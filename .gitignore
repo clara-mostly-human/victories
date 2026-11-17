@@ -1,0 +1,7 @@
+bots/
+node_modules/
+.venv/
+*.log
+logs/
+replays/
+.env*
