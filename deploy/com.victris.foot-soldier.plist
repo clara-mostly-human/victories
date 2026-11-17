@@ -7,7 +7,6 @@
   <array>
     <string>/Users/clara/Projects/victris/run.sh</string>
     <string>foot-soldier</string>
-    <string>v1</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/clara/Projects/victris</string>
   <key>EnvironmentVariables</key>
