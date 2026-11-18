@@ -28,6 +28,9 @@ pub struct BotLine {
     pub last_turn_s: Option<f64>,
     /// the gateway's verdict on this bot and its level, when the bot is behind the gateway
     pub gateway: Option<(String, String)>,
+    /// its socket to the ladder: the last ping, and the median time on the wire per turn (ms)
+    pub ping_ms: Option<f64>,
+    pub wire_ms: Option<f64>,
 }
 
 /// One finished game, as the bot and the ladder snapshot know it.
@@ -101,6 +104,8 @@ pub struct GatewayHealth {
     pub age_s: i64,
     /// each bot behind the gateway: its verdict and level ("ok", "warn", "bad")
     pub bots: std::collections::HashMap<String, (String, String)>,
+    /// each bot's socket: the last ping and the median wire time per turn, in ms
+    pub sockets: std::collections::HashMap<String, (Option<f64>, Option<f64>)>,
 }
 
 pub fn gateway_health(root: &Path) -> Option<GatewayHealth> {
@@ -111,9 +116,12 @@ pub fn gateway_health(root: &Path) -> Option<GatewayHealth> {
         problems: v.get("problems").and_then(|p| p.as_array()).map(|p| p.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
         age_s: (now_ms() - v.get("ts_ms").and_then(|t| t.as_i64()).unwrap_or(0)) / 1000,
         bots: Default::default(),
+        sockets: Default::default(),
     };
     for (name, b) in v.get("health").and_then(|x| x.as_object())? {
         h.bots.insert(name.clone(), (b.get("verdict").and_then(|x| x.as_str()).unwrap_or("?").to_string(), b.get("level").and_then(|x| x.as_str()).unwrap_or("bad").to_string()));
+        let num = |k: &str| b.get("socket").and_then(|s| s.get(k)).and_then(|x| x.as_f64());
+        h.sockets.insert(name.clone(), (num("ping_ms"), num("wire_ms")));
     }
     Some(h)
 }
@@ -252,6 +260,8 @@ fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>
             }),
             last_turn_s: last_turn_age_s(root, &b.name),
             gateway: health.as_ref().filter(|h| h.age_s <= 15).and_then(|h| h.bots.get(&b.name).cloned()),
+            ping_ms: health.as_ref().filter(|h| h.age_s <= 15).and_then(|h| h.sockets.get(&b.name).and_then(|s| s.0)),
+            wire_ms: health.as_ref().filter(|h| h.age_s <= 15).and_then(|h| h.sockets.get(&b.name).and_then(|s| s.1)),
         });
     }
     let mut arms = Vec::new();
@@ -427,7 +437,7 @@ pub fn html(s: &Snapshot) -> String {
         let (word, class) = state(b);
         let (lo, hi) = b.day.interval();
         bots.push_str(&format!(
-            "<tr><td><strong><a href=\"/?bot={0}\">{0}</a></strong><span class=\"sub\">{1}</span></td><td><span class=\"pill {class}\">{word}</span></td><td>{2}<span class=\"sub\">{3}</span></td><td class=\"n\">{4}</td><td class=\"n\">{5}<span class=\"sub\">{rank}{6:+.0} on this version</span></td><td class=\"n\">{7}<span class=\"sub\">{8} last hour</span></td><td class=\"n\">{9}&ndash;{10}&ndash;{11}</td><td class=\"n\">{12}<span class=\"sub\">{13}</span></td><td class=\"n\">{14}</td></tr>\n",
+            "<tr><td><strong><a href=\"/?bot={0}\">{0}</a></strong><span class=\"sub\">{1}</span></td><td><span class=\"pill {class}\">{word}</span></td><td>{2}<span class=\"sub\">{3}</span></td><td class=\"n\">{4}</td><td class=\"n\">{5}<span class=\"sub\">{rank}{6:+.0} on this version</span></td><td class=\"n\">{7}<span class=\"sub\">{8} last hour</span></td><td class=\"n\">{9}&ndash;{10}&ndash;{11}</td><td class=\"n\">{12}<span class=\"sub\">{13}</span></td><td class=\"n\">{14}</td><td class=\"n\">{15}</td><td class=\"n\">{16}</td></tr>\n",
             esc(&b.name),
             esc(&b.role),
             esc(&b.release),
@@ -443,6 +453,8 @@ pub fn html(s: &Snapshot) -> String {
             if b.day.games() > 0 { format!("{:.0}%", 100.0 * b.day.score()) } else { "&ndash;".into() },
             if b.day.games() > 0 { format!("{:.0} to {:.0}%", 100.0 * lo, 100.0 * hi) } else { String::new() },
             b.think_p99_ms.map(|p| format!("{p:.0} ms")).unwrap_or_else(|| "&ndash;".into()),
+            b.ping_ms.map(|p| format!("{p:.0} ms")).unwrap_or_else(|| "&ndash;".into()),
+            b.wire_ms.map(|p| format!("{p:.0} ms")).unwrap_or_else(|| "&ndash;".into()),
             rank = b.rank.map(|r| format!("#{r}, ")).unwrap_or_default(),
         ));
     }
@@ -620,9 +632,9 @@ h2 a.all {{ font-weight: 400; text-transform: none; letter-spacing: 0; margin-le
 
 <h2>Bots</h2>
 <div class="wrap"><table>
-<tr><th>Bot</th><th>State</th><th>Release</th><th class="n">Version</th><th class="n">Rating</th><th class="n">Games, 24 h</th><th class="n">W&ndash;L&ndash;D</th><th class="n">Score</th><th class="n">Think p99</th></tr>
+<tr><th>Bot</th><th>State</th><th>Release</th><th class="n">Version</th><th class="n">Rating</th><th class="n">Games, 24 h</th><th class="n">W&ndash;L&ndash;D</th><th class="n">Score</th><th class="n">Think p99</th><th class="n">Ping</th><th class="n">Wire per turn</th></tr>
 {bots}</table></div>
-<p class="note">Score counts a draw as half a win; the range under it is the 95% interval. Think p99 is over the last 90 seconds of play, or the last finished game when the bot is between matches. State is the gateway's verdict for a bot behind the gateway: it says "playing" only while turns are being answered.</p>
+<p class="note">Score counts a draw as half a win; the range under it is the 95% interval. Think p99 is over the last 90 seconds of play, or the last finished game when the bot is between matches. State is the gateway's verdict for a bot behind the gateway: it says "playing" only while turns are being answered. Ping is the last round trip on the bot's socket to the ladder (measured at connect and every 20 seconds); wire per turn is the median of what the ladder charged for a turn less the time the bot took, over the current or last match. A good socket is about 40 to 65 ms ping and 70 ms on the wire; a slow one about 150 ms and 300.</p>
 
 <h2>{games_title}</h2>
 <div class="wrap"><table>
@@ -797,7 +809,7 @@ pub fn state_json(s: &Snapshot) -> serde_json::Value {
             "bot": b.name, "role": b.role, "state": state(b).0, "release": b.release, "version": b.version,
             "rating": b.rating.map(|r| r.round()), "rating_change_24h": b.rating_day.round(), "games_24h": b.day.games(), "games_last_hour": b.hour_games,
             "wins": b.day.wins, "losses": b.day.losses, "draws": b.day.draws, "score_pct": pct(&b.day), "think_p99_ms": b.think_p99_ms.map(|p| p.round()),
-            "last_turn_s": b.last_turn_s.map(|t| t.round()),
+            "last_turn_s": b.last_turn_s.map(|t| t.round()), "ping_ms": b.ping_ms.map(|p| p.round()), "wire_ms": b.wire_ms.map(|p| p.round()),
         })).collect::<Vec<_>>(),
         "arms": s.arms.iter().map(|a| {
             let (lo, hi) = a.record.interval();

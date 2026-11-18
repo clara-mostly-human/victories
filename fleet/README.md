@@ -128,8 +128,10 @@ What the gateway owns:
   resumes on the new one). Otherwise a slow socket is only given up when a reconnect is
   cheap: at connect (ping over `"ping_reject_ms"`, 120 now: up to three tries, at 0, 2 and
   5 s), with one quick ping when a match is being resumed (two tries), and between
-  matches after two slow pings. All of it sits under one cap, `"replacements_per_10min"`
-  (8), across the whole fleet: when the cap is spent a bot keeps the socket it has. About
+  matches after two slow pings. All of it is governed fleet-wide: one replacement at a
+  time, 90 s apart (`"replace_gap_ms"`), at most `"replacements_per_10min"` (8), and if
+  three replacement sockets in a row come out slow, none for twenty minutes (a `SOCKETS`
+  line in the alert log says so). When the gate is shut a bot keeps the socket it has. About
   half of all new sockets are slow whatever we do (ping 150 to 260 ms and 300 to 450 ms
   on the wire per turn, against 40 to 65 and 70), and the ladder resets a socket every
   few minutes anyway; an eager version of this test reconnected 33 times in four minutes

@@ -129,7 +129,7 @@ impl Default for Options {
             // 0: a socket is not replaced in play for being slow (only for losing turns)
             slow_wire_ms: 0.0,
             ping_reject_ms: 0.0,
-            replace_gap: Duration::from_secs(10),
+            replace_gap: Duration::from_secs(90),
             max_concurrent: 5,
             stall_after: Duration::from_secs(120),
             replacements_per_10min: 8,
@@ -270,6 +270,11 @@ pub struct Shared {
     pub health: Mutex<HashMap<String, Value>>,
     /// which of our bots are queued (1) or in a match (2)
     active: Mutex<HashMap<String, u8>>,
+    /// the flagship is on a slow socket right now (it gets the next replacement)
+    flagship_slow: std::sync::atomic::AtomicBool,
+    /// replacement sockets in a row that came out slow, and until when replacing is off
+    replace_fails: AtomicU64,
+    replace_suspended: Mutex<Option<Instant>>,
     /// the socket-test thresholds, in ms; re-read from `fleet/bots.json` while running
     pub ping_reject_ms: AtomicU64,
     pub slow_wire_ms: AtomicU64,
@@ -279,6 +284,9 @@ impl Shared {
     pub fn new(opt: Options, cfg: &Config) -> Shared {
         let now = Instant::now();
         Shared {
+            flagship_slow: std::sync::atomic::AtomicBool::new(false),
+            replace_fails: AtomicU64::new(0),
+            replace_suspended: Mutex::new(None),
             ping_reject_ms: AtomicU64::new(opt.ping_reject_ms.max(0.0) as u64),
             slow_wire_ms: AtomicU64::new(opt.slow_wire_ms.max(0.0) as u64),
             connect_budget: Budget::new("connection", cfg.comms_connects_per_minute, Duration::from_secs(60)),
@@ -319,14 +327,45 @@ impl Shared {
         }
     }
 
-    /// May a slow socket be replaced now? At most one in every `replace_gap`, fleet-wide.
-    fn may_replace(&self) -> bool {
+    /// May a slow socket be given up for another now? One at a time across the fleet,
+    /// `replace_gap` apart, inside the ten-minute cap, and not at all while replacing has
+    /// been shown to be futile (see `replacement_came_out`).
+    fn may_replace(&self, flagship: bool) -> bool {
+        if let Some(until) = *self.replace_suspended.lock().unwrap_or_else(|p| p.into_inner()) {
+            if Instant::now() < until {
+                return false;
+            }
+        }
+        // The flagship is first in line: while its socket is slow, nobody else's is replaced.
+        if !flagship && self.flagship_slow.load(Ordering::Relaxed) {
+            return false;
+        }
         let mut next = self.next_replace.lock().unwrap_or_else(|p| p.into_inner());
         if Instant::now() < *next {
             return false;
         }
+        if !self.replace_budget.try_take() {
+            return false;
+        }
         *next = Instant::now() + self.opt.replace_gap;
         true
+    }
+
+    /// What the socket that replaced a slow one turned out to be. Three slow ones in a row,
+    /// fleet-wide, and replacing stops for twenty minutes: when every new socket is slow
+    /// (as on 2026-11-18 from 16:30Z, after we had opened some eighty connections in half
+    /// an hour), asking for more only adds connections.
+    fn replacement_came_out(&self, root: &Path, good: bool) {
+        if good {
+            self.replace_fails.store(0, Ordering::Relaxed);
+            return;
+        }
+        let fails = self.replace_fails.fetch_add(1, Ordering::Relaxed) + 1;
+        if fails >= 3 {
+            self.replace_fails.store(0, Ordering::Relaxed);
+            *self.replace_suspended.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now() + Duration::from_secs(1200));
+            log_line(root, "SOCKETS", "the last three replacement sockets were all slow: no socket is replaced for the next 20 minutes");
+        }
     }
 
     fn set_active(&self, bot: &str, state: u8) {
@@ -714,6 +753,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
     let mut bad_since = Instant::now();
     // slow sockets refused in a row while a match waited to be resumed
     let mut resume_tries = 0u32;
+    // the last connection was given up for being slow; the next one's test says if that paid
+    let mut after_replacement = false;
     let mut down_why = String::from("not connected yet");
     let mut hello_fields_said = false;
 
@@ -769,6 +810,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     e.detach(&why);
                 }
                 shared.set_active(name, 0);
+                if name == "field-marshal" {
+                    shared.flagship_slow.store(false, Ordering::Relaxed);
+                }
                 nap(Duration::from_secs(5), stop);
                 continue;
             }
@@ -784,6 +828,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         };
         let url = p.bot.url.clone().unwrap_or_else(|| DEFAULT_URL.to_string());
         let role = p.bot.role.clone();
+        // The flagship may try harder for a good socket than the others.
+        let tries = if role == "flagship" { 5 } else { SLOW_TRIES };
         let mut label: Option<String> = p.version.clone().or_else(|| engine.as_ref().map(|e| e.version.clone()));
 
         // A bot process may attach while there is no connection.
@@ -838,12 +884,18 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
             // next socket if this one is refused.
             let hello = inbox.iter().find(|t| t.contains("\"hello\"")).and_then(|t| serde_json::from_str::<Value>(t).ok()).filter(|v| v.get("type").and_then(Value::as_str) == Some("hello"));
             let in_a_hurry = resuming || hello.is_some();
+            if let (true, Some(ms), true) = (after_replacement, ping_ms, reject > 0.0) {
+                // This socket replaced a slow one: was it worth it?
+                after_replacement = false;
+                shared.replacement_came_out(root, ms <= reject);
+            }
             if let Some(ms) = ping_ms {
-                if bad_sockets >= SLOW_TRIES && bad_since.elapsed() > SLOW_REST {
+                if bad_sockets >= tries && bad_since.elapsed() > SLOW_REST {
                     bad_sockets = 0;
                 }
-                let may = if in_a_hurry { resume_tries < 2 } else { bad_sockets < SLOW_TRIES };
-                if reject > 0.0 && ms > reject && may && shared.replace_budget.try_take() {
+                let may = if in_a_hurry { resume_tries < 2 } else { bad_sockets < tries };
+                if reject > 0.0 && ms > reject && may && shared.may_replace(role == "flagship") {
+                    after_replacement = true;
                     if in_a_hurry {
                         resume_tries += 1;
                         backoff = Duration::ZERO;
@@ -1417,12 +1469,13 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
             // A slow socket is replaced: at once in a match (the match resumes on the new
             // one), spaced across the fleet, and not for ever for one bot.
             if let Some(why) = replace_why.clone() {
-                if bad_sockets >= SLOW_TRIES && bad_since.elapsed() > SLOW_REST {
+                if bad_sockets >= tries && bad_since.elapsed() > SLOW_REST {
                     bad_sockets = 0;
                 }
                 if last_slow_check.elapsed() > Duration::from_secs(2) {
                     last_slow_check = Instant::now();
-                    if bad_sockets < SLOW_TRIES && shared.may_replace() && shared.replace_budget.try_take() {
+                    if bad_sockets < tries && shared.may_replace(role == "flagship") {
+                        after_replacement = true;
                         bad_sockets += 1;
                         bad_since = Instant::now();
                         {
@@ -1536,6 +1589,12 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     "refused": refusal.as_ref().map(|(code, at, d)| json!({ "code": code, "ago_s": at.elapsed().as_secs(), "detail": d })),
                 });
                 shared.publish(name, health(&flow, &engine, Some(conn), &label, &role, &down_why, backoff));
+                if role == "flagship" {
+                    // Is the flagship's socket slow? Then it gets the next replacement.
+                    let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
+                    let slow = reject > 0.0 && (ping_ms.map(|x| x > reject).unwrap_or(false) || wire_ms.map(|x| x > 200.0).unwrap_or(false));
+                    shared.flagship_slow.store(slow, Ordering::Relaxed);
+                }
 
                 if !flow.in_match {
                     if stop() {
