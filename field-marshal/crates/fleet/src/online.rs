@@ -100,8 +100,51 @@ pub fn refresh_ladder(root: &Path, store: &Store, ours: &[String]) -> Result<usi
     // The same file twice changes nothing; say how old it is.
     let fetched = v.get("fetched").and_then(Value::as_str).unwrap_or("?").to_string();
     store.set_ladder(&rows, ours).map_err(|e| e.to_string())?;
+    // Our bots' own pages carry a rating for every version, ranked or not: a new label (fewer
+    // than 30 games) is not on the leaderboard, but it has a rating. That rating stands
+    // after the latest game we have of that version.
+    if let Some(bots) = v.get("bots").and_then(Value::as_object) {
+        for (bot, b) in bots {
+            for ver in b.get("versions").and_then(Value::as_array).into_iter().flatten() {
+                let label = ver.get("version").or_else(|| ver.get("label")).and_then(Value::as_str);
+                let rating = ver.get("rating").and_then(Value::as_f64);
+                if let (Some(label), Some(rating)) = (label, rating) {
+                    let _ = store.conn.execute(
+                        "UPDATE matches SET rating_after = ?3 WHERE bot = ?1 AND version = ?2 AND match_id =
+                           (SELECT match_id FROM matches WHERE bot = ?1 AND version = ?2 AND result IS NOT NULL ORDER BY COALESCE(ended_ms, started_ms) DESC LIMIT 1)",
+                        rusqlite::params![bot, label, rating],
+                    );
+                }
+            }
+        }
+    }
     eprintln!("{} standings fetched on GitHub at {fetched}: {} rows", utc_stamp(), rows.len());
     Ok(rows.len())
+}
+
+/// Asks GitHub to run one of the repository's workflows now (`gh workflow run`), at most
+/// once every `min_gap_s` for each workflow. GitHub's own schedule for these workflows did
+/// not fire on 2026-11-18 (the standings ran once in two hours, the replays not at all), so
+/// the Mac's health pass starts them itself. This talks to GitHub only, never to the ladder.
+pub fn dispatch_workflow(root: &Path, workflow: &str, min_gap_s: u64) -> Result<bool, String> {
+    let mark = crate::store::data_dir(root).join("run").join(format!("dispatched-{workflow}"));
+    if let Some(age) = std::fs::metadata(&mark).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()) {
+        if age.as_secs() < min_gap_s {
+            return Ok(false);
+        }
+    }
+    let url = Command::new("git").current_dir(root).args(["remote", "get-url", "origin"]).output().map_err(|e| e.to_string())?;
+    let url = String::from_utf8_lossy(&url.stdout).trim().to_string();
+    let repo = url.trim_start_matches("git@github.com:").trim_start_matches("https://github.com/").trim_end_matches(".git").to_string();
+    let gh = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh"].into_iter().find(|p| Path::new(p).is_file()).unwrap_or("gh");
+    let out = Command::new(gh).args(["workflow", "run", workflow, "--repo", &repo, "--ref", "main"]).output().map_err(|e| format!("gh: {e}"))?;
+    let _ = std::fs::create_dir_all(mark.parent().unwrap_or(Path::new(".")));
+    let _ = std::fs::write(&mark, utc_stamp());
+    if out.status.success() {
+        Ok(true)
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
 }
 
 pub fn alert_log(root: &Path) -> std::path::PathBuf {

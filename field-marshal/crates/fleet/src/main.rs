@@ -1149,6 +1149,26 @@ fn main_inner() -> Result<i32, String> {
             watch(&root, &store, &cfg)?;
             housekeeping(&root, &store, &cfg);
             // The standings, when the snapshot in the store has grown old.
+            // GitHub's schedules for the standings and replay workflows do not fire reliably:
+            // start them from here when their output is overdue (GitHub only, not the ladder).
+            {
+                let standings = data_dir(&root).join("standings-remote").join("standings.json");
+                let stale = std::fs::metadata(&standings).ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).map(|a| a.as_secs() > 360).unwrap_or(true);
+                if stale {
+                    match fleet::online::dispatch_workflow(&root, "standings.yml", 280) {
+                        Ok(true) => println!("standings workflow started on GitHub"),
+                        Ok(false) => {}
+                        Err(x) => eprintln!("standings workflow not started: {x}"),
+                    }
+                }
+                if cfg.corpus_branch {
+                    match fleet::online::dispatch_workflow(&root, "corpus.yml", 3 * 3600) {
+                        Ok(true) => println!("replay workflow started on GitHub"),
+                        Ok(false) => {}
+                        Err(x) => eprintln!("replay workflow not started: {x}"),
+                    }
+                }
+            }
             if cfg.ladder_refresh_minutes > 0 {
                 let last: i64 = store.conn.query_row("SELECT COALESCE(MAX(updated_ms), 0) FROM ladder", [], |r| r.get(0)).unwrap_or(0);
                 if now_ms() - last >= cfg.ladder_refresh_minutes as i64 * 60_000 {
