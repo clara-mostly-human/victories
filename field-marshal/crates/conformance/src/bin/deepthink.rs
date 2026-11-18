@@ -9,9 +9,11 @@
 //!
 //! The default engine is `tree`: a search in which both sides look for their best move at
 //! every tick (`victris_engine::mcts`). A first search from the position gives the moves
-//! worth comparing (our three most visited, plus the move really made) and the mix of
-//! moves the opponent is likely to make. Each of our candidates is then searched again
-//! against each of those opponent moves, and its value is the average over that mix.
+//! worth comparing (our three most visited, plus the move really made) and the moves the
+//! opponent is likely to make, to which its best answer to each of our candidates is
+//! added. Every pair is searched again, the small game between the two lists is solved,
+//! and a candidate's value is its average against the opponent's mix at balance, so a
+//! move is never judged against an opponent that is not ready for it.
 //! Regret = best candidate's value minus the value of the move made.
 //!
 //! The older `playouts` engine is kept for comparison:
@@ -95,30 +97,63 @@ fn tree_tick(e: &Engine, s: &State, x: usize, actual: RawTurn, cfg: Config, sub:
     if mix.is_empty() {
         mix.push((theirs[0].0, 1.0));
     }
-    let total: f64 = mix.iter().map(|m| m.1).sum();
-    let sub_cfg = Config { iterations: sub, depth: cfg.depth.saturating_sub(1).max(1), ..cfg };
-    let value_of = |a: RawTurn| -> f64 {
-        let mut v = 0.0;
-        for (b, w) in &mix {
-            let mut st = *s;
-            let turns = if x == 0 { [a, *b] } else { [*b, a] };
-            let lost = e.step(&mut st, &turns).hp_lost;
-            let mut r = (lost[1] - lost[0]) as f64;
-            if !st.fighters[1].alive {
-                r += 40.0;
+    // The opponent's best answer to each of our candidates joins its list: a move of ours
+    // must be judged against an opponent that is ready for it.
+    let mut replies: Vec<RawTurn> = mix.iter().map(|m| m.0).collect();
+    let half = Config { iterations: (cfg.iterations / 2).max(1000), ..cfg };
+    for a in &cands {
+        let fixed = if x == 0 { [Some(*a), None] } else { [None, Some(*a)] };
+        let r = Search::new(e, half).run(s, fixed);
+        if let Some(best) = r.acts[1 - x].iter().max_by_key(|t| t.1) {
+            if !replies.contains(&best.0) {
+                replies.push(best.0);
             }
-            if !st.fighters[0].alive {
-                r -= 40.0;
-            }
-            if st.result.is_none() {
-                r += Search::new(e, sub_cfg).run(&st, [None, None]).value;
-            }
-            v += w / total * sign * r;
         }
-        v
+    }
+    let sub_cfg = Config { iterations: sub, depth: cfg.depth.saturating_sub(1).max(1), ..cfg };
+    let pair_value = |a: RawTurn, b: RawTurn| -> f64 {
+        let mut st = *s;
+        let turns = if x == 0 { [a, b] } else { [b, a] };
+        let lost = e.step(&mut st, &turns).hp_lost;
+        let mut r = (lost[1] - lost[0]) as f64;
+        if !st.fighters[1].alive {
+            r += 40.0;
+        }
+        if !st.fighters[0].alive {
+            r -= 40.0;
+        }
+        if st.result.is_none() {
+            r += Search::new(e, sub_cfg).run(&st, [None, None]).value;
+        }
+        sign * r
     };
-    let values: Vec<f64> = cands.iter().map(|c| value_of(*c)).collect();
-    let best = (0..cands.len()).max_by(|a, b| values[*a].partial_cmp(&values[*b]).unwrap()).unwrap();
+    let (rows, cols) = (cands.len(), replies.len());
+    let payoff: Vec<f64> = cands.iter().flat_map(|a| replies.iter().map(|b| pair_value(*a, *b)).collect::<Vec<_>>()).collect();
+    // Solve the small game by regret matching: both sides' mixes at balance.
+    let (mut reg_r, mut reg_c) = (vec![0.0f64; rows], vec![0.0f64; cols]);
+    let (mut avg_r, mut avg_c) = (vec![0.0f64; rows], vec![0.0f64; cols]);
+    let strat = |reg: &Vec<f64>| -> Vec<f64> {
+        let pos: f64 = reg.iter().map(|v| v.max(0.0)).sum();
+        if pos > 0.0 { reg.iter().map(|v| v.max(0.0) / pos).collect() } else { vec![1.0 / reg.len() as f64; reg.len()] }
+    };
+    for _ in 0..2000 {
+        let (pr, pc) = (strat(&reg_r), strat(&reg_c));
+        let row_val: Vec<f64> = (0..rows).map(|i| (0..cols).map(|j| pc[j] * payoff[i * cols + j]).sum()).collect();
+        let col_val: Vec<f64> = (0..cols).map(|j| (0..rows).map(|i| pr[i] * payoff[i * cols + j]).sum()).collect();
+        let v: f64 = (0..rows).map(|i| pr[i] * row_val[i]).sum();
+        for i in 0..rows {
+            reg_r[i] += row_val[i] - v;
+            avg_r[i] += pr[i];
+        }
+        for j in 0..cols {
+            reg_c[j] += v - col_val[j];
+            avg_c[j] += pc[j];
+        }
+    }
+    let norm: f64 = avg_c.iter().sum();
+    let their_mix: Vec<f64> = avg_c.iter().map(|v| v / norm).collect();
+    let values: Vec<f64> = (0..rows).map(|i| (0..cols).map(|j| their_mix[j] * payoff[i * cols + j]).sum()).collect();
+    let best = (0..rows).max_by(|a, b| values[*a].partial_cmp(&values[*b]).unwrap()).unwrap();
     let at = cands.iter().position(|c| *c == actual).unwrap();
     (cands[best], values[best], values[at], first_choice)
 }
