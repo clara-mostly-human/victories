@@ -160,7 +160,8 @@ wss.on("connection", (ws: any, req: any) => {
 });
 
 wss.on("listening", () => {
-  const bin = join(here, "../target/release/marshal");
+  // --bin <path>: test a build other than target/release (e.g. while a live bot uses that one)
+  const bin = opt("bin", join(here, "../target/release/marshal"));
   const botArgs = ["--bot", BOT, "--url", `ws://127.0.0.1:${PORT}`, "--matches", String(GAMES)];
   if (LOG_DIR) botArgs.push("--log-dir", LOG_DIR);
   if (PLAYBOOKS) botArgs.push("--playbooks", PLAYBOOKS);

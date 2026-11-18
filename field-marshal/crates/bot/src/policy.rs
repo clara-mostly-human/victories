@@ -16,6 +16,11 @@
 //! played out with the next tick itself solved as a game (`deepen`). Deepening more
 //! turns, or adding dodge-only ticks after the second, did not help.
 //!
+//! matrix-4 gives the opponent its close shot and its repulsor on both ticks. Replays of
+//! the ladder games against bots rated 2100 and up showed why: most of their hits and
+//! wall slams land the tick after we step, when we cannot move. A search that plays the
+//! opponent's punishment on the second tick stops stepping into it.
+//!
 //! All numbers live in [`Playbook`], so a playbook for a named opponent can change them.
 //! They were tuned in the arena and then confirmed against other bots. Two findings are
 //! built into the defaults and deserve suspicion later, against stronger opponents: the
@@ -74,6 +79,13 @@ pub struct Playbook {
     pub sample: bool,
     /// search: consider shots aimed where the opponent could step
     pub lead_shots: bool,
+    /// search: give the opponent a shot at the tile we stand on among its options, on both
+    /// ticks. Within two tiles such a shot lands the tick it is fired, so this is what
+    /// makes the search respect a ready shooter at close range.
+    pub model_shots: bool,
+    /// search: on the second tick, give the opponent its repulsor after any movement.
+    /// Strong ladder bots slam us the tick after we step, when we cannot move away.
+    pub model_slams: bool,
     /// search: how many of the best turns to play out a second tick (0 = one tick only)
     pub deepen: usize,
     /// search: dodge-only ticks played after the second tick
@@ -92,7 +104,7 @@ pub struct Playbook {
 impl Default for Playbook {
     fn default() -> Self {
         Playbook {
-            name: "matrix-3".into(),
+            name: "matrix-4".into(),
             fire_cost: 3.0,
             repulsor_cost: 1.0,
             frost_cost: 0.5,
@@ -113,9 +125,11 @@ impl Default for Playbook {
             model_attacks: false,
             sample: false,
             lead_shots: true,
-            model_repulsor: false,
+            model_repulsor: true,
             dash_slam: true,
             slam_risk: 5.0,
+            model_shots: true,
+            model_slams: true,
             deepen: 16,
             deep_rollout: 1,
             deep_range: 6,
@@ -153,7 +167,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -399,6 +413,23 @@ fn subgame_value(e: &Engine, s: &State, me: usize, pb: &Playbook, k: &Kit, sims:
             }
             if en.cd_dash == 0 {
                 theirs.push((RawTurn::dash(d), pb.dash_cost));
+            }
+        }
+        let plain = theirs.len();
+        if pb.model_shots {
+            if let Some(a) = k.ranged.filter(|a| en.cd_attack[*a as usize] == 0) {
+                for i in 0..plain {
+                    let (mv, cost) = theirs[i];
+                    theirs.push((mv.with_attack(a, my.pos), cost + pb.fire_cost));
+                }
+            }
+        }
+        if pb.model_slams && chebyshev(en.pos, my.pos) <= 2 + e.rules.dash_distance {
+            if let Some(a) = k.repulsor.filter(|a| en.cd_attack[*a as usize] == 0) {
+                for i in 0..plain {
+                    let (mv, cost) = theirs[i];
+                    theirs.push((mv.with_burst(a), cost + pb.repulsor_cost));
+                }
             }
         }
     }
@@ -788,7 +819,7 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
         for r in &replies {
             let moved = if matches!(r.dash, victris_engine::turn::DirIn::Dir(_)) { pb.dash_cost } else { 0.0 };
             theirs.push((*r, moved));
-            if en_ranged && pb.model_attacks {
+            if en_ranged && (pb.model_attacks || pb.model_shots) {
                 theirs.push((r.with_attack(k.ranged.unwrap(), my.pos), moved + pb.fire_cost));
             }
             if en_repulsor && (pb.model_attacks || pb.model_repulsor) && dist_now <= 3 {
