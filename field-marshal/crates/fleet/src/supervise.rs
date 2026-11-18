@@ -11,6 +11,7 @@
 //!   try again; three of these within an hour halt the bot until `fleet resume`.
 //! - 2: bad arguments or no token. Halt.
 //! - 3: another process holds this bot's name. Wait a minute.
+//! - 4: the ladder refused the version label. Start again under the next label.
 //! - anything else: a crash. Restart with a growing delay.
 
 use crate::config::{BotConfig, Config};
@@ -293,6 +294,21 @@ pub fn run(root: &Path, name: &str) -> i32 {
             Some(3) => {
                 say(name, "another process is running this bot; trying again in a minute");
                 nap(Duration::from_secs(60));
+            }
+            Some(4) => {
+                // The ladder refused the version label for good. A new label is the cure, but
+                // not without limit: three in an hour and the bot is halted for a person to look.
+                if let Some(s) = &store {
+                    let recent: i64 = s.conn.query_row("SELECT COUNT(*) FROM runs WHERE bot = ?1 AND exit = '4' AND ended_ms > ?2", rusqlite::params![name, now_ms() - 3_600_000], |r| r.get(0)).unwrap_or(0);
+                    if recent >= 3 {
+                        let _ = s.set_halted(name, Some("the ladder refused three version labels within an hour"));
+                        crate::online::alert(root, "ALERT", Some(name), &format!("{name} is halted: the ladder refused three version labels within an hour"));
+                    } else if let Ok(next) = s.next_version(name) {
+                        let _ = s.set_deployment(name, &release, &next, "the ladder refused the old version label");
+                        s.event(Some(name), "version_bumped", &json!({ "from": version, "to": next, "release": release }));
+                        crate::online::log_line(root, "PIPELINE", &format!("{name}: the ladder refused version label {version}; it now runs {release} as {next}"));
+                    }
+                }
             }
             _ => {
                 crashes = if ran > Duration::from_secs(600) { 1 } else { crashes + 1 };

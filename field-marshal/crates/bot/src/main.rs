@@ -15,7 +15,8 @@
 //! --experiments the playbook for a target opponent comes from the fleet's experiment plan.
 //!
 //! Exit codes: 0 done or stopped, 1 a ladder error that reconnecting cannot fix, 2 bad
-//! arguments or no token, 3 another process is already running this bot.
+//! arguments or no token, 3 another process is already running this bot, 4 the ladder
+//! refused the version label (the supervisor starts us again under a new one).
 
 use marshal::session::{Config, Out, Playbooks, Session};
 use std::io::{BufRead, Write};
@@ -160,7 +161,13 @@ fn run_stdio(mut session: Session, provisional: bool) {
                     let _ = writeln!(out, r#"{{"type":"reconnect"}}"#);
                     let _ = out.flush();
                 }
-                Out::Done | Out::Fatal(_) => return,
+                Out::Fatal(code) => {
+                    // Behind the gateway: say why, so it can act (a new label for version_limit).
+                    let _ = writeln!(out, "{}", serde_json::json!({ "type": "fatal", "code": code }));
+                    let _ = out.flush();
+                    return;
+                }
+                Out::Done => return,
             }
         }
     }
@@ -353,7 +360,8 @@ fn main() {
             }
             Closed::Fatal(code) => {
                 session.note("fatal", serde_json::json!(code));
-                std::process::exit(1);
+                // 4 tells the supervisor that a new version label is the cure.
+                std::process::exit(if code == "version_limit" { 4 } else { 1 });
             }
             Closed::Dropped(why) => {
                 if stop.load(Ordering::Relaxed) && !session.in_match() {

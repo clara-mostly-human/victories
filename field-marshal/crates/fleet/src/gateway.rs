@@ -505,6 +505,23 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                             }
                             "error" => {
                                 let code = msg.get("code").and_then(Value::as_str).unwrap_or("?").to_string();
+                                if code == "version_limit" {
+                                    // The ladder will not take this version label any more.
+                                    // The next label, same release; the engine is replaced
+                                    // at the top of the loop.
+                                    if let Ok(store) = Store::open(&default_db(root), Duration::from_secs(2)) {
+                                        let old = engine.as_ref().map(|e| e.version.clone()).unwrap_or_default();
+                                        let release = engine.as_ref().map(|e| e.release.clone()).unwrap_or_default();
+                                        if let Ok(next) = store.next_version(name) {
+                                            let _ = store.set_deployment(name, &release, &next, "the ladder refused the old version label");
+                                            log_line(root, "PIPELINE", &format!("{name}: the ladder refused version label {old}; it now runs {release} as {next}"));
+                                        }
+                                    }
+                                    let _ = ws.close(None);
+                                    in_match = false;
+                                    std::thread::sleep(Duration::from_secs(2));
+                                    continue 'outer;
+                                }
                                 if FATAL_CODES.contains(&code.as_str()) {
                                     if let Some(e) = engine.as_mut() {
                                         e.send(&text);
@@ -598,7 +615,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         engine_said = Some("reconnect");
                         continue;
                     }
-                    Some("leave") => continue,
+                    Some("leave") | Some("fatal") => continue,
                     Some("ready") if swallow_ready => {
                         swallow_ready = false;
                         continue;

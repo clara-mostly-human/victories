@@ -365,6 +365,30 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
                 }
             }
         }
+        // Connected is not the same as playing: a bot can sit on the ladder for an hour
+        // being refused (2026-11-18: a version label the ladder would no longer take).
+        // No finished game in fifteen minutes is an alert of its own.
+        if let Ok(store) = Store::open(&default_db(root), Duration::from_secs(2)) {
+            for b in cfg.bots.iter().filter(|b| b.expect_online) {
+                let last: Option<i64> = store.conn.query_row("SELECT MAX(COALESCE(ended_ms, started_ms)) FROM matches WHERE bot = ?1", [&b.name], |r| r.get(0)).ok().flatten();
+                let Some(last) = last else { continue };
+                let idle_min = (crate::store::now_ms() - last) / 60_000;
+                let key = format!("{}#idle", b.name);
+                let w = bots.entry(key).or_default();
+                if idle_min >= 15 {
+                    let due = w.alerted_at.map(|t| t.elapsed() >= REPEAT_EVERY).unwrap_or(true);
+                    if due {
+                        w.alerted_at = Some(Instant::now());
+                        let who = b.owner.as_deref().map(|o| format!(" Owner: {o}.")).unwrap_or_default();
+                        alert(root, "ALERT", Some(&b.name), &format!("{} has not finished a game for {idle_min} min, though it may be connected. See its log.{who}", b.name));
+                    }
+                } else if w.alerted_at.is_some() {
+                    alert(root, "RECOVERED", Some(&b.name), &format!("{} is playing again", b.name));
+                    *w = Watch::default();
+                }
+            }
+        }
+
         // Not being able to ask at all is its own alert: the network or the ladder is down.
         if asked > 0 && failed == asked {
             let since = *api_down_since.get_or_insert_with(Instant::now);

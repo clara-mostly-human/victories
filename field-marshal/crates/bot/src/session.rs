@@ -305,7 +305,10 @@ impl Session {
             Some("error") => {
                 let code = msg.get("code").and_then(Value::as_str).unwrap_or("?").to_string();
                 self.note("server_error", json!({ "code": code, "message": msg.get("message"), "retry_after_s": msg.get("retry_after_s") }));
-                if FATAL_CODES.contains(&code.as_str()) {
+                if FATAL_CODES.contains(&code.as_str()) || code == "version_limit" {
+                    // `version_limit`: the ladder will not take this version label any more
+                    // ("versions can't be edited, register a new label"). Asking again with
+                    // the same label never works; whoever started us must pick a new one.
                     vec![Out::Fatal(code)]
                 } else if self.cur.is_none() {
                     // Refused while waiting for a match: without another `queue` the bot would
