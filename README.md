@@ -13,6 +13,8 @@ One directory per bot, named after the bot. Tokens live in `bots/<bot-name>` (gi
   spawn layouts per map, so against a deterministic opponent there are only about a dozen distinct games.
 - `run.sh <bot-name>` — runs `<bot-name>/` on the ladder with the token from `bots/<bot-name>`, queueing as the
   version in `<bot-name>/VERSION`. To ship a change: bump VERSION and restart the process.
+- `fleet/` — the tooling around the bots: shared results store, experiment plan, supervisor, release pipeline,
+  replay collector and offline watchdog. See `fleet/README.md`; the tool is `fleet` (`field-marshal/crates/fleet`).
 - `deploy/` — launchd agent that keeps foot-soldier running on the Mac mini (`deploy/install.sh`).
 
 Every strategy change gets a new version number (`v2`, `v3`, …) so its rating is tracked separately.
