@@ -727,11 +727,15 @@ fn median(v: &[f64]) -> f64 {
 
 /// The socket test at connect: three pings, the median round trip in milliseconds. Text
 /// frames that arrive meanwhile are kept for the caller. `None` when no pong came back.
-fn ping_test(ws: &mut Socket, early: &mut VecDeque<String>, pings: u8, wait: Duration) -> Option<f64> {
+/// Pings a new socket. `closed` gets the reason when the ladder closes the socket during the
+/// test (2026-11-18 21:34Z: three resume sockets in a row were closed at once, the reason was
+/// thrown away, and the match was lost to the reconnect grace).
+fn ping_test(ws: &mut Socket, early: &mut VecDeque<String>, pings: u8, wait: Duration, closed: &mut Option<String>) -> Option<f64> {
     let mut samples = Vec::new();
     for k in 0..pings {
         let sent = Instant::now();
-        if ws.send(Message::Ping(vec![b'g', b'w', k])).is_err() {
+        if let Err(e) = ws.send(Message::Ping(vec![b'g', b'w', k])) {
+            *closed = Some(format!("send failed: {e}"));
             return None;
         }
         let mut got = false;
@@ -748,9 +752,19 @@ fn ping_test(ws: &mut Socket, early: &mut VecDeque<String>, pings: u8, wait: Dur
                         }
                     }
                     Ok(Message::Text(t)) => early.push_back(t),
+                    Ok(Message::Close(frame)) => {
+                        *closed = Some(match frame {
+                            Some(f) => format!("closed by the ladder: code {} {}", u16::from(f.code), f.reason),
+                            None => "closed by the ladder (no reason given)".into(),
+                        });
+                        return None;
+                    }
                     Ok(_) => {}
                     Err(tungstenite::Error::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => break,
-                    Err(_) => return None,
+                    Err(e) => {
+                        *closed = Some(format!("read failed: {e}"));
+                        return None;
+                    }
                 }
             }
         }
@@ -989,11 +1003,22 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         let mut ping_ms: Option<f64>;
         let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
         let resuming = flow.in_match;
+        let mut closed_at_connect: Option<String> = None;
         ping_ms = if !resuming {
-            ping_test(&mut ws, &mut inbox, 3, Duration::from_millis(1500))
+            ping_test(&mut ws, &mut inbox, 3, Duration::from_millis(1500), &mut closed_at_connect)
         } else {
-            ping_test(&mut ws, &mut inbox, 1, Duration::from_millis(400))
+            ping_test(&mut ws, &mut inbox, 1, Duration::from_millis(400), &mut closed_at_connect)
         };
+        if let Some(why) = closed_at_connect {
+            // The ladder closed it before anything was played: record why, and try again
+            // (at once while a match waits to be resumed, with the usual backoff otherwise).
+            let this = telemetry::socket_opened(root, name, &remote.to_string(), None, resuming, rotated_from.take());
+            tel().socket_closed(this, &format!("at connect: {why}"));
+            event(root, name, "closed_at_connect", json!({ "socket": this, "remote": remote.to_string(), "why": why, "in_match": flow.in_match }));
+            backoff = if flow.in_match { Duration::from_millis(300) } else { (backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(30)) };
+            down_why = format!("closed at connect: {why}");
+            continue;
+        }
         // Every socket is registered, slow or not: the store counts how many a bot was given.
         let this = telemetry::socket_opened(root, name, &remote.to_string(), ping_ms, resuming, rotated_from.take());
         sid = Some(this);
