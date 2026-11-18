@@ -48,7 +48,8 @@ def main():
                 continue
             # The bot's page is large (recent matches); keep the standing and the versions.
             keep = {k: b.get(k) for k in BOT_KEEP if k in b}
-            keep["versions"] = [{k: v.get(k) for k in VERSION_KEEP if k in v} for v in (b.get("versions") or [])[-12:]]
+            # Every plain field of each version (the label's key is not documented), and its health.
+            keep["versions"] = [{k: x for k, x in v.items() if not isinstance(x, (list, dict)) or k == "health"} for v in (b.get("versions") or [])[-12:]]
             out["bots"][name] = keep
     except urllib.error.HTTPError as e:
         out["errors"].append(f"stopped: HTTP {e.code} for {e.url}")

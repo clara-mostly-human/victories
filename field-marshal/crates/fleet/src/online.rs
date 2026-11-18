@@ -106,7 +106,7 @@ pub fn refresh_ladder(root: &Path, store: &Store, ours: &[String]) -> Result<usi
     if let Some(bots) = v.get("bots").and_then(Value::as_object) {
         for (bot, b) in bots {
             for ver in b.get("versions").and_then(Value::as_array).into_iter().flatten() {
-                let label = ver.get("version").or_else(|| ver.get("label")).and_then(Value::as_str);
+                let label = ["version", "label", "name", "number"].iter().find_map(|k| ver.get(*k).and_then(Value::as_str)).filter(|l| l.starts_with('v'));
                 let rating = ver.get("rating").and_then(Value::as_f64);
                 if let (Some(label), Some(rating)) = (label, rating) {
                     let _ = store.conn.execute(
