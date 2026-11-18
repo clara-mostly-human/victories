@@ -1,4 +1,4 @@
-//! The offline watchdog: asks the ladder, once a minute, whether each bot that should be
+//! The offline watchdog and the load guard. The watchdog asks the ladder, once a minute, whether each bot that should be
 //! up is online, and raises an alert when one has been offline for two minutes.
 //!
 //! It only reads the ladder's public API. It never starts, stops or connects as any bot:
@@ -80,6 +80,111 @@ pub fn alert(root: &Path, kind: &str, bot: Option<&str>, text: &str) {
         .output();
 }
 
+// ---- load guard -----------------------------------------------------------------------------
+//
+// The live bots share four fast cores with everything else on the machine. When they are
+// being starved (2026-11-18: a bot was disqualified for ten silent ticks while batch jobs
+// ran), batch work must stop. The guard looks every 15 seconds at the load average and at
+// each live bot's recent think times, and keeps a pause file while either is too high.
+// `fleet/duel.mjs` (and so the arena gate) starts no game while the file exists.
+
+pub fn pause_file(root: &Path) -> std::path::PathBuf {
+    root.join("data").join("run").join("batch.pause")
+}
+
+pub fn load_average() -> f64 {
+    let mut avg = [0f64; 3];
+    if unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) } < 1 {
+        return 0.0;
+    }
+    avg[0]
+}
+
+/// 99th percentile of a bot's think time over the last 90 seconds, in milliseconds, from
+/// the end of its tick log. `None` when it has not played enough ticks in that time.
+pub fn recent_think_p99_ms(root: &Path, bot: &str) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let dir = root.join("logs").join(bot);
+    let newest = std::fs::read_dir(&dir).ok()?.filter_map(|f| f.ok()).map(|f| f.path()).filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false)).max()?;
+    let mut f = std::fs::File::open(newest).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(400_000))).ok()?;
+    let mut text = String::new();
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).ok()?;
+    text.push_str(&String::from_utf8_lossy(&bytes));
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_millis() as i64;
+    let mut us: Vec<i64> = text
+        .lines()
+        .filter(|l| l.contains("\"t\":\"tick\""))
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v.get("ts").and_then(Value::as_i64).map(|t| now - t <= 90_000).unwrap_or(false))
+        .filter_map(|v| v.get("us").and_then(Value::as_i64))
+        .collect();
+    if us.len() < 40 {
+        return None;
+    }
+    us.sort_unstable();
+    Some(us[(us.len() - 1) * 99 / 100] as f64 / 1000.0)
+}
+
+/// Why batch work should stand still right now, if it should.
+pub fn overload(root: &Path, cfg: &Config) -> Option<String> {
+    let load = load_average();
+    if load > cfg.guard_load {
+        return Some(format!("load average {load:.1} is above {:.0}", cfg.guard_load));
+    }
+    for b in cfg.bots.iter().filter(|b| b.expect_online) {
+        if let Some(p99) = recent_think_p99_ms(root, &b.name) {
+            if p99 > cfg.guard_think_p99_ms {
+                return Some(format!("{} think time p99 is {p99:.0} ms, above {:.0} ms", b.name, cfg.guard_think_p99_ms));
+            }
+        }
+    }
+    None
+}
+
+/// A line in the alert log without a notification on screen.
+fn log_line(root: &Path, kind: &str, text: &str) {
+    let line = format!("{} {kind} {text}", utc_stamp());
+    eprintln!("{line}");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(alert_log(root)) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+struct Guard {
+    paused: bool,
+    calm: u32,
+}
+
+impl Guard {
+    fn check(&mut self, root: &Path, cfg: &Config) {
+        match overload(root, cfg) {
+            Some(why) => {
+                self.calm = 0;
+                let _ = std::fs::create_dir_all(root.join("data").join("run"));
+                let _ = std::fs::write(pause_file(root), format!("{} {why}\n", utc_stamp()));
+                if !self.paused {
+                    self.paused = true;
+                    log_line(root, "LOAD", &format!("batch work paused: {why}"));
+                }
+            }
+            None => {
+                self.calm += 1;
+                // Four calm checks in a row (a minute) before batch work may go on.
+                if self.calm >= 4 && (self.paused || pause_file(root).exists()) {
+                    let _ = std::fs::remove_file(pause_file(root));
+                    if self.paused {
+                        log_line(root, "LOAD", "batch work may go on: the machine is calm again");
+                    }
+                    self.paused = false;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Watch {
     offline_since: Option<Instant>,
@@ -90,6 +195,7 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
     let mut bots: HashMap<String, Watch> = HashMap::new();
     let mut api_down_since: Option<Instant> = None;
     let mut api_alerted = false;
+    let mut guard = Guard { paused: false, calm: 0 };
     eprintln!("{} watchdog started", utc_stamp());
     while !stop() {
         // The list is read each round, so a config edit needs no restart.
@@ -139,7 +245,12 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
             api_alerted = false;
         }
         let until = Instant::now() + CHECK_EVERY;
+        let mut next_guard = Instant::now();
         while Instant::now() < until && !stop() {
+            if Instant::now() >= next_guard {
+                next_guard = Instant::now() + Duration::from_secs(15);
+                guard.check(root, &cfg);
+            }
             std::thread::sleep(Duration::from_millis(500));
         }
     }

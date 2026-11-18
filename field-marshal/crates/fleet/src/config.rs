@@ -5,7 +5,9 @@
 //! ```
 //!
 //! `managed` bots are run by `fleet run` under launchd. `experiments` lets a bot take arms
-//! from the experiment plan. `expect_online` puts a bot under the offline watchdog. Every name listed here counts as one of ours.
+//! from the experiment plan. `expect_online` puts a bot under the offline watchdog. An
+//! optional top-level `"guard": { "load": 8, "think_p99_ms": 300 }` sets when the load guard
+//! pauses batch work. Every name listed here counts as one of ours.
 
 use serde_json::Value;
 use std::path::Path;
@@ -29,9 +31,19 @@ pub struct BotConfig {
     pub owner: Option<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Config {
     pub bots: Vec<BotConfig>,
+    /// the load guard pauses batch work above this 1-minute load average
+    pub guard_load: f64,
+    /// ... or when a live bot's think time (99th percentile over the last 90 s) is above this
+    pub guard_think_p99_ms: f64,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0 }
+    }
 }
 
 impl Config {
@@ -61,7 +73,9 @@ impl Config {
                 });
             }
         }
-        Config { bots }
+        let d = Config::default();
+        let guard = |k: &str, dflt: f64| v.get("guard").and_then(|g| g.get(k)).and_then(Value::as_f64).unwrap_or(dflt);
+        Config { bots, guard_load: guard("load", d.guard_load), guard_think_p99_ms: guard("think_p99_ms", d.guard_think_p99_ms) }
     }
 
     pub fn bot(&self, name: &str) -> Option<&BotConfig> {

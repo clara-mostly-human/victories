@@ -305,10 +305,13 @@ fn xml(text: &str) -> String {
 }
 
 /// A launchd agent. `interval` runs the program every so many seconds instead of keeping it alive.
-pub fn plist(label: &str, root: &Path, args: &[String], log: &Path, interval: Option<u32>) -> String {
+pub fn plist(label: &str, root: &Path, args: &[String], log: &Path, interval: Option<u32>, batch: bool) -> String {
     let args: String = args.iter().map(|a| format!("    <string>{}</string>\n", xml(a))).collect();
+    // Batch agents (collector, health pass) yield the processor and the disk to the bots.
+    let low = "  <key>Nice</key><integer>15</integer>\n  <key>LowPriorityIO</key><true/>\n  <key>ProcessType</key><string>Background</string>\n";
     let mode = match interval {
-        Some(s) => format!("  <key>StartInterval</key><integer>{s}</integer>\n  <key>RunAtLoad</key><true/>\n"),
+        Some(s) => format!("  <key>StartInterval</key><integer>{s}</integer>\n  <key>RunAtLoad</key><true/>\n{low}"),
+        None if batch => format!("  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ThrottleInterval</key><integer>30</integer>\n{low}"),
         // ExitTimeOut: launchd waits this long after SIGTERM, so a stop lets the match finish.
         None => "  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ThrottleInterval</key><integer>10</integer>\n  <key>ExitTimeOut</key><integer>960</integer>\n  <key>ProcessType</key><string>Interactive</string>\n".to_string(),
     };

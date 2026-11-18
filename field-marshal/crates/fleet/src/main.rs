@@ -484,7 +484,7 @@ fn main_inner() -> Result<i32, String> {
             if let Some(dir) = log.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            supervise::install_agent(&lbl, &supervise::plist(&lbl, &root, &args, &log, interval))?;
+            supervise::install_agent(&lbl, &supervise::plist(&lbl, &root, &args, &log, interval, what == "collector"))?;
             println!("{lbl} installed and loaded; log {}", log.display());
         }
         "uninstall" => {
@@ -635,6 +635,20 @@ fn main_inner() -> Result<i32, String> {
                 drop(store);
                 fleet::online::run(&root, &|| STOP.load(Ordering::Relaxed));
             } else {
+                println!(
+                    "load average {:.1} (guard at {:.0}); batch work {}",
+                    fleet::online::load_average(),
+                    cfg.guard_load,
+                    match std::fs::read_to_string(fleet::online::pause_file(&root)) {
+                        Ok(why) => format!("PAUSED since {}", why.trim()),
+                        Err(_) => "may run".to_string(),
+                    }
+                );
+                for b in cfg.bots.iter().filter(|b| b.expect_online) {
+                    if let Some(p99) = fleet::online::recent_think_p99_ms(&root, &b.name) {
+                        println!("{:<15} think time p99 over the last 90 s: {p99:.0} ms (guard at {:.0})", b.name, cfg.guard_think_p99_ms);
+                    }
+                }
                 for b in &cfg.bots {
                     let state = match fleet::online::is_online(&b.name) {
                         Ok(true) => "online".to_string(),

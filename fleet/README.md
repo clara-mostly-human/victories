@@ -26,10 +26,20 @@ put its token in `bots/<name>`, add it to `fleet/bots.json` with `"managed": tru
 
 | Agent | What it does |
 | --- | --- |
-| `com.victris.fleet-online` | Offline watchdog. Asks the ladder once a minute whether each bot with `expect_online` is online. After two minutes offline it writes an `ALERT` line to `logs/fleet-alerts.log`, shows a Mac notification, and repeats every 15 minutes until a `RECOVERED` line. Read-only. |
+| `com.victris.fleet-online` | Offline watchdog and load guard. Asks the ladder once a minute whether each bot with `expect_online` is online. After two minutes offline it writes an `ALERT` line to `logs/fleet-alerts.log`, shows a Mac notification, and repeats every 15 minutes until a `RECOVERED` line. Read-only. |
 | `com.victris.fleet-collector` | Replay collector, see below. |
 | `com.victris.fleet-watch` | Every 5 minutes: loads new games from bot logs into the store, and kills a managed bot that has been silent for 20 minutes so its supervisor restarts it. Once a day it writes a snapshot of the store to `data/backup/` (the newest seven are kept) and compresses tick logs of managed bots that are more than two days old. |
 | `com.victris.<bot>` | Supervisor of one managed bot (`fleet run <bot>`). |
+
+**Live bots come first.** The M4 has four fast cores and each live bot needs one, so everything
+else here is batch work and stays out of the way: duels, the arena gate, release builds, the
+collector and the health pass all run under `nice -n 15`; a gate uses one worker (two search
+processes) unless told two, never more. On top of that the watchdog agent is a load guard:
+every 15 seconds it looks at the load average and at each live bot's think time over the
+last 90 seconds, and while either is too high (`"guard": {"load": 8, "think_p99_ms": 300}`
+in `fleet/bots.json`) it keeps `data/run/batch.pause` in place. No duel starts a game while
+that file exists. `fleet online` shows the load, the think times and whether batch work is
+paused. Anything else long-running on this machine should check the same file.
 
 `fleet status` shows all of it on one screen. `fleet alerts` prints the alert log.
 

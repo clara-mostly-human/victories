@@ -5,7 +5,13 @@
 // with the ladder's time limits. Nothing here touches the ladder.
 //
 //   node fleet/duel.mjs --a <marshal> [--a-playbooks file] --b <marshal> [--b-playbooks file]
-//        [--games 200] [--workers 2] [--seed 1]
+//        [--games 200] [--workers 1] [--seed 1] [--max-load 6] [--pause-file path]
+//
+// This is batch work on a machine that also runs live bots, so it stays out of their way:
+// the bot processes run under `nice -n 15`, one worker (two search processes) is the
+// default, and between games it waits while the 1-minute load average is above --max-load
+// or while the pause file exists (the fleet's load guard writes it when a live bot's think
+// time rises).
 //
 // Games come in pairs: the same map and seed twice with the seats swapped, so map, spawn
 // and seat effects cancel. One JSON line per finished game on stdout, from A's side:
@@ -14,6 +20,8 @@
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { existsSync } from "node:fs";
+import { loadavg } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -27,7 +35,9 @@ const opt = (name, dflt) => {
   return i < 0 ? dflt : args[i + 1];
 };
 const GAMES = Number(opt("games", "200"));
-const WORKERS = Number(opt("workers", "2"));
+const WORKERS = Number(opt("workers", "1"));
+const MAX_LOAD = Number(opt("max-load", "6"));
+const PAUSE_FILE = opt("pause-file", join(here, "../data/run/batch.pause"));
 const SEED = Number(opt("seed", "1"));
 const SIDES = {
   a: { bin: opt("a", ""), playbooks: opt("a-playbooks", "") },
@@ -47,7 +57,7 @@ class Bot {
     this.dead = false;
     const a = ["--bot", `duel-${side}`, "--stdio"];
     if (SIDES[side].playbooks) a.push("--playbooks", SIDES[side].playbooks);
-    this.child = spawn(SIDES[side].bin, a, { stdio: ["pipe", "pipe", "ignore"] });
+    this.child = spawn("/usr/bin/nice", ["-n", "15", SIDES[side].bin, ...a], { stdio: ["pipe", "pipe", "ignore"] });
     children.add(this.child);
     this.child.on("exit", () => {
       this.dead = true;
@@ -155,9 +165,27 @@ let next = 0;
 let stopping = false;
 const tally = { win: 0, loss: 0, draw: 0 };
 
+// Live bots come first: no new game starts while the machine is busy or the guard says stop.
+let waitingSince = 0;
+async function yieldToLiveBots() {
+  for (;;) {
+    const paused = existsSync(PAUSE_FILE);
+    const load = loadavg()[0];
+    if (!paused && load <= MAX_LOAD) break;
+    if (!waitingSince || Date.now() - waitingSince > 60000) {
+      waitingSince = Date.now();
+      process.stderr.write(`duel: waiting (${paused ? "paused by the load guard" : `load ${load.toFixed(1)} above ${MAX_LOAD}`})\n`);
+    }
+    await new Promise((r) => setTimeout(r, 5000));
+    if (stopping) return;
+  }
+  waitingSince = 0;
+}
+
 async function worker() {
   let bots = { a: new Bot("a"), b: new Bot("b") };
   while (!stopping) {
+    await yieldToLiveBots();
     const game = next++;
     if (game >= GAMES) break;
     // A bot that died plays the rest of that game as timeouts; it gets a fresh process after.

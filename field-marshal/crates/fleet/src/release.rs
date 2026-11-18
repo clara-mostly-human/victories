@@ -79,10 +79,16 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
     let ws = src.join("field-marshal");
     let target = build_dir.join("target");
     eprintln!("building");
-    sh(Command::new("cargo").current_dir(&ws).env("CARGO_TARGET_DIR", &target).args(["build", "--release", "-p", "marshal"]), "cargo build")?;
+    // Low priority and two jobs: a build must not take the fast cores from the live bots.
+    let cargo = |args: &[&str]| {
+        let mut c = Command::new("/usr/bin/nice");
+        c.current_dir(&ws).env("CARGO_TARGET_DIR", &target).env("CARGO_BUILD_JOBS", "2").env("RUST_TEST_THREADS", "2").args(["-n", "15", "cargo"]).args(args);
+        c
+    };
+    sh(&mut cargo(&["build", "--release", "-p", "marshal"]), "cargo build")?;
     if tests {
         eprintln!("running the tests");
-        sh(Command::new("cargo").current_dir(&ws).env("CARGO_TARGET_DIR", &target).args(["test", "--release", "--workspace"]), "cargo test")?;
+        sh(&mut cargo(&["test", "--release", "--workspace"]), "cargo test")?;
     }
     let seq = store.next_release_seq().map_err(|e| e.to_string())?;
     let id = format!("r{seq}-{short}");
@@ -126,7 +132,7 @@ pub struct GateOptions {
 
 impl Default for GateOptions {
     fn default() -> Self {
-        GateOptions { against: None, max_games: 400, workers: 2, seed: 1, s0: 0.50, s1: 0.56 }
+        GateOptions { against: None, max_games: 400, workers: 1, seed: 1, s0: 0.50, s1: 0.56 }
     }
 }
 
@@ -141,15 +147,22 @@ pub fn gate(root: &Path, store: &Store, id: &str, o: &GateOptions) -> Result<Val
         return Err("a release cannot be gated against itself".into());
     }
     let playbooks = |r: &Release| Path::new(&r.path).join("playbooks").join("default.json");
-    let mut child = Command::new("node")
+    // Batch work: low priority, and never more than two workers (four search processes)
+    // on a machine whose four fast cores are shared with the live bots.
+    let workers = o.workers.clamp(1, 2);
+    if workers != o.workers {
+        eprintln!("--workers {} reduced to {workers}: live bots share this machine", o.workers);
+    }
+    let mut child = Command::new("/usr/bin/nice")
         .current_dir(root)
+        .args(["-n", "15", "node"])
         .arg(root.join("fleet").join("duel.mjs"))
         .arg("--a").arg(Path::new(&cand.path).join("marshal"))
         .arg("--a-playbooks").arg(playbooks(&cand))
         .arg("--b").arg(Path::new(&base.path).join("marshal"))
         .arg("--b-playbooks").arg(playbooks(&base))
         .arg("--games").arg(o.max_games.to_string())
-        .arg("--workers").arg(o.workers.to_string())
+        .arg("--workers").arg(workers.to_string())
         .arg("--seed").arg(o.seed.to_string())
         .stdout(Stdio::piped())
         .spawn()
