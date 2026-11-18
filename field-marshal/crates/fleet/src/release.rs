@@ -81,6 +81,12 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
         Command::new("sh").current_dir(root).arg("-c").arg(format!("git archive {sha} field-marshal | tar -x -C '{}'", src.display())),
         "git archive",
     )?;
+    // `git archive` stamps every file with the commit's time. Cargo decides what to rebuild
+    // by comparing those times with its earlier outputs in the shared target folder, so a
+    // commit made before the previous build finished would be taken for unchanged and the
+    // release would carry the previous commit's code. Stamping the export with the present
+    // moment makes every crate of the workspace build afresh from exactly these files.
+    sh(Command::new("find").arg(&src).args(["-type", "f", "-exec", "touch", "{}", "+"]), "touch the export")?;
     let ws = src.join("field-marshal");
     let target = build_dir.join("target");
     eprintln!("building");
