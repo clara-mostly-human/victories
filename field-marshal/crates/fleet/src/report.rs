@@ -369,3 +369,106 @@ ul {{ list-style: none; margin: 0; padding: 10px 14px; font: 12px/1.6 ui-monospa
         queued = s.corpus_queued,
     )
 }
+
+fn csv_cell(t: &str) -> String {
+    if t.contains(',') || t.contains('"') || t.contains('\n') {
+        format!("\"{}\"", t.replace('"', "\"\""))
+    } else {
+        t.to_string()
+    }
+}
+
+fn csv(header: &[&str], rows: Vec<Vec<String>>) -> String {
+    let mut out = header.join(",");
+    out.push('\n');
+    for r in rows {
+        out.push_str(&r.iter().map(|c| csv_cell(c)).collect::<Vec<_>>().join(","));
+        out.push('\n');
+    }
+    out
+}
+
+/// The snapshot as plain tables (`summary.csv`, `bots.csv`, `arms.csv`, `releases.csv`,
+/// `alerts.csv`), for the hosted status page, which draws from attached files.
+pub fn write_csv(s: &Snapshot, dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let up = s.bots.iter().filter(|b| state(b).1 != "bad").count();
+    let games: i64 = s.bots.iter().map(|b| b.day.games()).sum();
+    std::fs::write(
+        dir.join("summary.csv"),
+        csv(
+            &["as_of", "bots_up", "bots", "games_24h", "alerts_24h", "replays", "replays_24h", "replays_2400", "replays_waiting", "load", "batch", "live_release"],
+            vec![vec![
+                s.at.clone(),
+                up.to_string(),
+                s.bots.len().to_string(),
+                games.to_string(),
+                s.alerts_day.to_string(),
+                s.corpus_ok.to_string(),
+                s.corpus_day.to_string(),
+                s.corpus_strong.to_string(),
+                s.corpus_queued.to_string(),
+                format!("{:.1}", s.load),
+                if s.paused.is_some() { "paused".into() } else { "may run".into() },
+                s.live.clone(),
+            ]],
+        ),
+    )?;
+    std::fs::write(
+        dir.join("bots.csv"),
+        csv(
+            &["bot", "role", "state", "release", "version", "rating", "rating_change_24h", "games_24h", "games_last_hour", "wins", "losses", "draws", "score_pct", "think_p99_ms"],
+            s.bots
+                .iter()
+                .map(|b| {
+                    vec![
+                        b.name.clone(),
+                        b.role.clone(),
+                        state(b).0.to_string(),
+                        b.release.clone(),
+                        b.version.clone(),
+                        b.rating.map(|r| format!("{r:.0}")).unwrap_or_default(),
+                        format!("{:.0}", b.rating_day),
+                        b.day.games().to_string(),
+                        b.hour_games.to_string(),
+                        b.day.wins.to_string(),
+                        b.day.losses.to_string(),
+                        b.day.draws.to_string(),
+                        if b.day.games() > 0 { format!("{:.0}", 100.0 * b.day.score()) } else { String::new() },
+                        b.think_p99_ms.map(|p| format!("{p:.0}")).unwrap_or_default(),
+                    ]
+                })
+                .collect(),
+        ),
+    )?;
+    std::fs::write(
+        dir.join("arms.csv"),
+        csv(
+            &["experiment", "arm", "games", "target", "wins", "losses", "draws", "score_pct", "low_pct", "high_pct"],
+            s.arms
+                .iter()
+                .map(|a| {
+                    let (lo, hi) = a.record.interval();
+                    vec![
+                        a.experiment.clone(),
+                        a.arm.clone(),
+                        a.record.games().to_string(),
+                        a.target.to_string(),
+                        a.record.wins.to_string(),
+                        a.record.losses.to_string(),
+                        a.record.draws.to_string(),
+                        if a.record.games() > 0 { format!("{:.0}", 100.0 * a.record.score()) } else { String::new() },
+                        if a.record.games() > 0 { format!("{:.0}", 100.0 * lo) } else { String::new() },
+                        if a.record.games() > 0 { format!("{:.0}", 100.0 * hi) } else { String::new() },
+                    ]
+                })
+                .collect(),
+        ),
+    )?;
+    std::fs::write(
+        dir.join("releases.csv"),
+        csv(&["release", "status", "arena_gate", "ladder_evidence", "note"], s.releases.iter().map(|r| vec![r.id.clone(), r.status.clone(), r.gate.clone(), r.evidence.clone(), r.note.clone()]).collect()),
+    )?;
+    std::fs::write(dir.join("alerts.csv"), csv(&["n", "line"], s.alerts.iter().enumerate().map(|(i, l)| vec![(i + 1).to_string(), l.clone()]).collect()))?;
+    Ok(())
+}

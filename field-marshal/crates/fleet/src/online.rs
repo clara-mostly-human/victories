@@ -74,6 +74,13 @@ pub fn alert(root: &Path, kind: &str, bot: Option<&str>, text: &str) {
     if let Ok(store) = Store::open(&default_db(root), Duration::from_secs(2)) {
         store.event(bot, &format!("alert_{}", kind.to_lowercase()), &json!({ "text": text }));
     }
+    // An optional hook carries the alert off the machine (a phone push, a message): if
+    // `fleet/alert-hook.sh` exists and is executable it is run with the kind and the text
+    // as its two arguments, in the background, so a slow hook never holds the watchdog.
+    let hook = root.join("fleet").join("alert-hook.sh");
+    if hook.is_file() {
+        let _ = Command::new(&hook).arg(kind).arg(text).current_dir(root).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+    }
     // The text goes to osascript as an argument, never into the script itself.
     let _ = Command::new("osascript")
         .args(["-e", "on run argv", "-e", "display notification (item 1 of argv) with title \"Victris fleet\" sound name \"Basso\"", "-e", "end run", text])

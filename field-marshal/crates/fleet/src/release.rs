@@ -61,6 +61,11 @@ fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
 pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, tests: bool) -> Result<Release, String> {
     let sha = sh(Command::new("git").current_dir(root).args(["rev-parse", "--verify", &format!("{git_ref}^{{commit}}")]), "git rev-parse")?;
     let short = &sha[..7.min(sha.len())];
+    // One build at a time: the autopilot and a person may ask for the same commit at once,
+    // and both would work in the same folders. The second waits, then finds the release.
+    let _ = std::fs::create_dir_all(data_dir(root).join("build"));
+    let lock = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(data_dir(root).join("build").join(".lock")).map_err(|e| e.to_string())?;
+    lock.lock().map_err(|e| format!("cannot take the build lock: {e}"))?;
     if let Some(r) = store.releases().map_err(|e| e.to_string())?.into_iter().find(|r| r.git_sha == sha) {
         if Path::new(&r.path).join("marshal").is_file() {
             eprintln!("commit {short} is already release {}", r.id);

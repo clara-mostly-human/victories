@@ -699,9 +699,14 @@ fn main_inner() -> Result<i32, String> {
             }
         }
         "report" => {
+            let snap = fleet::report::snapshot(&root, &store, &cfg);
             let path = data_dir(&root).join("status.html");
-            std::fs::write(&path, fleet::report::html(&fleet::report::snapshot(&root, &store, &cfg))).map_err(e)?;
+            std::fs::write(&path, fleet::report::html(&snap)).map_err(e)?;
             println!("{}", path.display());
+            // The same numbers as tables, for the hosted page.
+            let dir = data_dir(&root).join("status");
+            fleet::report::write_csv(&snap, &dir).map_err(e)?;
+            println!("{}", dir.display());
         }
         "digest" => print!("{}", fleet::report::digest(&fleet::report::snapshot(&root, &store, &cfg))),
         "alerts" => {

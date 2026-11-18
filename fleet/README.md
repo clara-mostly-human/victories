@@ -11,12 +11,25 @@ running agent. `fleet help` lists every command.
 State lives in `data/` (not in git): `data/fleet.db` is the store, `data/releases/` the frozen
 builds, `data/run/` pid files. Per-bot settings are in `fleet/bots.json` (in git, no secrets).
 
+## Where to look
+
+- `fleet status` and `fleet online`: every bot, the live release, experiments, load and think times.
+- `data/status.html`: the same as a page, rewritten every five minutes on the Mac.
+- `fleet digest`: the last 24 hours in a few lines. A scheduled task in the Claude app
+  (`victris-fleet-daily-digest`, every morning at about 08:10 local) runs it and pushes the
+  first line to the phone.
+- `logs/fleet-alerts.log` (`fleet alerts`): `ALERT` and `RECOVERED` from the watchdog, `LOAD` from
+  the load guard, `PIPELINE` from the autopilot. If `fleet/alert-hook.sh` exists and is
+  executable, every `ALERT` and `RECOVERED` also runs it with the kind and the text as its two
+  arguments; that is the place to send alerts to a phone without any Claude session running.
+
 ## Who runs what
 
 | Bot | Run by | The fleet |
 | --- | --- | --- |
-| field-marshal | the search thread, launchd agent `com.victris.field-marshal` | reads its logs, watches that it is online. Never starts it or uses its token. |
-| foot-soldier | `fleet run foot-soldier` under launchd (`com.victris.foot-soldier`) | the canary: supervises it, runs experiments and canary releases on it. It is the Rust bot since 2026-11-18; the TypeScript bot in `foot-soldier/` (v1, v2) is retired and only kept as an arena opponent. |
+| field-marshal | the search thread. Its launchd wrapper runs `data/releases/live/marshal`, the release `fleet release promote` last set. | builds its releases, keeps the live pointer, reads its results, watches that it is online. Never starts, stops or restarts it, and never uses its token. |
+| foot-soldier | `fleet run foot-soldier` under launchd | the canary: always carries the newest release allowed on the ladder and takes no experiment arms, so its record is the record of one release. (The TypeScript bot in `foot-soldier/` is retired and only kept as an arena opponent.) |
+| shock-trooper, quarter-master, spy-master | `fleet run <bot>` under launchd | scouts: run the live release and take arms from the experiment plan. |
 
 A bot is `managed` when the fleet supervises it. Adding a scout later is: register the bot,
 put its token in `bots/<name>`, add it to `fleet/bots.json` with `"managed": true`, then
@@ -42,6 +55,28 @@ that file exists. `fleet online` shows the load, the think times and whether bat
 paused. Anything else long-running on this machine should check the same file.
 
 `fleet status` shows all of it on one screen. `fleet alerts` prints the alert log.
+
+## The autopilot
+
+`com.victris.fleet-autopilot` runs the pipeline by itself, one step a minute, and writes a
+`PIPELINE` line for everything it does:
+
+1. A commit on `main` that changes `field-marshal/crates/bot`, `crates/engine` or `playbooks`
+   is built into a release about two minutes after it lands.
+2. The newest build plays the live release in the arena gate, as a low-priority child under
+   the load guard. A build with the same search as the live one (only `session.rs`,
+   `main.rs`, `fleet_hook.rs` or `lib.rs` differ) skips the gate: the arena could not tell
+   them apart.
+3. The newest build that passed, or was promoted, goes on the canary.
+4. Ladder evidence for what is on the canary is worked out every ten minutes.
+5. Scouts are moved to a fleet build of the live release's commit, but never while an
+   experiment is running.
+
+It never promotes and never touches the flagship. Promotion is a person's or the search
+thread's step: `fleet release promote <id>` after the evidence passed, or with
+`--force "<reason>"` as the owner's own call. Promote moves `data/releases/live` and
+`data/releases/live.env` (`RELEASE=<id>`) by rename, so a restart never lands between two
+releases.
 
 ## The store
 
@@ -72,6 +107,7 @@ match row are one transaction, so several bots can draw at once.
 
     fleet plan add slam.json
     fleet plan show slam-risk-vs-top     # record per arm and per opponent, balance per cell
+    fleet plan add-arm slam-risk-vs-top risk2 '{"slam_risk": 2}'   # joins a running experiment
     fleet plan pause|resume|stop <name>
 
 In the client this is the `Strategist` trait in `crates/bot/src/session.rs`: asked once at
