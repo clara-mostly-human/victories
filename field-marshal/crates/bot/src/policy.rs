@@ -129,6 +129,12 @@ pub struct Playbook {
     /// a buffed Shelbot3 took us from 118 hp to 21 in six ticks while we stood one tile
     /// from the second pad. The buff is damage x3/2 for 50 ticks.
     pub pad_bonus: f64,
+    /// above 0, the turn comes from the tree search for both sides (`victris_engine::mcts`)
+    /// run for this many milliseconds, with none of the hand-set terms of this file. Used
+    /// while the opponent is in view; out of view the old policy looks for it.
+    pub tree_ms: u64,
+    /// ticks the tree search looks ahead
+    pub tree_depth: u32,
     /// weight (hp per unit of log probability) of the learned movement prior: how likely
     /// a strong bot is to hold, step toward, away, sideways or dash in our situation
     /// (`movemodel`, fitted on 922 replay games; it predicts 50% of their moves in unseen
@@ -262,6 +268,8 @@ impl Default for Playbook {
             prior_model: false,
             pad_race: false,
             pad_bonus: 0.0,
+            tree_ms: 0,
+            tree_depth: 12,
             move_prior_weight: 0.0,
             attack_prior_weight: 0.0,
             rollout_punish: false,
@@ -362,6 +370,12 @@ impl Playbook {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
+        }
+        if let Some(x) = v.get("tree_ms").and_then(Value::as_u64) {
+            p.tree_ms = x;
+        }
+        if let Some(x) = v.get("tree_depth").and_then(Value::as_u64) {
+            p.tree_depth = x as u32;
         }
         if let Some(x) = v.get("frost_hold_grace").and_then(Value::as_i64) {
             p.frost_hold_grace = x as i32;
@@ -1158,6 +1172,27 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     }
     let k = kit(e);
     let visible = view.enemy.is_some();
+    // The tree search as the whole brain: both sides search for their best move on the
+    // exact engine for `tree_ms`, and we play our most visited turn.
+    if pb.tree_ms > 0 && visible {
+        let cfg = victris_engine::mcts::Config { depth: pb.tree_depth, ..Default::default() };
+        let mut search = victris_engine::mcts::Search::new(e, cfg);
+        search.start();
+        let mut done = 0u32;
+        loop {
+            search.iterate(&s, [None, None], 1000);
+            done += 1000;
+            if started.elapsed().as_millis() as u64 >= pb.tree_ms {
+                break;
+            }
+        }
+        let root = search.result();
+        let best = root.acts[me].iter().max_by_key(|a| a.1).copied();
+        return match best {
+            Some((turn, _, q)) => Decision { turn, sims: done, score: q, note: "tree" },
+            None => idle,
+        };
+    }
     let dist_now = chebyshev(my.pos, en.pos);
 
     // ---- our options: a movement (or none), then an attack (or none)

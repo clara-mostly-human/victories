@@ -37,11 +37,13 @@ pub struct Config {
     pub buff_value: f64,
     /// share of the prior that is spread evenly over all turns
     pub even: f32,
+    /// nodes at most this many ticks below the root order forcing turns first
+    pub forcing_depth: u32,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, forcing_depth: 2 }
     }
 }
 
@@ -63,8 +65,11 @@ struct Node {
     n: u32,
 }
 
-/// The turns a fighter can take, with priors that sum to 1.
-pub fn actions(e: &Engine, s: &State, x: usize, even: f32) -> Vec<Act> {
+/// The turns a fighter can take, with priors that sum to 1. With `forcing`, turns that
+/// hurt or stun the opponent at once if it stands still are tried first, the way a chess
+/// engine tries captures and checks first; this costs one engine step per turn, so it is
+/// used only near the root.
+pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool) -> Vec<Act> {
     let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
     let idle = vec![Act { turn: RawTurn::IDLE, prior: 1.0, n: 0, w: 0.0 }];
     if f.state != FState::Idle || !f.alive || !o.alive {
@@ -138,6 +143,24 @@ pub fn actions(e: &Engine, s: &State, x: usize, even: f32) -> Vec<Act> {
     for a in out.iter_mut() {
         a.prior = (1.0 - even) * a.prior / total.max(1e-6) + even * flat;
     }
+    if forcing {
+        let gains: Vec<f32> = out
+            .iter()
+            .map(|a| {
+                let mut st = *s;
+                let turns = if x == 0 { [a.turn, RawTurn::IDLE] } else { [RawTurn::IDLE, a.turn] };
+                let was = st.fighters[1 - x].state;
+                let lost = e.step(&mut st, &turns).hp_lost[1 - x] as f32;
+                lost + if st.fighters[1 - x].state == FState::Stunned && was != FState::Stunned { 15.0 } else { 0.0 }
+            })
+            .collect();
+        let sum: f32 = gains.iter().sum();
+        if sum > 0.0 {
+            for (a, g) in out.iter_mut().zip(&gains) {
+                a.prior = 0.6 * a.prior + 0.4 * g / sum;
+            }
+        }
+    }
     out
 }
 
@@ -190,8 +213,10 @@ pub fn quiet_turn(e: &Engine, s: &State, x: usize) -> RawTurn {
     turn
 }
 
-fn reward(s: &State, lost: [i32; 2]) -> f64 {
-    let mut r = (lost[1] - lost[0]) as f64;
+/// The change in the hp difference over a tick, for fighter 0: damage dealt and taken,
+/// and healing from a pad, with the kill bonus. `before` is (hp of 0, hp of 1) before it.
+fn reward(s: &State, before: (i32, i32)) -> f64 {
+    let mut r = ((s.fighters[0].hp.max(0) - before.0) - (s.fighters[1].hp.max(0) - before.1)) as f64;
     if !s.fighters[1].alive {
         r += KILL;
     }
@@ -210,8 +235,9 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config) -> f64 {
             break;
         }
         let turns = [quiet_turn(e, &st, 0), quiet_turn(e, &st, 1)];
-        let lost = e.step(&mut st, &turns).hp_lost;
-        v += reward(&st, lost);
+        let before = (st.fighters[0].hp, st.fighters[1].hp);
+        e.step(&mut st, &turns);
+        v += reward(&st, before);
     }
     let buff = |i: usize| if st.fighters[i].power_until == NO_BUFF { 0 } else { (st.fighters[i].power_until - st.tick).max(0) };
     v + cfg.buff_value * (buff(0) - buff(1)) as f64
@@ -222,6 +248,8 @@ pub struct Search<'a> {
     pub cfg: Config,
     nodes: Vec<Node>,
     children: HashMap<u64, u32>,
+    total: f64,
+    done: u32,
 }
 
 /// What the search found at the root, for each side: (turn, visits, average result in hp
@@ -234,7 +262,7 @@ pub struct RootResult {
 
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, cfg: Config) -> Search<'a> {
-        Search { e, cfg, nodes: Vec::new(), children: HashMap::new() }
+        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0 }
     }
 
     fn select(&self, node: usize, side: usize) -> usize {
@@ -253,11 +281,30 @@ impl<'a> Search<'a> {
 
     /// Searches from `root`. A side with a turn in `fixed` plays that turn at the root.
     pub fn run(&mut self, root: &State, fixed: [Option<RawTurn>; 2]) -> RootResult {
+        self.start();
+        self.iterate(root, fixed, self.cfg.iterations);
+        self.result()
+    }
+
+    /// Empties the tree for a new root.
+    pub fn start(&mut self) {
         self.nodes.clear();
         self.children.clear();
         self.nodes.push(Node::default());
+        self.total = 0.0;
+        self.done = 0;
+    }
+
+    /// What the tree holds at the root now.
+    pub fn result(&self) -> RootResult {
+        let list = |x: usize| self.nodes[0].acts[x].iter().map(|a| (a.turn, a.n, if a.n > 0 { a.w / a.n as f64 } else { 0.0 })).collect();
+        RootResult { acts: [list(0), list(1)], value: self.total / self.done.max(1) as f64 }
+    }
+
+    /// Runs `count` more iterations from `root` (after `start`).
+    pub fn iterate(&mut self, root: &State, fixed: [Option<RawTurn>; 2], count: u32) {
         let mut total = 0.0;
-        for _ in 0..self.cfg.iterations {
+        for _ in 0..count {
             let mut s = *root;
             let mut node = 0usize;
             let mut path: Vec<(usize, usize, usize, f64)> = Vec::with_capacity(self.cfg.depth as usize);
@@ -267,7 +314,7 @@ impl<'a> Search<'a> {
                     for x in 0..2 {
                         self.nodes[node].acts[x] = match (depth, fixed[x]) {
                             (0, Some(t)) => vec![Act { turn: t, prior: 1.0, n: 0, w: 0.0 }],
-                            _ => actions(self.e, &s, x, self.cfg.even),
+                            _ => actions(self.e, &s, x, self.cfg.even, depth <= self.cfg.forcing_depth),
                         };
                     }
                     if depth > 0 {
@@ -277,8 +324,9 @@ impl<'a> Search<'a> {
                 }
                 let (i0, i1) = (self.select(node, 0), self.select(node, 1));
                 let turns = [self.nodes[node].acts[0][i0].turn, self.nodes[node].acts[1][i1].turn];
-                let lost = self.e.step(&mut s, &turns).hp_lost;
-                path.push((node, i0, i1, reward(&s, lost)));
+                let before = (s.fighters[0].hp, s.fighters[1].hp);
+                self.e.step(&mut s, &turns);
+                path.push((node, i0, i1, reward(&s, before)));
                 if s.result.is_some() {
                     break;
                 }
@@ -309,7 +357,7 @@ impl<'a> Search<'a> {
             }
             total += g;
         }
-        let list = |x: usize| self.nodes[0].acts[x].iter().map(|a| (a.turn, a.n, if a.n > 0 { a.w / a.n as f64 } else { 0.0 })).collect();
-        RootResult { acts: [list(0), list(1)], value: total / self.cfg.iterations.max(1) as f64 }
+        self.total += total;
+        self.done += count;
     }
 }
