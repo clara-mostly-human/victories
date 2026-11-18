@@ -216,7 +216,21 @@ impl Guard {
             self.reset_calm = 0;
             if !self.resetting {
                 self.resetting = true;
-                log_line(root, "RESETS", &format!("the ladder dropped {n} of our bots' connections in the last 3 minutes"));
+                // Was it our own network? Ask the router and a neutral host right now.
+                let ping = |host: &str| -> String {
+                    match Command::new("/sbin/ping").args(["-c", "3", "-i", "0.2", "-t", "3", "-q", host]).output() {
+                        Ok(o) => {
+                            let text = String::from_utf8_lossy(&o.stdout).to_string();
+                            let loss = text.lines().find(|l| l.contains("packet loss")).and_then(|l| l.split(", ").find(|p| p.contains("packet loss")).map(str::to_string)).unwrap_or_else(|| "no answer".into());
+                            let rtt = text.lines().find(|l| l.contains("min/avg/max")).and_then(|l| l.split('=').nth(1)).and_then(|v| v.trim().split('/').nth(1)).map(|a| format!(", {a} ms")).unwrap_or_default();
+                            format!("{loss}{rtt}")
+                        }
+                        Err(_) => "ping failed".into(),
+                    }
+                };
+                let gateway = Command::new("/sbin/route").args(["-n", "get", "default"]).output().ok().and_then(|o| String::from_utf8_lossy(&o.stdout).lines().find(|l| l.contains("gateway:")).and_then(|l| l.split_whitespace().nth(1)).map(str::to_string));
+                let router = gateway.as_deref().map(ping).unwrap_or_else(|| "no default route".into());
+                log_line(root, "RESETS", &format!("the ladder dropped {n} of our bots' connections in the last 3 minutes; router: {router}; 1.1.1.1: {}", ping("1.1.1.1")));
             }
         } else if self.resetting {
             self.reset_calm += 1;
