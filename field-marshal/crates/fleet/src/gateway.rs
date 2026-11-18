@@ -1352,6 +1352,11 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     // The match limit is ours to respect: the flagship always asks, the others
                     // only while there is room.
                     let room = role == "flagship" || resume_until.is_some() || shared.others_active(name) < opt.max_concurrent;
+                    // The label: the store's for a bot the fleet deploys, else the one its
+                    // process attached with (the flagship's thread chooses its own).
+                    if label.is_none() {
+                        label = engine.as_ref().map(|e| e.version.clone()).filter(|v| v != "?");
+                    }
                     if let (true, Some(l)) = (room, label.clone()) {
                         queue_due = None;
                         if !shared.match_budget.wait_for_room(stop) || !shared.queue_budget.take(stop) {
