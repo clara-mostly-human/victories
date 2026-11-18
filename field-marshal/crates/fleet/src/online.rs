@@ -69,6 +69,52 @@ pub fn wrote_recently(root: &Path, bot: &str, within: Duration) -> bool {
         .unwrap_or(false)
 }
 
+/// One request for the ladder's standings, into the store's `ladder` table. This is the
+/// only thing the fleet asks the ladder over HTTP, and it does so rarely (see
+/// `ladder_refresh_minutes`): it is what gives opponents their rating and rank on the
+/// status page, and our own bots their exact rating.
+pub fn refresh_ladder(store: &Store, ours: &[String]) -> Result<usize, String> {
+    let out = Command::new("curl")
+        .args(["-sS", "--max-time", "30", "-A", "fleet-watch/1.0", "-w", "\n%{http_code}", &format!("{HOST}/api/leaderboard?limit=500")])
+        .output()
+        .map_err(|e| format!("curl: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let cut = out.stdout.iter().rposition(|b| *b == b'\n').unwrap_or(0);
+    let code = String::from_utf8_lossy(&out.stdout[cut..]).trim().to_string();
+    if code != "200" {
+        return Err(format!("HTTP {code}"));
+    }
+    let v: Value = serde_json::from_slice(&out.stdout[..cut]).map_err(|e| e.to_string())?;
+    let list = match &v {
+        Value::Array(a) => a.clone(),
+        Value::Object(o) => o.get("bots").and_then(Value::as_array).cloned().unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let rows: Vec<(String, i64, f64, Option<String>, Option<i64>)> = list
+        .iter()
+        .enumerate()
+        .filter_map(|(k, r)| {
+            Some((
+                r.get("name")?.as_str()?.to_string(),
+                r.get("rank").and_then(Value::as_i64).unwrap_or(k as i64 + 1),
+                r.get("rating")?.as_f64()?,
+                r.get("version").and_then(Value::as_str).map(str::to_string),
+                match (r.get("wins").and_then(Value::as_i64), r.get("losses").and_then(Value::as_i64)) {
+                    (Some(w), Some(l)) => Some(w + l + r.get("draws").and_then(Value::as_i64).unwrap_or(0)),
+                    _ => None,
+                },
+            ))
+        })
+        .collect();
+    if rows.is_empty() {
+        return Err("the standings came back empty".into());
+    }
+    store.set_ladder(&rows, ours).map_err(|e| e.to_string())?;
+    Ok(rows.len())
+}
+
 pub fn alert_log(root: &Path) -> std::path::PathBuf {
     root.join("logs").join("fleet-alerts.log")
 }

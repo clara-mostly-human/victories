@@ -35,6 +35,7 @@
 //!   fleet serve [--port 8787]                     the status page, live: built from the store on every request
 //!   fleet report                                  write the status page to data/status.html
 //!   fleet digest                                  the last 24 hours in a few lines (first line fits a notification)
+//!   fleet ladder                                  fetch the ladder's standings into the store (one request)
 //!   fleet alerts [N]                              the last N lines of the alert log
 
 use fleet::collect::{self, Collector};
@@ -721,6 +722,16 @@ fn main_inner() -> Result<i32, String> {
         "watch" => {
             watch(&root, &store, &cfg)?;
             housekeeping(&root, &store, &cfg);
+            // The standings, when the snapshot in the store has grown old.
+            if cfg.ladder_refresh_minutes > 0 {
+                let last: i64 = store.conn.query_row("SELECT COALESCE(MAX(updated_ms), 0) FROM ladder", [], |r| r.get(0)).unwrap_or(0);
+                if now_ms() - last >= cfg.ladder_refresh_minutes as i64 * 60_000 {
+                    match fleet::online::refresh_ladder(&store, &cfg.names()) {
+                        Ok(n) => println!("standings of {n} bots stored"),
+                        Err(x) => eprintln!("standings not refreshed: {x}"),
+                    }
+                }
+            }
             // Replays fetched off this network arrive through the repository's corpus branch.
             match if cfg.corpus_branch { collect::import_branch(&root, &store, &cfg.names()) } else { Ok((0, 0, 0)) } {
                 Ok((copied, verified, bad)) if copied + verified + bad > 0 => println!("corpus branch: {copied} replays brought in, {verified} verified, {bad} failed verification"),
@@ -804,6 +815,10 @@ fn main_inner() -> Result<i32, String> {
             fleet::report::serve(&root, port, &|| STOP.load(Ordering::Relaxed)).map_err(|x| format!("cannot serve on port {port}: {x}"))?;
         }
         "digest" => print!("{}", fleet::report::digest(&fleet::report::snapshot(&root, &store, &cfg))),
+        "ladder" => {
+            let n = fleet::online::refresh_ladder(&store, &cfg.names())?;
+            println!("standings of {n} bots stored");
+        }
         "alerts" => {
             let n: usize = a.words.get(1).and_then(|n| n.parse().ok()).unwrap_or(20);
             let text = std::fs::read_to_string(fleet::online::alert_log(&root)).unwrap_or_default();

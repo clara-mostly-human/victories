@@ -351,7 +351,10 @@ pub fn deploy(root: &Path, store: &Store, cfg: &Config, bot: &str, id: &str, ver
     let current = store.bot_state(bot).map_err(|e| e.to_string())?;
     let same = current.as_ref().map(|c| c.release.as_deref() == Some(id)).unwrap_or(false);
     // A new release on a bot is a new version on the ladder, so its rating is tracked apart.
-    let version = match (version, same, current.as_ref().and_then(|c| c.version.clone())) {
+    // A scout plays a different arm every match, so its label says nothing about what it
+    // runs: it keeps one label, and with it a rating that can settle. (The ladder starts
+    // every new version from scratch.) The canary's label changes with every release.
+    let version = match (version, same || b.role == "scout", current.as_ref().and_then(|c| c.version.clone())) {
         (Some(v), _, _) => v.to_string(),
         (None, true, Some(v)) => v,
         _ => store.next_version(bot).map_err(|e| e.to_string())?,

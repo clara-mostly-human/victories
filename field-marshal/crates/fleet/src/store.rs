@@ -160,6 +160,14 @@ CREATE TABLE IF NOT EXISTS replays (
   note TEXT
 );
 CREATE INDEX IF NOT EXISTS replays_queue ON replays (status, priority, ended);
+CREATE TABLE IF NOT EXISTS ladder (
+  name TEXT PRIMARY KEY,
+  rank INTEGER,
+  rating REAL,
+  version TEXT,
+  games INTEGER,
+  updated_ms INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY,
   ts_ms INTEGER NOT NULL,
@@ -226,7 +234,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         // Columns added after the first version of the store.
-        for (table, column, kind) in [("matches", "opponent_rating", "REAL"), ("matches", "rating_before", "REAL"), ("arms", "stopped", "TEXT"), ("matches", "remote", "TEXT"), ("matches", "charge_p50_ms", "INTEGER"), ("matches", "charge_p99_ms", "INTEGER"), ("matches", "lost_turns", "INTEGER")] {
+        for (table, column, kind) in [("matches", "opponent_rating", "REAL"), ("matches", "rating_before", "REAL"), ("arms", "stopped", "TEXT"), ("matches", "remote", "TEXT"), ("matches", "charge_p50_ms", "INTEGER"), ("matches", "charge_p99_ms", "INTEGER"), ("matches", "lost_turns", "INTEGER"), ("matches", "rating_after", "REAL")] {
             let has: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), [column], |r| r.get(0))?;
             if has == 0 {
                 // Another process may add it at the same moment; that is fine.
@@ -295,7 +303,66 @@ impl Store {
                 line.get("charge_ms").and_then(|c| i(c, "p99")),
                 line.get("charge_ms").and_then(|c| i(c, "lost_turns")),
             ],
+        )?;
+        // What the socket does not say comes from the last ladder snapshot: how strong the
+        // opponent is. And our own rating is carried forward from the game before: the
+        // ladder only tells a bot the change.
+        self.conn.execute(
+            "UPDATE matches SET opponent_rating = COALESCE(opponent_rating, (SELECT rating FROM ladder WHERE name = matches.opponent)),
+               rating_after = COALESCE(
+                 (SELECT p.rating_after FROM matches p WHERE p.bot = matches.bot AND p.version IS matches.version AND p.rating_after IS NOT NULL
+                    AND p.match_id != matches.match_id ORDER BY COALESCE(p.ended_ms, p.started_ms) DESC LIMIT 1),
+                 (SELECT l.rating FROM ladder l WHERE l.name = matches.bot AND l.version IS matches.version)
+               ) + COALESCE(rating_change, 0)
+             WHERE match_id = ?1 AND bot = ?2",
+            params![id, bot],
         )
+    }
+
+    /// Takes in a ladder snapshot: `rows` are (name, rank, rating, version, games). Our own
+    /// bots' ratings are set straight from it, so the carried-forward figures cannot drift.
+    pub fn set_ladder(&self, rows: &[(String, i64, f64, Option<String>, Option<i64>)], ours: &[String]) -> rusqlite::Result<()> {
+        let now = now_ms();
+        self.conn.execute_batch("BEGIN")?;
+        self.conn.execute("DELETE FROM ladder", [])?;
+        for (name, rank, rating, version, games) in rows {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO ladder (name, rank, rating, version, games, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![name, rank, rating, version, games, now],
+            )?;
+            if ours.contains(name) {
+                self.conn.execute(
+                    "UPDATE matches SET rating_after = ?2 WHERE bot = ?1 AND version IS ?3 AND match_id =
+                       (SELECT match_id FROM matches WHERE bot = ?1 AND version IS ?3 AND result IS NOT NULL ORDER BY COALESCE(ended_ms, started_ms) DESC LIMIT 1)",
+                    params![name, rating, version],
+                )?;
+            }
+        }
+        self.conn.execute_batch("COMMIT")
+    }
+
+    /// Fills in what older bot builds did not write at match end: the opponent's rating
+    /// from the ladder snapshot, and our own rating carried forward game by game.
+    pub fn backfill_ratings(&self, ours: &[String]) -> rusqlite::Result<()> {
+        self.conn.execute("UPDATE matches SET opponent_rating = (SELECT rating FROM ladder WHERE name = matches.opponent) WHERE opponent_rating IS NULL AND result IS NOT NULL AND opponent IN (SELECT name FROM ladder)", [])?;
+        for bot in ours {
+            let mut q = self.conn.prepare("SELECT match_id, version, rating_after, rating_change FROM matches WHERE bot = ?1 AND result IS NOT NULL ORDER BY COALESCE(ended_ms, started_ms)")?;
+            let rows: Vec<(String, Option<String>, Option<f64>, Option<f64>)> = q.query_map([bot], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+            let mut carried: Option<(Option<String>, f64)> = None;
+            for (id, version, after, change) in rows {
+                match (after, &carried) {
+                    (Some(a), _) => carried = Some((version, a)),
+                    // The ladder rates every version afresh: only carry within one version.
+                    (None, Some((v, r))) if *v == version => {
+                        let next = r + change.unwrap_or(0.0);
+                        self.conn.execute("UPDATE matches SET rating_after = ?3 WHERE match_id = ?1 AND bot = ?2", params![id, bot, next])?;
+                        carried = Some((version, next));
+                    }
+                    _ => carried = None,
+                }
+            }
+        }
+        Ok(())
     }
 
     // ---- bots ------------------------------------------------------------------------------

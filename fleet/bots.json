@@ -55,5 +55,6 @@
     "connects_per_minute": 20,
     "queues_per_minute": 90,
     "matches_per_day": 15000
-  }
+  },
+  "ladder_refresh_minutes": 30
 }

@@ -19,9 +19,33 @@ pub struct BotLine {
     pub day: Record,
     pub hour_games: i64,
     pub rating: Option<f64>,
+    /// place on the ladder, when this version is ranked
+    pub rank: Option<i64>,
     pub rating_day: f64,
     pub last_game_ms: Option<i64>,
     pub think_p99_ms: Option<f64>,
+}
+
+/// One finished game, as the bot and the ladder snapshot know it.
+pub struct GameLine {
+    pub ended_ms: i64,
+    pub bot: String,
+    pub version: String,
+    pub result: String,
+    pub reason: String,
+    pub opponent: String,
+    pub opponent_rating: Option<f64>,
+    pub opponent_rank: Option<i64>,
+    pub map: String,
+    pub seat: Option<i64>,
+    pub ticks: Option<i64>,
+    pub rating_change: Option<f64>,
+    pub rating_after: Option<f64>,
+    pub dealt: i64,
+    pub taken: i64,
+    pub playbook: String,
+    pub charge_p50_ms: Option<i64>,
+    pub lost_turns: Option<i64>,
 }
 
 pub struct ArmLine {
@@ -42,6 +66,12 @@ pub struct ReleaseLine {
 pub struct Snapshot {
     pub at: String,
     pub bots: Vec<BotLine>,
+    /// the latest finished games, newest first (of one bot when the page is filtered)
+    pub games: Vec<GameLine>,
+    pub only_bot: Option<String>,
+    pub ladder_age_ms: Option<i64>,
+    /// arms split by how strong the opponent is
+    pub arm_tiers: Vec<(String, Record)>,
     pub arms: Vec<ArmLine>,
     pub releases: Vec<ReleaseLine>,
     pub live: String,
@@ -60,6 +90,66 @@ fn one<T: rusqlite::types::FromSql>(store: &Store, sql: &str, p: impl rusqlite::
 }
 
 pub fn snapshot(root: &Path, store: &Store, cfg: &Config) -> Snapshot {
+    snapshot_for(root, store, cfg, None)
+}
+
+/// The snapshot; `only_bot` narrows the list of games to one of our bots.
+pub fn snapshot_for(root: &Path, store: &Store, cfg: &Config, only_bot: Option<&str>) -> Snapshot {
+    let only_bot = only_bot.filter(|b| cfg.is_ours(b)).map(str::to_string);
+    let games: Vec<GameLine> = {
+        let mut q = store
+            .conn
+            .prepare(
+                "SELECT COALESCE(m.ended_ms, m.started_ms), m.bot, COALESCE(m.version, ''), m.result, COALESCE(m.reason, ''), COALESCE(m.opponent, '?'),
+                        m.opponent_rating, (SELECT rank FROM ladder l WHERE l.name = m.opponent), COALESCE(m.map, ''), m.seat, m.final_tick,
+                        m.rating_change, m.rating_after, m.detail, COALESCE(m.playbook, ''), m.charge_p50_ms, m.lost_turns
+                 FROM matches m WHERE m.result IS NOT NULL AND (?1 IS NULL OR m.bot = ?1) ORDER BY 1 DESC LIMIT 60",
+            )
+            .ok();
+        match q.as_mut() {
+            None => Vec::new(),
+            Some(q) => q
+                .query_map([only_bot.as_deref()], |r| {
+                    let detail: Option<String> = r.get(13)?;
+                    let damage = detail.and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok()).and_then(|d| d.get("damage").cloned());
+                    let sum = |prefix: &str| -> i64 { damage.as_ref().and_then(|d| d.as_object()).map(|o| o.iter().filter(|(k, _)| k.starts_with(prefix)).filter_map(|(_, v)| v.as_i64()).sum()).unwrap_or(0) };
+                    Ok(GameLine {
+                        ended_ms: r.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                        bot: r.get(1)?,
+                        version: r.get(2)?,
+                        result: r.get(3)?,
+                        reason: r.get(4)?,
+                        opponent: r.get(5)?,
+                        opponent_rating: r.get(6)?,
+                        opponent_rank: r.get(7)?,
+                        map: r.get(8)?,
+                        seat: r.get(9)?,
+                        ticks: r.get(10)?,
+                        rating_change: r.get(11)?,
+                        rating_after: r.get(12)?,
+                        dealt: sum("dealt:"),
+                        taken: sum("taken:"),
+                        playbook: r.get(14)?,
+                        charge_p50_ms: r.get(15)?,
+                        lost_turns: r.get(16)?,
+                    })
+                })
+                .map(|rows| rows.filter_map(|g| g.ok()).collect())
+                .unwrap_or_default(),
+        }
+    };
+    let ladder_age_ms: Option<i64> = one::<i64>(store, "SELECT MAX(updated_ms) FROM ladder", []).map(|t| now_ms() - t);
+    let arm_tiers: Vec<(String, Record)> = store
+        .experiments(true)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|e| store.records("arm-tier", &Filter { experiment: Some(e.name.clone()), ..Filter::default() }).unwrap_or_default())
+        .map(|r| (r.key, r.record))
+        .collect();
+    snapshot_inner(root, store, cfg, games, only_bot, ladder_age_ms, arm_tiers)
+}
+
+fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>, only_bot: Option<String>, ladder_age_ms: Option<i64>, arm_tiers: Vec<(String, Record)>) -> Snapshot {
     let now = now_ms();
     let day = now - 86_400_000;
     let mut bots = Vec::new();
@@ -71,14 +161,39 @@ pub fn snapshot(root: &Path, store: &Store, cfg: &Config) -> Snapshot {
             .and_then(|r| r.first().map(|r| (r.record, r.rating)));
         let last = |col: &str| -> Option<String> { one(store, &format!("SELECT {col} FROM matches WHERE bot = ?1 AND {col} IS NOT NULL ORDER BY started_ms DESC LIMIT 1"), [&b.name]) };
         // The ladder's list gives the rating before a game and the change it brought.
+        // Our rating after the latest game: carried forward from the ladder's own figure by
+        // the change each game brought (the ladder tells a bot only the change).
         let rating: Option<f64> = store
             .conn
             .query_row(
-                "SELECT rating_before + COALESCE(rating_change, 0) FROM matches WHERE bot = ?1 AND rating_before IS NOT NULL ORDER BY started_ms DESC LIMIT 1",
+                "SELECT COALESCE(rating_after, rating_before + COALESCE(rating_change, 0)) FROM matches
+                 WHERE bot = ?1 AND result IS NOT NULL AND (rating_after IS NOT NULL OR rating_before IS NOT NULL)
+                   AND version IS (SELECT version FROM matches WHERE bot = ?1 ORDER BY started_ms DESC LIMIT 1)
+                 ORDER BY COALESCE(ended_ms, started_ms) DESC LIMIT 1",
                 [&b.name],
                 |r| r.get(0),
             )
             .ok();
+        // The ladder ranks one version of a bot; the place only counts while that is the
+        // version playing now.
+        let rank: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT rank FROM ladder WHERE name = ?1 AND version IS (SELECT version FROM matches WHERE bot = ?1 ORDER BY started_ms DESC LIMIT 1)",
+                [&b.name],
+                |r| r.get(0),
+            )
+            .ok();
+        // The change over 24 hours, within the version playing now (every version starts afresh).
+        let version_change: f64 = store
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(rating_change), 0) FROM matches WHERE bot = ?1 AND result IS NOT NULL AND started_ms >= ?2
+                   AND version IS (SELECT version FROM matches WHERE bot = ?1 ORDER BY started_ms DESC LIMIT 1)",
+                rusqlite::params![b.name, day],
+                |r| r.get(0),
+            )
+            .unwrap_or(0.0);
         bots.push(BotLine {
             name: b.name.clone(),
             role: b.role.clone(),
@@ -90,7 +205,8 @@ pub fn snapshot(root: &Path, store: &Store, cfg: &Config) -> Snapshot {
             day: rec.map(|r| r.0).unwrap_or_default(),
             hour_games: one(store, "SELECT COUNT(*) FROM matches WHERE bot = ?1 AND result IS NOT NULL AND started_ms >= ?2", rusqlite::params![b.name, now - 3_600_000]).unwrap_or(0),
             rating,
-            rating_day: rec.map(|r| r.1).unwrap_or(0.0),
+            rank,
+            rating_day: version_change,
             last_game_ms: one(store, "SELECT MAX(COALESCE(ended_ms, started_ms)) FROM matches WHERE bot = ?1", [&b.name]),
             think_p99_ms: recent_think_p99_ms(root, &b.name),
         });
@@ -138,6 +254,10 @@ pub fn snapshot(root: &Path, store: &Store, cfg: &Config) -> Snapshot {
     Snapshot {
         at: utc_stamp(),
         bots,
+        games,
+        only_bot,
+        ladder_age_ms,
+        arm_tiers,
         arms,
         releases,
         live: store.live_release().ok().flatten().map(|r| r.id).unwrap_or_else(|| "none".into()),
@@ -150,6 +270,12 @@ pub fn snapshot(root: &Path, store: &Store, cfg: &Config) -> Snapshot {
         load: load_average(),
         paused: std::fs::read_to_string(pause_file(root)).ok().map(|s| s.trim().to_string()),
     }
+}
+
+/// `HH:MM:SS` in UTC, for readers whose browser does not run the page's script.
+fn utc_time(ms: i64) -> String {
+    let s = (ms / 1000).rem_euclid(86_400);
+    format!("{:02}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
 }
 
 fn state(b: &BotLine) -> (&'static str, &'static str) {
@@ -216,7 +342,7 @@ pub fn html(s: &Snapshot) -> String {
         let (word, class) = state(b);
         let (lo, hi) = b.day.interval();
         bots.push_str(&format!(
-            "<tr><td><strong>{}</strong><span class=\"sub\">{}</span></td><td><span class=\"pill {class}\">{word}</span></td><td>{}<span class=\"sub\">{}</span></td><td class=\"n\">{}</td><td class=\"n\">{}<span class=\"sub\">{:+.0} today</span></td><td class=\"n\">{}<span class=\"sub\">{} last hour</span></td><td class=\"n\">{}&ndash;{}&ndash;{}</td><td class=\"n\">{}<span class=\"sub\">{}</span></td><td class=\"n\">{}</td></tr>\n",
+            "<tr><td><strong><a href=\"/?bot={0}\">{0}</a></strong><span class=\"sub\">{1}</span></td><td><span class=\"pill {class}\">{word}</span></td><td>{2}<span class=\"sub\">{3}</span></td><td class=\"n\">{4}</td><td class=\"n\">{5}<span class=\"sub\">{rank}{6:+.0} on this version</span></td><td class=\"n\">{7}<span class=\"sub\">{8} last hour</span></td><td class=\"n\">{9}&ndash;{10}&ndash;{11}</td><td class=\"n\">{12}<span class=\"sub\">{13}</span></td><td class=\"n\">{14}</td></tr>\n",
             esc(&b.name),
             esc(&b.role),
             esc(&b.release),
@@ -232,8 +358,74 @@ pub fn html(s: &Snapshot) -> String {
             if b.day.games() > 0 { format!("{:.0}%", 100.0 * b.day.score()) } else { "&ndash;".into() },
             if b.day.games() > 0 { format!("{:.0} to {:.0}%", 100.0 * lo, 100.0 * hi) } else { String::new() },
             b.think_p99_ms.map(|p| format!("{p:.0} ms")).unwrap_or_else(|| "&ndash;".into()),
+            rank = b.rank.map(|r| format!("#{r}, ")).unwrap_or_default(),
         ));
     }
+    let mut game_rows = String::new();
+    for g in &s.games {
+        let class = match g.result.as_str() {
+            "win" => "good",
+            "loss" => "bad",
+            _ => "warn",
+        };
+        let strength = match (g.opponent_rating, g.opponent_rank) {
+            (Some(r), Some(k)) => format!("rated {r:.0}, #{k}"),
+            (Some(r), None) => format!("rated {r:.0}"),
+            _ => "not on the last standings".to_string(),
+        };
+        let rating = match (g.rating_change, g.rating_after) {
+            (Some(c), Some(a)) => format!("{a:.0}<span class=\"sub\">{c:+.0}</span>"),
+            (Some(c), None) => format!("{c:+.0}"),
+            _ => "&ndash;".into(),
+        };
+        let conn = match (g.charge_p50_ms, g.lost_turns) {
+            (Some(c), Some(l)) if l > 0 => format!("{c} ms<span class=\"sub\">{l} turns lost</span>"),
+            (Some(c), _) => format!("{c} ms"),
+            _ => "&ndash;".into(),
+        };
+        game_rows.push_str(&format!(
+            "<tr><td class=\"n\"><time data-ms=\"{}\">{}</time></td><td><a href=\"/?bot={bot}\">{bot}</a><span class=\"sub\">{}</span></td><td><span class=\"pill {class}\">{}</span><span class=\"sub\">{}</span></td><td><strong>{}</strong><span class=\"sub\">{strength}</span></td><td>{}<span class=\"sub\">seat {}, {} ticks</span></td><td class=\"n\">{rating}</td><td class=\"n\">{}<span class=\"sub\">took {}</span></td><td>{}</td><td class=\"n\">{conn}</td></tr>\n",
+            g.ended_ms,
+            esc(&utc_time(g.ended_ms)),
+            esc(&g.version),
+            esc(&g.result),
+            esc(&g.reason.replace('_', " ")),
+            esc(&g.opponent),
+            esc(&g.map),
+            g.seat.map(|x| x.to_string()).unwrap_or_else(|| "?".into()),
+            g.ticks.map(|x| x.to_string()).unwrap_or_else(|| "?".into()),
+            g.dealt,
+            g.taken,
+            esc(&g.playbook),
+            bot = esc(&g.bot),
+        ));
+    }
+    if game_rows.is_empty() {
+        game_rows = "<tr><td colspan=\"9\" class=\"sub\">No finished game yet.</td></tr>".into();
+    }
+    let mut tiers = String::new();
+    for (key, r) in &s.arm_tiers {
+        let (lo, hi) = r.interval();
+        tiers.push_str(&format!(
+            "<tr><td>{}</td><td class=\"n\">{}</td><td class=\"n\">{}&ndash;{}&ndash;{}</td><td class=\"n\">{:.0}%<span class=\"sub\">{:.0} to {:.0}%</span></td></tr>\n",
+            esc(key),
+            r.games(),
+            r.wins,
+            r.losses,
+            r.draws,
+            100.0 * r.score(),
+            100.0 * lo,
+            100.0 * hi
+        ));
+    }
+    let games_title = match &s.only_bot {
+        Some(b) => format!("Latest games of {} <a class=\"all\" href=\"/\">show all bots</a>", esc(b)),
+        None => "Latest games".to_string(),
+    };
+    let standings = match s.ladder_age_ms {
+        Some(ms) => format!("Opponent ratings and ranks are from the ladder's standings as fetched {} minutes ago.", ms / 60_000),
+        None => "Opponent ratings and ranks appear once the ladder's standings have been fetched.".to_string(),
+    };
     let mut arms = String::new();
     for a in &s.arms {
         let pct = (100 * a.record.games() / a.target.max(1)).min(100);
@@ -321,6 +513,9 @@ th.n {{ text-align: right; }}
 .bar i {{ display: block; height: 4px; background: var(--accent); border-radius: 2px; }}
 ul {{ list-style: none; margin: 0; padding: 12px 16px; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }}
 .note {{ color: var(--muted); font-size: 13px; margin: 6px 2px 0; }}
+a {{ color: var(--accent); text-decoration: none; }}
+a:hover {{ text-decoration: underline; }}
+h2 a.all {{ font-weight: 400; text-transform: none; letter-spacing: 0; margin-left: 10px; }}
 </style>
 </head>
 <body>
@@ -340,10 +535,21 @@ ul {{ list-style: none; margin: 0; padding: 12px 16px; font: 12px/1.6 ui-monospa
 {bots}</table></div>
 <p class="note">Score counts a draw as half a win; the range under it is the 95% interval. Think p99 is over the last 90 seconds of play.</p>
 
+<h2>{games_title}</h2>
+<div class="wrap"><table>
+<tr><th class="n">Ended</th><th>Bot</th><th>Result</th><th>Opponent</th><th>Map</th><th class="n">Rating after</th><th class="n">Damage dealt</th><th>Playbook or arm</th><th class="n">Charged per turn</th></tr>
+{game_rows}</table></div>
+<p class="note">Each bot writes a game here the moment it ends. Rating after is the bot's rating carried forward by the change the ladder reported. {standings} Charged per turn is the median of what the ladder billed for a turn: our thinking plus the trip there and back.</p>
+
 <h2>Experiments</h2>
 <div class="wrap"><table>
 <tr><th>Experiment</th><th>Arm</th><th class="n">Games</th><th class="n">W&ndash;L&ndash;D</th><th class="n">Score</th></tr>
 {arms}</table></div>
+
+<p class="note">The same arms by how strong the opponent is:</p>
+<div class="wrap"><table>
+<tr><th>Arm and opponents</th><th class="n">Games</th><th class="n">W&ndash;L&ndash;D</th><th class="n">Score</th></tr>
+{tiers}</table></div>
 
 <h2>Releases</h2>
 <div class="wrap"><table>
@@ -354,9 +560,20 @@ ul {{ list-style: none; margin: 0; padding: 12px 16px; font: 12px/1.6 ui-monospa
 <h2>Alerts and pipeline log</h2>
 <div class="wrap"><ul>{alerts}</ul></div>
 </main>
+<script>
+// Times are stored in UTC; show them in the reader's own time.
+for (const t of document.querySelectorAll('time[data-ms]')) {{
+  const d = new Date(Number(t.dataset.ms));
+  if (!isNaN(d)) t.textContent = d.toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit', second: '2-digit' }});
+}}
+</script>
 </body>
 </html>
 "##,
+        games_title = games_title,
+        game_rows = game_rows,
+        standings = standings,
+        tiers = if tiers.is_empty() { "<tr><td colspan=\"4\" class=\"sub\">No experiment is running.</td></tr>".to_string() } else { tiers },
         at = esc(&s.at.replace('T', " ").replace('Z', "")),
         total = s.bots.len(),
         alerts_day = s.alerts_day,
@@ -510,6 +727,7 @@ pub fn serve(root: &Path, port: u16, stop: &dyn Fn() -> bool) -> std::io::Result
     let listener = std::net::TcpListener::bind(("0.0.0.0", port))?;
     listener.set_nonblocking(true)?;
     eprintln!("{} status page on port {port}", utc_stamp());
+    let mut last_backfill = std::time::Instant::now() - std::time::Duration::from_secs(60);
     while !stop() {
         let (mut stream, _) = match listener.accept() {
             Ok(x) => x,
@@ -525,13 +743,23 @@ pub fn serve(root: &Path, port: u16, stop: &dyn Fn() -> bool) -> std::io::Result
         let mut buf = [0u8; 2048];
         let n = stream.read(&mut buf).unwrap_or(0);
         let request = String::from_utf8_lossy(&buf[..n]);
-        let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+        let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+        let (path, query) = match target.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (target.clone(), String::new()),
+        };
+        // `?bot=<name>` narrows the games to one of our bots; anything else is ignored.
+        let only: Option<String> = query.split('&').find_map(|kv| kv.strip_prefix("bot=")).filter(|b| b.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')).map(str::to_string);
         // Only two things are served, both read-only views of the store. Nothing is taken
         // from the request but its path.
         let built = (|| -> Result<(String, &'static str), String> {
             let cfg = Config::load(root)?;
             let store = Store::open(&crate::store::default_db(root), std::time::Duration::from_secs(2)).map_err(|e| e.to_string())?;
-            let snap = snapshot(root, &store, &cfg);
+            if last_backfill.elapsed() >= std::time::Duration::from_secs(15) {
+                last_backfill = std::time::Instant::now();
+                let _ = store.backfill_ratings(&cfg.names());
+            }
+            let snap = snapshot_for(root, &store, &cfg, only.as_deref());
             Ok(match path.as_str() {
                 "/" | "/index.html" | "/status.html" => (html(&snap).replacen("<meta charset=\"utf-8\">", "<meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"20\">", 1), "text/html; charset=utf-8"),
                 "/state.json" => (state_json(&snap).to_string(), "application/json"),
