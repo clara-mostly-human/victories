@@ -17,7 +17,7 @@
 //!   fleet plan list | show <name> | add <file.json> | pause <name> | resume <name> | stop <name>
 //!   fleet plan show <name> [--since 90m|04:45|<epoch>] [--baseline-playbook matrix-5] [--control-only]
 //!                                                 arms, and each arm against the default playbook over the arm's own time, by opponent rating
-//!   fleet plan add-arm <name> <arm> '<settings json>' | stop-arm <name> <arm> [--reason text] | resume-arm <name> <arm> | rebalance <name>
+//!   fleet plan add-arm <name> <arm> '<settings json>' | stop-arm <name> <arm> [--reason text] | resume-arm <name> <arm> | rebalance <name> | quota <name> <games>
 //!   fleet epoch add <name> <time> [--note text] | list        named moments, usable wherever --since is
 //!   fleet assign --bot b --opponent o --map m --seat n --match id     what the plan would hand out (writes the row)
 //!
@@ -420,7 +420,7 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                 return Err("the settings must be a JSON object".into());
             }
             match store.add_arm(name, arm, &settings) {
-                Ok(1) => println!("arm {arm} added to {name}; it is handed out first until it has caught up"),
+                Ok(1) => println!("arm {arm} added to {name}; every running arm gets an equal share from now"),
                 Ok(_) => return Err(format!("no experiment named {name}")),
                 Err(x) => return Err(format!("cannot add the arm: {x}")),
             }
@@ -434,6 +434,14 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
             }
             store.event(None, "arm_resumed", &json!({ "experiment": name, "arm": arm }));
             println!("arm {arm} of {name} runs again; every running arm gets an equal share from now");
+        }
+        "quota" => {
+            let name = a.word(2, "the experiment's name")?;
+            let n: i64 = a.word(3, "the number of games per arm")?.parse().map_err(|_| "the quota must be a number".to_string())?;
+            if store.conn.execute("UPDATE experiments SET games_per_arm = ?2 WHERE name = ?1", rusqlite::params![name, n]).map_err(e)? == 0 {
+                return Err(format!("no experiment named {name}"));
+            }
+            println!("{name}: each arm now runs to {n} games (all its games count, in whatever window they were played)");
         }
         "rebalance" => {
             let name = a.word(2, "the experiment's name")?;
