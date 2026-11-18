@@ -126,8 +126,11 @@ What the gateway owns:
   of every turn, which is what the ladder charged us less what the bot process took. A
   socket whose median wire time is over 180 ms after twenty turns, or that lost two turns
   on the wire, is replaced, mid-match (the match resumes on the new socket). Replacements
-  are spaced 30 s apart across the fleet and come later each time for one bot (0, 5, 15,
-  45 s); after four slow sockets in a row it keeps what it has for ten minutes.
+  are spaced 10 s apart across the fleet. A bot that draws slow sockets in a row tries
+  again at once, then after 2, 5, 10 and 15 s (about half of all new sockets were slow on
+  2026-11-18, so runs of them are ordinary); after ten in a row it keeps what it has for
+  three minutes and then tries again. With `"ping_reject_ms"` set (120 now), a socket
+  whose ping is over the limit is also replaced between matches, after two slow pings.
 - **The ladder's protocol**, as the ladder's guide says. After a match it queues again. On
   `quota_exceeded` the bot stays queued and waits: no second `queue`, no reconnect. After
   a reconnect it queues as usual and the ladder resumes a match in progress (the match

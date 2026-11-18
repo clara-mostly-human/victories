@@ -123,7 +123,7 @@ impl Default for Options {
             ready_deadline: Duration::from_millis(1500),
             slow_wire_ms: 180.0,
             ping_reject_ms: 0.0,
-            replace_gap: Duration::from_secs(30),
+            replace_gap: Duration::from_secs(10),
             max_concurrent: 5,
             stall_after: Duration::from_secs(120),
         }
@@ -620,16 +620,24 @@ fn queue_frame(version: &str) -> String {
     json!({ "type": "queue", "version": version }).to_string()
 }
 
-/// How long to wait before the next try at a good socket, after `bad` slow ones in a row.
+/// How long to wait before the next try at a good socket, after `bad` slow ones in a row:
+/// at once, then a little longer each time, never long. About half of all new sockets
+/// are slow (2026-11-18), so several tries in a row are ordinary, and a bot that waits is
+/// a bot that does not play.
 fn replace_backoff(bad: u32) -> Duration {
     Duration::from_secs(match bad {
         0 | 1 => 0,
-        2 => 5,
-        3 => 15,
-        4 => 45,
-        _ => 120,
+        2 => 2,
+        3 => 5,
+        4 => 10,
+        _ => 15,
     })
 }
+
+/// After this many slow sockets in a row a bot keeps the one it has for a while.
+const SLOW_TRIES: u32 = 10;
+/// ... this long, before it starts trying again.
+const SLOW_REST: Duration = Duration::from_secs(180);
 
 /// What is true about this bot on the ladder's side. It outlives a connection and a bot
 /// process: this is the state a process is told and set back to.
@@ -787,11 +795,12 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
             ping_ms = ping_test(&mut ws, &mut inbox);
             if let Some(ms) = ping_ms {
                 let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
-                if reject > 0.0 && ms > reject && bad_sockets < 4 && inbox.is_empty() {
+                if bad_sockets >= SLOW_TRIES && bad_since.elapsed() > SLOW_REST {
+                    bad_sockets = 0;
+                }
+                if reject > 0.0 && ms > reject && bad_sockets < SLOW_TRIES && inbox.is_empty() {
                     bad_sockets += 1;
-                    if bad_sockets == 1 {
-                        bad_since = Instant::now();
-                    }
+                    bad_since = Instant::now();
                     backoff = replace_backoff(bad_sockets);
                     shared.replaced.fetch_add(1, Ordering::Relaxed);
                     event(root, name, "slow_socket", json!({ "remote": remote.to_string(), "ping_ms": ms.round(), "in_a_row": bad_sockets, "retry_in_s": backoff.as_secs(), "found": "at connect" }));
@@ -1335,16 +1344,14 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
             // A slow socket is replaced: at once in a match (the match resumes on the new
             // one), spaced across the fleet, and not for ever for one bot.
             if let Some(why) = replace_why.clone() {
-                if bad_sockets >= 4 && bad_since.elapsed() > Duration::from_secs(600) {
+                if bad_sockets >= SLOW_TRIES && bad_since.elapsed() > SLOW_REST {
                     bad_sockets = 0;
                 }
                 if last_slow_check.elapsed() > Duration::from_secs(2) {
                     last_slow_check = Instant::now();
-                    if bad_sockets < 4 && shared.may_replace() {
+                    if bad_sockets < SLOW_TRIES && shared.may_replace() {
                         bad_sockets += 1;
-                        if bad_sockets == 1 {
-                            bad_since = Instant::now();
-                        }
+                        bad_since = Instant::now();
                         {
                             let mut slow = shared.slow.lock().unwrap_or_else(|p| p.into_inner());
                             slow.retain(|a| *a != remote);
@@ -1824,6 +1831,7 @@ mod tests {
     fn slow_sockets_are_replaced_later_each_time() {
         assert_eq!(replace_backoff(1), Duration::ZERO);
         assert!(replace_backoff(2) < replace_backoff(3) && replace_backoff(3) < replace_backoff(4));
+        assert!(replace_backoff(9) <= Duration::from_secs(15), "never a long wait: a waiting bot does not play");
         assert_eq!(median(&[5.0, 1.0, 9.0]), 5.0);
     }
 }
