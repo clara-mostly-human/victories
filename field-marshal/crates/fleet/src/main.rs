@@ -343,6 +343,29 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                     }
                 }
             }
+            // Pads taken per game, by arm: the direct read-out of anything that changes how
+            // the bot goes for pads. From the pickups each bot counts in its match line.
+            {
+                let mut q = store
+                    .conn
+                    .prepare(
+                        "SELECT arm, COUNT(*),
+                                AVG(COALESCE(json_extract(detail, '$.damage.\"pickup:mine:power\"'), 0)), AVG(COALESCE(json_extract(detail, '$.damage.\"pickup:theirs:power\"'), 0)),
+                                AVG(COALESCE(json_extract(detail, '$.damage.\"pickup:mine:health\"'), 0)), AVG(COALESCE(json_extract(detail, '$.damage.\"pickup:theirs:health\"'), 0))
+                         FROM matches WHERE experiment_id = ?1 AND result IS NOT NULL AND voided = 0 AND detail IS NOT NULL AND started_ms >= ?2 GROUP BY arm ORDER BY arm",
+                    )
+                    .map_err(e)?;
+                let rows: Vec<(String, i64, f64, f64, f64, f64)> = q
+                    .query_map(rusqlite::params![x.id, from.unwrap_or(0)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+                    .map_err(e)?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                println!("\npads taken per game");
+                println!("{:<18} {:>5}   {:>10} {:>12}   {:>11} {:>13}", "arm", "games", "power, we", "power, they", "health, we", "health, they");
+                for (arm, n, pm, pt, hm, ht) in rows {
+                    println!("{arm:<18} {n:>5}   {pm:>10.2} {pt:>12.2}   {hm:>11.2} {ht:>13.2}");
+                }
+            }
             for (arm, why) in &x.stopped {
                 println!("  arm {arm} was stopped: {why}");
             }
