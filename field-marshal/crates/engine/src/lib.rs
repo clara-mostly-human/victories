@@ -12,6 +12,7 @@ pub mod events;
 pub mod geom;
 pub mod hash;
 pub mod map;
+pub mod movefeat;
 pub mod observe;
 pub mod replay;
 pub mod rules;
