@@ -481,6 +481,10 @@ impl Session {
                 m.charges.push((prev - b).clamp(0, 60_000) as u32);
             }
             m.last_budget = Some(b);
+            // The search's think cap follows the budget the ladder says is left.
+            if let Some(tracker) = m.tracker.as_ref() {
+                tracker.note_budget_left(b);
+            }
         }
         let Some(tracker) = m.tracker.as_mut() else { return vec![Out::Send(idle)] };
 
