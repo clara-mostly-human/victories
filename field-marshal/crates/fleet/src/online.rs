@@ -201,10 +201,35 @@ pub fn log_line(root: &Path, kind: &str, text: &str) {
 struct Guard {
     paused: bool,
     calm: u32,
+    /// a burst of reset connections is going on
+    resetting: bool,
+    reset_calm: u32,
 }
 
 impl Guard {
+    /// Bursts of reset connections are written down as they start and end, so they can be
+    /// lined up later with whatever else was happening on this network.
+    fn note_resets(&mut self, root: &Path, cfg: &Config) {
+        let bots: Vec<String> = cfg.bots.iter().filter(|b| b.expect_online).map(|b| b.name.clone()).collect();
+        let n = recent_resets(root, &bots, 180_000);
+        if n >= 4 {
+            self.reset_calm = 0;
+            if !self.resetting {
+                self.resetting = true;
+                log_line(root, "RESETS", &format!("the ladder dropped {n} of our bots' connections in the last 3 minutes"));
+            }
+        } else if self.resetting {
+            self.reset_calm += 1;
+            // Three minutes with fewer than four in the window.
+            if self.reset_calm >= 12 {
+                self.resetting = false;
+                log_line(root, "RESETS", "the burst of dropped connections is over");
+            }
+        }
+    }
+
     fn check(&mut self, root: &Path, cfg: &Config) {
+        self.note_resets(root, cfg);
         match overload(root, cfg) {
             Some(why) => {
                 self.calm = 0;
@@ -240,7 +265,7 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
     let mut bots: HashMap<String, Watch> = HashMap::new();
     let mut api_down_since: Option<Instant> = None;
     let mut api_alerted = false;
-    let mut guard = Guard { paused: false, calm: 0 };
+    let mut guard = Guard { paused: false, calm: 0, resetting: false, reset_calm: 0 };
     eprintln!("{} watchdog started", utc_stamp());
     while !stop() {
         // The list is read each round, so a config edit needs no restart.
