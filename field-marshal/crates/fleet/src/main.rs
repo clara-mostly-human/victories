@@ -395,6 +395,44 @@ fn watch(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
 /// Agents that are not bots.
 const SERVICES: [&str; 3] = ["watch", "collector", "online"];
 
+/// Once a day: a snapshot of the store, and old tick logs of the bots we run compressed.
+/// Nothing is deleted except our own snapshots beyond the newest seven.
+fn housekeeping(root: &Path, store: &Store, cfg: &Config) {
+    let day = fleet::online::utc_stamp()[..10].to_string();
+    let dir = data_dir(root).join("backup");
+    let snapshot = dir.join(format!("fleet-{day}.db"));
+    if snapshot.exists() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(&dir);
+    // VACUUM INTO writes a consistent copy while the bots keep writing.
+    match store.conn.execute("VACUUM INTO ?1", [snapshot.display().to_string()]) {
+        Ok(_) => println!("store snapshot written to {}", snapshot.display()),
+        Err(x) => {
+            eprintln!("store snapshot failed: {x}");
+            fleet::online::alert(root, "ALERT", None, &format!("the nightly store snapshot failed: {x}"));
+            return;
+        }
+    }
+    let mut old: Vec<_> = std::fs::read_dir(&dir).into_iter().flatten().filter_map(|f| f.ok()).map(|f| f.path()).filter(|p| p.file_name().map(|n| n.to_string_lossy().starts_with("fleet-")).unwrap_or(false)).collect();
+    old.sort();
+    while old.len() > 7 {
+        let _ = std::fs::remove_file(old.remove(0));
+    }
+    // Tick logs are about 50 KB a game. Two days on, everything in them is in the store.
+    for b in cfg.bots.iter().filter(|b| b.managed) {
+        let logs = root.join("logs").join(&b.name);
+        for f in std::fs::read_dir(&logs).into_iter().flatten().filter_map(|f| f.ok()) {
+            let path = f.path();
+            let aged = f.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).map(|d| d > Duration::from_secs(2 * 86_400)).unwrap_or(false);
+            if aged && path.extension().map(|x| x == "jsonl").unwrap_or(false) {
+                let ok = std::process::Command::new("gzip").arg(&path).status().map(|s| s.success()).unwrap_or(false);
+                println!("{}: {}", path.display(), if ok { "compressed" } else { "could not be compressed" });
+            }
+        }
+    }
+}
+
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
@@ -584,7 +622,10 @@ fn main_inner() -> Result<i32, String> {
                 }
             }
         }
-        "watch" => watch(&root, &store, &cfg)?,
+        "watch" => {
+            watch(&root, &store, &cfg)?;
+            housekeeping(&root, &store, &cfg);
+        }
         "online" => {
             if a.words.get(1).map(String::as_str) == Some("run") {
                 unsafe {

@@ -28,7 +28,7 @@ put its token in `bots/<name>`, add it to `fleet/bots.json` with `"managed": tru
 | --- | --- |
 | `com.victris.fleet-online` | Offline watchdog. Asks the ladder once a minute whether each bot with `expect_online` is online. After two minutes offline it writes an `ALERT` line to `logs/fleet-alerts.log`, shows a Mac notification, and repeats every 15 minutes until a `RECOVERED` line. Read-only. |
 | `com.victris.fleet-collector` | Replay collector, see below. |
-| `com.victris.fleet-watch` | Every 5 minutes: loads new games from bot logs into the store, and kills a managed bot that has been silent for 20 minutes so its supervisor restarts it. |
+| `com.victris.fleet-watch` | Every 5 minutes: loads new games from bot logs into the store, and kills a managed bot that has been silent for 20 minutes so its supervisor restarts it. Once a day it writes a snapshot of the store to `data/backup/` (the newest seven are kept) and compresses tick logs of managed bots that are more than two days old. |
 | `com.victris.<bot>` | Supervisor of one managed bot (`fleet run <bot>`). |
 
 `fleet status` shows all of it on one screen. `fleet alerts` prints the alert log.
@@ -106,7 +106,8 @@ the same token is refused instead of knocking the first one off the ladder.
 The collector watches the ladder's public match list and downloads replays one at a time, at
 most one request every five seconds: our own games first, then games of the top 15 bots, then
 games between bots rated 2000 and up, then the rest. A 403 or 429 pauses it for ten minutes,
-doubling up to two hours. Every replay is re-simulated on the exact engine before it is
+doubling up to two hours. The ladder plays far more games than that pace can fetch, so queued
+games that were not reached are let go: other bots' after a day, top bots' after three, ours never. Every replay is re-simulated on the exact engine before it is
 accepted; one that does not match goes to `replays/rejected/` and raises an event. Accepted
 replays are `replays/corpus/<match id>.jsonl.gz`, indexed in the `replays` table with both
 bots' names, versions and ratings.

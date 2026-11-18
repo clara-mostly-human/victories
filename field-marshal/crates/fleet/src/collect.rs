@@ -430,6 +430,15 @@ impl<'a> Collector<'a> {
                             found += self.discover(&format!("{HOST}/api/matches?bot={bot}&limit=200"))?;
                         }
                     }
+                    // The ladder plays more games than a polite collector can fetch, so the
+                    // back of the queue is let go: other bots' games after a day, top bots'
+                    // games after three. Our own games never expire.
+                    let now = now_ms();
+                    let _ = self.store.conn.execute(
+                        "UPDATE replays SET status = 'skipped', note = 'not fetched in time' WHERE status = 'queued'
+                           AND ((priority >= 2 AND added_ms < ?1) OR (priority = 1 AND added_ms < ?2))",
+                        params![now - 86_400_000, now - 3 * 86_400_000],
+                    );
                     let queued: i64 = self.store.conn.query_row("SELECT COUNT(*) FROM replays WHERE status = 'queued'", [], |r| r.get(0)).unwrap_or(0);
                     self.note(&format!("{found} new games listed; {queued} waiting; {} downloaded and {} rejected since start", self.downloaded, self.rejected));
                 }
