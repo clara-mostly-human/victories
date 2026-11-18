@@ -307,19 +307,19 @@ h2 {{ font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color:
 .tile span {{ color: var(--muted); font-size: 13px; }}
 .wrap {{ background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow-x: auto; }}
 table {{ width: 100%; border-collapse: collapse; min-width: 640px; }}
-th, td {{ padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }}
+th, td {{ padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }}
 th {{ font-size: 12px; font-weight: 600; color: var(--muted); white-space: nowrap; }}
 tr:last-child td {{ border-bottom: 0; }}
 .n {{ text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }}
 th.n {{ text-align: right; }}
 .sub {{ display: block; color: var(--muted); font-size: 12px; font-weight: 400; }}
-.pill {{ display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--line); color: var(--ink); }}
+.pill {{ display: inline-block; padding: 4px 12px; border-radius: 999px; font-size: 12px; line-height: 1.3; font-weight: 600; background: var(--line); color: var(--ink); }}
 .pill.good {{ background: var(--good-bg); color: var(--good); }}
 .pill.warn {{ background: var(--warn-bg); color: var(--warn); }}
 .pill.bad {{ background: var(--bad-bg); color: var(--bad); }}
 .bar {{ height: 4px; background: var(--line); border-radius: 2px; margin-top: 5px; min-width: 90px; }}
 .bar i {{ display: block; height: 4px; background: var(--accent); border-radius: 2px; }}
-ul {{ list-style: none; margin: 0; padding: 10px 14px; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }}
+ul {{ list-style: none; margin: 0; padding: 12px 16px; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }}
 .note {{ color: var(--muted); font-size: 13px; margin: 6px 2px 0; }}
 </style>
 </head>

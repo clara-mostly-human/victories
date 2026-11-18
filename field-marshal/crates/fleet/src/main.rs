@@ -620,7 +620,7 @@ fn main_inner() -> Result<i32, String> {
                 }
                 let mut opt = collect::Options::default();
                 if let Some(g) = a.num::<u64>("--gap")? {
-                    opt.gap = Duration::from_secs(g.max(2));
+                    opt.gap = Duration::from_secs(g.max(20));
                 }
                 if mode == "once" {
                     opt.max_downloads = Some(a.num("--max")?.unwrap_or(20));

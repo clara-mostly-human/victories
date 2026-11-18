@@ -135,6 +135,34 @@ pub fn recent_think_p99_ms(root: &Path, bot: &str) -> Option<f64> {
     Some(us[(us.len() - 1) * 99 / 100] as f64 / 1000.0)
 }
 
+/// Connections the ladder dropped on our bots in the last `window_ms`, counted from the
+/// ends of their logs (`disconnected` lines whose reason is a reset or a closed socket).
+pub fn recent_resets(root: &Path, bots: &[String], window_ms: i64) -> usize {
+    use std::io::{Read, Seek, SeekFrom};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0);
+    let mut n = 0;
+    for bot in bots {
+        let dir = root.join("logs").join(bot);
+        let Some(newest) = std::fs::read_dir(&dir).ok().and_then(|d| d.filter_map(|f| f.ok()).map(|f| f.path()).filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false)).max()) else { continue };
+        let Ok(mut f) = std::fs::File::open(newest) else { continue };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if f.seek(SeekFrom::Start(len.saturating_sub(1_500_000))).is_err() {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        if f.read_to_end(&mut bytes).is_err() {
+            continue;
+        }
+        n += String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|l| l.contains("\"t\":\"disconnected\"") && (l.contains("reset") || l.contains("closed the connection") || l.contains("Handshake")))
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| v.get("ts").and_then(Value::as_i64).map(|t| now - t <= window_ms).unwrap_or(false))
+            .count();
+    }
+    n
+}
+
 /// Why batch work should stand still right now, if it should.
 pub fn overload(root: &Path, cfg: &Config) -> Option<String> {
     let load = load_average();

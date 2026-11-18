@@ -7,10 +7,16 @@
 //! `replays/corpus/<match id>.jsonl.gz` and indexed in the store with both bots' names,
 //! versions and ratings, so a training set is one query (`fleet corpus ...`).
 //!
-//! Politeness: one request at a time, at most one every five seconds, and a pause that
-//! doubles (10 minutes up to 2 hours) whenever the host answers 403 or 429. The bulk
-//! download that was blocked on 2026-11-18 took about 700 files in a few minutes, some of
-//! them in parallel; this never does either.
+//! Politeness. One request at a time, and a pause that doubles (10 minutes up to 2 hours)
+//! whenever the host answers 403 or 429. More important: the ladder's edge appears to count
+//! replay downloads and bot connections from one address together. On 2026-11-18 every
+//! stretch of replay fetching from this machine (a bulk download, then this collector at
+//! one request every five seconds) came with bursts of reset connections on our live bots,
+//! each costing two to three seconds of a match, and they stopped a few minutes after the
+//! fetching did. So the pace is set by the harm it does: the collector starts at one
+//! request a minute, watches the bots' logs, and when their connections are being reset it
+//! stops for ten minutes and comes back half as fast. Only a long quiet stretch lets it
+//! speed up again, and never past one request every twenty seconds.
 
 use crate::store::{now_ms, Store};
 use rusqlite::params;
@@ -39,7 +45,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { gap: Duration::from_secs(5), list_every: Duration::from_secs(300), top: 15, strong_rating: 2000.0, max_downloads: None }
+        Options { gap: Duration::from_secs(60), list_every: Duration::from_secs(600), top: 15, strong_rating: 2000.0, max_downloads: None }
     }
 }
 
@@ -181,6 +187,7 @@ pub struct Collector<'a> {
     top: Vec<String>,
     pause: Duration,
     ok_streak: u32,
+    quiet_since: std::time::Instant,
     pub downloaded: usize,
     pub rejected: usize,
 }
@@ -201,15 +208,37 @@ fn priority(l: &Listed, ours: &[String], top: &[String], strong: f64) -> i64 {
 
 impl<'a> Collector<'a> {
     pub fn new(root: &Path, store: &'a Store, ours: Vec<String>, opt: Options) -> Collector<'a> {
-        Collector { root: root.to_path_buf(), store, ours, opt, top: Vec::new(), pause: Duration::ZERO, ok_streak: 0, downloaded: 0, rejected: 0 }
+        Collector { root: root.to_path_buf(), store, ours, opt, top: Vec::new(), pause: Duration::ZERO, ok_streak: 0, quiet_since: std::time::Instant::now(), downloaded: 0, rejected: 0 }
     }
 
     fn note(&self, text: &str) {
         eprintln!("collector: {text}");
     }
 
+    /// The live bots come first. If their connections were reset while we were fetching,
+    /// stop for ten minutes and halve the pace; after half an hour without a reset, speed
+    /// up a little. `None` means "stand still now".
+    fn yield_to_bots(&mut self) -> Option<()> {
+        let resets = crate::online::recent_resets(&self.root, &self.ours, 180_000);
+        if resets >= 2 {
+            self.opt.gap = (self.opt.gap * 2).min(Duration::from_secs(600));
+            self.quiet_since = std::time::Instant::now();
+            self.pause = Duration::from_secs(600);
+            self.note(&format!("{resets} bot connections were reset in the last 3 minutes; stopping for 10 minutes, then one request every {} s", self.opt.gap.as_secs()));
+            self.store.event(None, "collector_yield", &serde_json::json!({ "resets": resets, "gap_s": self.opt.gap.as_secs() }));
+            return None;
+        }
+        if self.quiet_since.elapsed() >= Duration::from_secs(1800) && self.opt.gap > Duration::from_secs(20) {
+            self.quiet_since = std::time::Instant::now();
+            self.opt.gap = Duration::from_secs((self.opt.gap.as_secs() * 4 / 5).max(20));
+            self.note(&format!("30 minutes without a reset; now one request every {} s", self.opt.gap.as_secs()));
+        }
+        Some(())
+    }
+
     /// One request, with the gap after it. `None` means the host asked us to back off.
     fn get(&mut self, url: &str) -> Option<Fetched> {
+        self.yield_to_bots()?;
         let r = fetch(url);
         std::thread::sleep(self.opt.gap);
         if let Fetched::Blocked(code) = r {
