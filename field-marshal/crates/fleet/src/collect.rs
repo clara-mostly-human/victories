@@ -112,7 +112,7 @@ pub fn verify(text: &str) -> Result<(usize, victris_engine::replay::Replay), Str
 }
 
 /// One game from the ladder's match list.
-struct Listed {
+pub(crate) struct Listed {
     id: String,
     started: String,
     ended: String,
@@ -125,7 +125,7 @@ struct Listed {
     bots: [(String, String, Option<f64>); 2],
 }
 
-fn listed(m: &Value) -> Option<Listed> {
+pub(crate) fn listed(m: &Value) -> Option<Listed> {
     let id = m.get("id")?.as_str()?.to_string();
     if !safe_id(&id) || m.get("voided").and_then(Value::as_bool).unwrap_or(false) || m.get("ended").map(Value::is_null).unwrap_or(true) {
         return None;
@@ -256,7 +256,7 @@ impl<'a> Collector<'a> {
         Some(r)
     }
 
-    fn upsert(&self, l: &Listed) -> bool {
+    pub(crate) fn upsert(&self, l: &Listed) -> bool {
         let pr = priority(l, &self.ours, &self.top, self.opt.strong_rating);
         let on_disk = replay_path(&self.root, &l.id).is_file();
         let n = self
@@ -543,6 +543,60 @@ pub fn index_corpus(root: &Path, store: &Store, ours: &[String]) -> std::io::Res
         }
     }
     Ok((added, bad))
+}
+
+/// Brings in what the off-network fetcher has gathered. A GitHub workflow
+/// (`.github/workflows/corpus.yml`) downloads replays from GitHub's network and commits
+/// them to the repository's `corpus` branch, so that nothing is fetched from the address
+/// the live bots play from. Here that branch is pulled into `data/corpus-remote` (its own
+/// shallow clone, not part of this checkout), new replays are copied into the corpus,
+/// verified on the engine like any other, and indexed with the ladder's record of the
+/// match. Returns (replays copied, verified now, failed verification).
+pub fn import_branch(root: &Path, store: &Store, ours: &[String]) -> Result<(usize, usize, usize), String> {
+    let dir = crate::store::data_dir(root).join("corpus-remote");
+    let git = |args: &[&str], cwd: &Path| -> Result<String, String> {
+        let out = Command::new("git").current_dir(cwd).args(args).output().map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("git failed").to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+    if dir.join(".git").exists() {
+        git(&["fetch", "--quiet", "--depth", "1", "origin", "corpus"], &dir)?;
+        git(&["reset", "--quiet", "--hard", "FETCH_HEAD"], &dir)?;
+    } else {
+        let url = git(&["remote", "get-url", "origin"], root)?;
+        let _ = std::fs::create_dir_all(crate::store::data_dir(root));
+        git(&["clone", "--quiet", "--single-branch", "--branch", "corpus", "--depth", "1", &url, &dir.display().to_string()], root)?;
+    }
+    let text = std::fs::read_to_string(dir.join("index.jsonl")).unwrap_or_default();
+    let c = Collector::new(root, store, ours.to_vec(), Options::default());
+    let _ = std::fs::create_dir_all(corpus_dir(root));
+    let mut copied = 0;
+    let _ = store.conn.execute_batch("BEGIN");
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+        let Some(l) = listed(&v) else { continue };
+        let status: Option<String> = store.conn.query_row("SELECT status FROM replays WHERE match_id = ?1", [&l.id], |r| r.get(0)).ok();
+        if matches!(status.as_deref(), Some("ok") | Some("bad")) {
+            // Already judged; still take the ratings the ladder's record carries.
+            c.upsert(&l);
+            continue;
+        }
+        let from = dir.join("replays").join(&l.id[..l.id.len().min(5)]).join(format!("{}.jsonl.gz", l.id));
+        let to = replay_path(root, &l.id);
+        if from.is_file() && !to.exists() && std::fs::copy(&from, &to).is_ok() {
+            copied += 1;
+        }
+        if to.exists() {
+            // A row left queued by the old collector must not hide a file that is now here.
+            let _ = store.conn.execute("UPDATE replays SET status = 'unverified' WHERE match_id = ?1 AND status NOT IN ('ok', 'bad')", [&l.id]);
+        }
+        c.upsert(&l);
+    }
+    let _ = store.conn.execute_batch("COMMIT");
+    let (verified, bad) = index_corpus(root, store, ours).map_err(|e| e.to_string())?;
+    Ok((copied, verified, bad))
 }
 
 /// A slice of the corpus, for training and evaluation.

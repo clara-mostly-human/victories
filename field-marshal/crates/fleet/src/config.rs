@@ -40,11 +40,13 @@ pub struct Config {
     pub guard_think_p99_ms: f64,
     /// the strong bots each new build is compared with by the habits yardstick
     pub habits_bots: Vec<String>,
+    /// pull replays from the repository's `corpus` branch (filled by the GitHub workflow)
+    pub corpus_branch: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0, habits_bots: vec!["StuartSutcliffe".into(), "Shelbot4".into()] }
+        Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0, habits_bots: vec!["StuartSutcliffe".into(), "Shelbot4".into()], corpus_branch: false }
     }
 }
 
@@ -78,7 +80,7 @@ impl Config {
         let d = Config::default();
         let guard = |k: &str, dflt: f64| v.get("guard").and_then(|g| g.get(k)).and_then(Value::as_f64).unwrap_or(dflt);
         let habits_bots = v.get("habits_bots").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or(d.habits_bots);
-        Config { bots, guard_load: guard("load", d.guard_load), guard_think_p99_ms: guard("think_p99_ms", d.guard_think_p99_ms), habits_bots }
+        Config { bots, guard_load: guard("load", d.guard_load), guard_think_p99_ms: guard("think_p99_ms", d.guard_think_p99_ms), habits_bots, corpus_branch: v.get("corpus_branch").and_then(Value::as_bool).unwrap_or(false) }
     }
 
     pub fn bot(&self, name: &str) -> Option<&BotConfig> {

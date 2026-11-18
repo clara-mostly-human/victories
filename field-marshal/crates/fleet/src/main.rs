@@ -25,7 +25,8 @@
 //!   fleet release promote <id> [--force "<reason>"]
 //!   fleet release mark <id> <status> --reason "<why>"
 //!
-//!   fleet collect run | once [--max N] | index    the replay collector
+//!   fleet collect import                          bring in replays the GitHub workflow fetched (corpus branch)
+//!   fleet collect run | once [--max N] | index    the local collector (off: it disturbs the live bots)
 //!   fleet corpus [--min-rating 2400] [--bot name] [--ours | --not-ours] [--since 24h] [--limit N] [--count]
 //!   fleet watch                                   one health pass (launchd runs this every 5 minutes)
 //!   fleet online [run]                            is each bot online on the ladder? `run` is the offline watchdog
@@ -612,10 +613,14 @@ fn main_inner() -> Result<i32, String> {
             }
         }
         "release" => release_cmd(&root, &store, &cfg, &a)?,
-        "collect" => match a.word(1, "run, once or index")? {
+        "collect" => match a.word(1, "run, once, index or import")? {
             "index" => {
                 let (added, bad) = collect::index_corpus(&root, &store, &cfg.names()).map_err(e)?;
                 println!("{added} replays on disk verified and indexed, {bad} failed verification");
+            }
+            "import" => {
+                let (copied, verified, bad) = collect::import_branch(&root, &store, &cfg.names())?;
+                println!("{copied} replays brought in from the corpus branch; {verified} verified and indexed, {bad} failed verification");
             }
             mode @ ("run" | "once") => {
                 unsafe {
@@ -654,6 +659,12 @@ fn main_inner() -> Result<i32, String> {
         "watch" => {
             watch(&root, &store, &cfg)?;
             housekeeping(&root, &store, &cfg);
+            // Replays fetched off this network arrive through the repository's corpus branch.
+            match if cfg.corpus_branch { collect::import_branch(&root, &store, &cfg.names()) } else { Ok((0, 0, 0)) } {
+                Ok((copied, verified, bad)) if copied + verified + bad > 0 => println!("corpus branch: {copied} replays brought in, {verified} verified, {bad} failed verification"),
+                Ok(_) => {}
+                Err(x) => eprintln!("corpus branch not imported: {x}"),
+            }
             let _ = std::fs::write(data_dir(&root).join("status.html"), fleet::report::html(&fleet::report::snapshot(&root, &store, &cfg)));
         }
         "online" => {
