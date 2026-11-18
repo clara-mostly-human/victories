@@ -59,6 +59,16 @@ pub fn is_online(bot: &str) -> Result<bool, String> {
     v.get("online").and_then(Value::as_bool).ok_or_else(|| "the answer has no `online` field".to_string())
 }
 
+/// Has the bot written to its log within `within`?
+pub fn wrote_recently(root: &Path, bot: &str, within: Duration) -> bool {
+    std::fs::read_dir(root.join("logs").join(bot))
+        .ok()
+        .and_then(|d| d.filter_map(|f| f.ok()).filter(|f| f.path().extension().map(|x| x == "jsonl").unwrap_or(false)).filter_map(|f| f.metadata().ok()?.modified().ok()).max())
+        .and_then(|t| t.elapsed().ok())
+        .map(|age| age <= within)
+        .unwrap_or(false)
+}
+
 pub fn alert_log(root: &Path) -> std::path::PathBuf {
     root.join("logs").join("fleet-alerts.log")
 }
@@ -239,7 +249,12 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
         for b in cfg.bots.iter().filter(|b| b.expect_online) {
             asked += 1;
             let w = bots.entry(b.name.clone()).or_default();
-            match is_online(&b.name) {
+            // A bot that wrote to its log in the last two and a half minutes is on the
+            // ladder: it logs every turn and every match start. Only a silent bot is worth
+            // a question to the ladder, which keeps requests from this address near zero
+            // (they appear to count against the same limit as the bots' own connections).
+            let answer = if wrote_recently(root, &b.name, Duration::from_secs(150)) { Ok(true) } else { is_online(&b.name) };
+            match answer {
                 Ok(true) => {
                     if w.alerted_at.is_some() {
                         let down = w.offline_since.map(|t| t.elapsed().as_secs() / 60).unwrap_or(0);
