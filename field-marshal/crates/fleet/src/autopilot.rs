@@ -142,6 +142,12 @@ impl Autopilot {
                     if current.as_deref() == Some(&mirror.id) {
                         continue;
                     }
+                    // A scout put on a newer build by hand (for an arm that needs it) is
+                    // never taken back to an older one.
+                    let current_seq = current.as_ref().and_then(|id| store.release(id).ok().flatten()).map(|r| r.seq).unwrap_or(0);
+                    if current_seq > mirror.seq {
+                        continue;
+                    }
                     if running && current.is_some() {
                         self.say(root, &format!("scout-{}", b.name), format!("{} stays on {} until the running experiment ends; the flagship is on {}", b.name, current.unwrap_or_default(), mirror.id));
                         continue;
