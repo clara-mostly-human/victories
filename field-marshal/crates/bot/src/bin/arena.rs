@@ -1,12 +1,11 @@
 //! arena: play two playbooks against each other on the exact engine.
 //!
-//!   arena [--pairs 50] [--seed 1] [--threads N] [--a file.json] [--b file.json]
+//!   arena [--pairs 50] [--seed 1] [--threads N] [--a file.json] [--b file.json | --b-clone]
 //!
 //! Each seed is played on all three maps with the seats both ways, so `--pairs 50` is 300
 //! games. A playbook file holds the fields of `Playbook` to change, e.g. {"fire_cost": 2}.
 //! With no files, both sides play the default and the result should be close to even.
 
-use marshal::arena::run_match;
 use marshal::policy::Playbook;
 use std::time::Instant;
 
@@ -28,7 +27,9 @@ fn main() {
     let a = load("--a", "A");
     let b = load("--b", "B");
     let t0 = Instant::now();
-    let t = run_match(&a, &b, pairs, seed, threads);
+    // --b-clone: B is the sparring partner cloned from the ladder's strong bots.
+    let clone = args.iter().any(|x| x == "--b-clone");
+    let t = marshal::arena::run_match_with(&a, if clone { None } else { Some(&b) }, pairs, seed, threads);
     let dt = t0.elapsed().as_secs_f64();
     let (score, half) = t.score();
     println!(

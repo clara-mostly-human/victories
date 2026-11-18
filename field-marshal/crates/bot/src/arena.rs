@@ -28,14 +28,25 @@ pub struct GameResult {
 
 /// Plays one game. `books[i]` is the playbook of fighter index `i`.
 pub fn play(engine: &Engine, seed: i64, books: [&Playbook; 2]) -> GameResult {
+    play_with(engine, seed, [Some(books[0]), Some(books[1])])
+}
+
+/// Plays one game; a seat with no playbook is taken by the clone of the ladder's strong
+/// bots (`victris_engine::clone`), which sees the true state and samples its turns.
+pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> GameResult {
     let mut s = engine.new_match(seed);
     let mut trackers = [Tracker::for_engine(engine.clone(), 0, seed), Tracker::for_engine(engine.clone(), 1, seed)];
     let mut prev: [Option<RawTurn>; 2] = [None, None];
     let mut events = Vec::new();
     let mut out = GameResult::default();
+    let mut rng = (seed as u64).wrapping_mul(0x9e3779b97f4a7c15) | 1;
     while s.result.is_none() {
         let mut turns = [RawTurn::IDLE; 2];
         for i in 0..2 {
+            let Some(book) = books[i] else {
+                turns[i] = victris_engine::clone::clone_turn(engine, &s, i, &mut rng);
+                continue;
+            };
             let view = View::from_state(engine, &s, i);
             let told: Vec<Value> = visible_events(engine, &s, i, &events).iter().map(|e| e.to_json(engine)).collect();
             let sync = trackers[i].observe(&view, &told, prev[i]);
@@ -46,7 +57,7 @@ pub fn play(engine: &Engine, seed: i64, books: [&Playbook; 2]) -> GameResult {
                         trackers[i].last_mismatch.clone().unwrap_or_default(), Value::Array(told.clone()));
                 }
             }
-            let d = decide(&trackers[i], &view, books[i]);
+            let d = decide(&trackers[i], &view, book);
             // ARENA_DASHLOG=1: one line for every dash, to see what the dashes are for.
             if matches!(d.turn.dash, victris_engine::turn::DirIn::Dir(_)) && std::env::var_os("ARENA_DASHLOG").is_some() {
                 let (me, en) = (&s.fighters[i], &s.fighters[1 - i]);
@@ -57,7 +68,7 @@ pub fn play(engine: &Engine, seed: i64, books: [&Playbook; 2]) -> GameResult {
                 };
                 eprintln!(
                     "dash {} tick {} note '{}' with {} | enemy seen {} dist {} their dash cd {} | in their frost {} | hp {} vs {}",
-                    books[i].name, view.tick, d.note, with, view.enemy.is_some(), victris_engine::geom::chebyshev(me.pos, en.pos), en.cd_dash, frosted, me.hp, en.hp
+                    book.name, view.tick, d.note, with, view.enemy.is_some(), victris_engine::geom::chebyshev(me.pos, en.pos), en.cd_dash, frosted, me.hp, en.hp
                 );
             }
             out.sims += d.sims as u64;
@@ -132,6 +143,11 @@ impl Tally {
 /// Plays `pairs` seeds on each shipped map, each seed twice with the seats swapped, so
 /// spawn and seat effects cancel. Runs on `threads` threads.
 pub fn run_match(a: &Playbook, b: &Playbook, pairs: u32, first_seed: i64, threads: usize) -> Tally {
+    run_match_with(a, Some(b), pairs, first_seed, threads)
+}
+
+/// As `run_match`; with no `b`, A plays the clone of the ladder's strong bots.
+pub fn run_match_with(a: &Playbook, b: Option<&Playbook>, pairs: u32, first_seed: i64, threads: usize) -> Tally {
     let engines: Vec<Engine> = victris_engine::shipped::MAP_NAMES.iter().map(|n| Engine::shipped(n)).collect();
     let jobs: Vec<(usize, i64, bool)> = (0..pairs)
         .flat_map(|k| (0..engines.len()).flat_map(move |m| [(m, first_seed + k as i64, false), (m, first_seed + k as i64, true)]))
@@ -146,8 +162,8 @@ pub fn run_match(a: &Playbook, b: &Playbook, pairs: u32, first_seed: i64, thread
                     loop {
                         let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some(&(m, seed, swapped)) = jobs.get(j) else { break };
-                        let books = if swapped { [b, a] } else { [a, b] };
-                        let g = play(&engines[m], seed, books);
+                        let books = if swapped { [b, Some(a)] } else { [Some(a), b] };
+                        let g = play_with(&engines[m], seed, books);
                         t.games += 1;
                         t.ticks += g.ticks as u64;
                         t.mismatches += g.mismatches;
