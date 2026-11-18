@@ -16,8 +16,7 @@ builds, `data/run/` pid files. Per-bot settings are in `fleet/bots.json` (in git
 | Bot | Run by | The fleet |
 | --- | --- | --- |
 | field-marshal | the search thread, launchd agent `com.victris.field-marshal` | reads its logs, watches that it is online. Never starts it or uses its token. |
-| foot-soldier | launchd agent `com.victris.foot-soldier` (TypeScript, `deploy/`) | reads its results from the ladder, watches that it is online. |
-| fleet-canary | `fleet run fleet-canary` under launchd, once registered | supervises it, runs experiments and canary releases on it. |
+| foot-soldier | `fleet run foot-soldier` under launchd (`com.victris.foot-soldier`) | the canary: supervises it, runs experiments and canary releases on it. It is the Rust bot since 2026-11-18; the TypeScript bot in `foot-soldier/` (v1, v2) is retired and only kept as an arena opponent. |
 
 A bot is `managed` when the fleet supervises it. Adding a scout later is: register the bot,
 put its token in `bots/<name>`, add it to `fleet/bots.json` with `"managed": true`, then

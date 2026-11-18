@@ -9,19 +9,11 @@
       "owner": "the search thread (Build the main bot engine and client)"
     },
     "foot-soldier": {
-      "role": "legacy",
-      "managed": false,
-      "experiments": false,
-      "note": "TypeScript bot under its own launchd agent (deploy/). The fleet does not run it.",
-      "expect_online": true,
-      "owner": "launchd agent com.victris.foot-soldier restarts it by itself"
-    },
-    "fleet-canary": {
       "role": "canary",
       "managed": true,
       "experiments": true,
-      "note": "Test bot for the fleet itself: gated releases meet the ladder here first.",
-      "expect_online": false,
+      "note": "The fleet's canary since 2026-11-18: the Rust bot under the fleet supervisor. Gated releases meet the ladder here first. The TypeScript bot it replaced (foot-soldier/, v1 and v2) is retired.",
+      "expect_online": true,
       "owner": "the fleet (infrastructure thread)"
     }
   }
