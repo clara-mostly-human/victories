@@ -101,22 +101,74 @@ paused. Anything else long-running on this machine should check the same file.
   the flagship waits `queue_gap_ms` (one second) after a match before queueing, so the
   flagship gets a freed slot first, and a refused queue is retried after a few seconds.
 
-## The gateway (on trial with one scout)
+## The gateway
 
-`fleet gateway` is one process that holds the ladder connection of every bot whose entry has
-`"gateway": true`; each bot's engine runs behind it as a `marshal --stdio` child from that
-bot's release. It paces connects and queue requests across the fleet, shares what it learns
-about slow addresses between bots, sends an idle turn for an engine that has not answered
-within 800 ms (a stalled or crashed engine costs turns, never a disqualification) and
-restarts it, and swaps an engine to a new release between two matches without dropping the
-connection. `fleet install gateway` loads it; a bot's own supervisor stands down while
-`gateway` is true for it.
+The design is Mike's (2026-11-18): **one process talks to the ladder, and nothing else on
+this machine does.** `fleet gateway` runs under launchd (`com.victris.fleet-gateway`,
+restarted within a second if it dies) and holds one WebSocket per bot whose entry has
+`"gateway": true`. The programs that decide turns are separate local processes ("bot
+processes": `marshal --stdio`). Each attaches to the gateway over a Unix socket,
+`data/run/gateway.sock`, which becomes its standard input and output. A bot process can be
+stopped, replaced or crash and the bot's connection to the ladder stays up.
 
-It also keeps the comms budget, set under `"comms"` in `fleet/bots.json`: at most 20 new
-connections a minute, 90 queue requests a minute and 15,000 matches a day across all the
-bots behind it (the ladder's own quotas are 20,000 matches a day per owner and one match
-start per bot every 300 ms). When a budget is spent the gateway waits and says so in its
-log. `fleet status` shows how much of each is in use.
+    fleet health                  # the one verdict, and a line per bot
+    fleet health --json           # everything the gateway knows (data/run/gateway.json)
+    fleet install gateway         # load or reload the gateway's agent
+    fleet install <bot>           # the bot's supervisor: starts its bot process, attached
+    fleet attach <bot> -- <cmd>   # attach a bot process the fleet does not start (the flagship)
+
+What the gateway owns:
+
+- **The sockets.** It connects one at a time for the whole fleet (2 s apart, inside the
+  comms budget), with backoff (1 s doubling to 30 s after a failed or short-lived
+  connection). It tests each socket: three pings when it opens (the round trip is logged;
+  with `"ping_reject_ms"` set, a slow one is dropped at once), and in play the wire time
+  of every turn, which is what the ladder charged us less what the bot process took. A
+  socket whose median wire time is over 180 ms after twenty turns, or that lost two turns
+  on the wire, is replaced, mid-match (the match resumes on the new socket). Replacements
+  are spaced 30 s apart across the fleet and come later each time for one bot (0, 5, 15,
+  45 s); after four slow sockets in a row it keeps what it has for ten minutes.
+- **The ladder's protocol**, as the ladder's guide says. After a match it queues again. On
+  `quota_exceeded` the bot stays queued and waits: no second `queue`, no reconnect. After
+  a reconnect it queues as usual and the ladder resumes a match in progress (the match
+  start, then the current observation); turns held for the old socket are never replayed.
+  A refused version label (`version_limit`) is bumped in the store and queued under the
+  next label on the same socket. A fatal refusal halts that bot only.
+- **A queue per bot process.** Frames wait in the process's own queue; a newer
+  observation replaces stale ones; a process that has not read for three seconds is
+  detached. If the process is late (800 ms) the gateway sends its quick fallback turn, or
+  an empty turn; if no process is attached it says `ready` and plays idle. Silence never
+  forfeits a match. Thirty late answers in a row and the process is let go, so its
+  supervisor starts a fresh one.
+- **The truth, and resync.** The gateway knows the connection, the match, the tick and
+  the label. A bot process that attaches during a match is sent the match start and the
+  latest observation. A build of client level 4 also gets `status` frames (on change and
+  once a second) and a heartbeat (`ping`, answered with `pong` and the match and tick the
+  process believes); a process that disagrees twice is set right with `sync` and the
+  same replay.
+- **Releases and labels.** `fleet deploy <bot> <release>` only writes the store. After
+  the bot's current match the gateway lets the old process go, the supervisor starts the
+  new release, it attaches, and the gateway queues. The socket never closes.
+- **Health.** Each bot has one verdict, from turns flowing: `playing`, `waiting for a
+  match, N s`, `stalled N s: <cause>`, `no bot process attached`, `socket down (...)`. A
+  bot queued two minutes without a match is logged as `STALL` with the cause (the quota
+  the ladder named, or "queued on a live socket"), and `STALL over` when it plays. The
+  fleet's verdict (`HEALTH ok` / `HEALTH degraded: ...`) goes to `logs/fleet-alerts.log`
+  on every change and is the first line of the status page.
+
+Settings, in `fleet/bots.json`: `"comms"` (connections a minute, queue requests a minute,
+matches a day) and `"gateway"` (`connect_gap_ms`, `answer_deadline_ms`, `slow_wire_ms`,
+`ping_reject_ms`, `replace_gap_ms`, `max_concurrent`, `stall_after_ms`).
+
+Standings (opponents' ratings, our ranks) are fetched on GitHub every five minutes
+(`.github/workflows/standings.yml`) and read from the `standings` branch; replays come the
+same way (`corpus.yml`, `fleet collect import`). The machine makes no HTTP request to the
+ladder.
+
+To test a change to the gateway without touching the ladder: `fleet mock-ladder` is a
+stand-in ladder (slow sockets, dropped connections, quota and label refusals on request)
+and `fleet mock-engine` a stand-in bot process; run them in a throwaway root with
+`VICTRIS_ROOT`.
 
 ## The autopilot
 
