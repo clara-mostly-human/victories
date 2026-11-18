@@ -1,0 +1,10 @@
+{
+  "name": "proactive",
+  "note": "matrix-5 against matrix-5 with the two proactive pieces on: rollouts in which each side takes the hit the other cannot avoid (rollout_punish) and a bonus for closing in while the opponent's shot is on cooldown (press_bonus 2). Arena says 60% over 120 games (66% and 54% in two runs); the arena has overstated every gain so far, so the ladder decides. Every opponent, balanced by opponent, map and seat.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "proactive": { "rollout_punish": true, "press_bonus": 2 }
+  }
+}
