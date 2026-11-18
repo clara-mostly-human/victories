@@ -111,6 +111,11 @@ pub struct Options {
     pub max_concurrent: usize,
     /// a bot queued this long without a match is reported as stalled
     pub stall_after: Duration,
+    /// at most this many sockets are given up for a better one in any ten minutes, across
+    /// the whole fleet. Every new connection counts against whatever the ladder's edge
+    /// allows us, and on 2026-11-18 an eager version of this test reconnected 33 times in
+    /// four minutes and left most bots on slow sockets. The cap is what keeps it polite.
+    pub replacements_per_10min: usize,
 }
 
 impl Default for Options {
@@ -121,11 +126,13 @@ impl Default for Options {
             queue_gap: Duration::from_millis(300),
             answer_deadline: Duration::from_millis(800),
             ready_deadline: Duration::from_millis(1500),
-            slow_wire_ms: 180.0,
+            // 0: a socket is not replaced in play for being slow (only for losing turns)
+            slow_wire_ms: 0.0,
             ping_reject_ms: 0.0,
             replace_gap: Duration::from_secs(10),
             max_concurrent: 5,
             stall_after: Duration::from_secs(120),
+            replacements_per_10min: 8,
         }
     }
 }
@@ -147,6 +154,7 @@ impl Options {
         o.replace_gap = ms("replace_gap_ms", o.replace_gap);
         o.max_concurrent = g.get("max_concurrent").and_then(Value::as_u64).map(|n| n.max(1) as usize).unwrap_or(o.max_concurrent);
         o.stall_after = ms("stall_after_ms", o.stall_after);
+        o.replacements_per_10min = g.get("replacements_per_10min").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(o.replacements_per_10min);
         o
     }
 }
@@ -210,6 +218,19 @@ impl Budget {
         true
     }
 
+    /// Books one use if there is room right now; never waits.
+    pub fn try_take(&self) -> bool {
+        let mut t = self.times.lock().unwrap_or_else(|p| p.into_inner());
+        while t.front().map(|f| f.elapsed() >= self.window).unwrap_or(false) {
+            t.pop_front();
+        }
+        if t.len() >= self.limit {
+            return false;
+        }
+        t.push_back(Instant::now());
+        true
+    }
+
     /// Waits for room, then books one use.
     pub fn take(&self, stop: &dyn Fn() -> bool) -> bool {
         if !self.wait_for_room(stop) {
@@ -241,6 +262,8 @@ pub struct Shared {
     pub connect_budget: Budget,
     pub queue_budget: Budget,
     pub match_budget: Budget,
+    /// sockets given up for a better one: the cap on the gateway's own reconnects
+    pub replace_budget: Budget,
     /// bot processes that have attached, by bot, waiting for the bot's thread to take them
     pub attach: Mutex<HashMap<String, Engine>>,
     /// each bot's health, as its thread last published it
@@ -257,10 +280,11 @@ impl Shared {
         let now = Instant::now();
         Shared {
             ping_reject_ms: AtomicU64::new(opt.ping_reject_ms.max(0.0) as u64),
-            slow_wire_ms: AtomicU64::new(opt.slow_wire_ms.max(1.0) as u64),
+            slow_wire_ms: AtomicU64::new(opt.slow_wire_ms.max(0.0) as u64),
             connect_budget: Budget::new("connection", cfg.comms_connects_per_minute, Duration::from_secs(60)),
             queue_budget: Budget::new("queue request", cfg.comms_queues_per_minute, Duration::from_secs(60)),
             match_budget: Budget::new("match", cfg.comms_matches_per_day, Duration::from_secs(86_400)),
+            replace_budget: Budget::new("socket replacement", opt.replacements_per_10min.max(1), Duration::from_secs(600)),
             opt,
             next_connect: Mutex::new(now),
             next_queue: Mutex::new(now),
@@ -637,9 +661,9 @@ fn replace_backoff(bad: u32) -> Duration {
 }
 
 /// After this many slow sockets in a row a bot keeps the one it has for a while.
-const SLOW_TRIES: u32 = 10;
+const SLOW_TRIES: u32 = 3;
 /// ... this long, before it starts trying again.
-const SLOW_REST: Duration = Duration::from_secs(180);
+const SLOW_REST: Duration = Duration::from_secs(300);
 
 /// What is true about this bot on the ladder's side. It outlives a connection and a bot
 /// process: this is the state a process is told and set back to.
@@ -818,8 +842,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                 if bad_sockets >= SLOW_TRIES && bad_since.elapsed() > SLOW_REST {
                     bad_sockets = 0;
                 }
-                let may = if in_a_hurry { resume_tries < 3 } else { bad_sockets < SLOW_TRIES };
-                if reject > 0.0 && ms > reject && may {
+                let may = if in_a_hurry { resume_tries < 2 } else { bad_sockets < SLOW_TRIES };
+                if reject > 0.0 && ms > reject && may && shared.replace_budget.try_take() {
                     if in_a_hurry {
                         resume_tries += 1;
                         backoff = Duration::ZERO;
@@ -1026,7 +1050,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         if wires.len() >= 20 && wires.len() % 5 == 0 || lost >= 2 {
                             let m = median(&wires);
                             wire_ms = Some(m);
-                            if (wires.len() >= 20 && m > shared.slow_wire_ms.load(Ordering::Relaxed) as f64) || lost >= 2 {
+                            let limit = shared.slow_wire_ms.load(Ordering::Relaxed) as f64;
+                            if (wires.len() >= 20 && limit > 0.0 && m > limit) || lost >= 2 {
                                 replace_why = Some(format!("slow socket: wire time {m:.0} ms over {} turns, {lost} turns lost on the wire", wires.len()));
                             }
                         }
@@ -1045,7 +1070,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         if wires.len() >= 20 {
                             let m = median(&wires);
                             wire_ms = Some(m);
-                            if m <= shared.slow_wire_ms.load(Ordering::Relaxed) as f64 && lost < 2 {
+                            let limit = shared.slow_wire_ms.load(Ordering::Relaxed) as f64;
+                            if (limit <= 0.0 || m <= limit) && lost < 2 && m < 150.0 {
                                 // A good match on this socket: the run of slow ones is over.
                                 bad_sockets = 0;
                             }
@@ -1381,7 +1407,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                 }
                 if last_slow_check.elapsed() > Duration::from_secs(2) {
                     last_slow_check = Instant::now();
-                    if bad_sockets < SLOW_TRIES && shared.may_replace() {
+                    if bad_sockets < SLOW_TRIES && shared.may_replace() && shared.replace_budget.try_take() {
                         bad_sockets += 1;
                         bad_since = Instant::now();
                         {
@@ -1731,7 +1757,7 @@ pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
             last_options = Instant::now();
             let o = Options::load(root);
             shared.ping_reject_ms.store(o.ping_reject_ms.max(0.0) as u64, Ordering::Relaxed);
-            shared.slow_wire_ms.store(o.slow_wire_ms.max(1.0) as u64, Ordering::Relaxed);
+            shared.slow_wire_ms.store(o.slow_wire_ms.max(0.0) as u64, Ordering::Relaxed);
         }
         if last_state.elapsed() >= Duration::from_secs(2) {
             // The gateway's state and the health verdict, for `fleet status`, `fleet health`
@@ -1757,6 +1783,7 @@ pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
                 "bots": running.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
                 "health": health,
                 "connections": b(&shared.connect_budget), "queue_requests": b(&shared.queue_budget), "matches": b(&shared.match_budget),
+                "socket_replacements": b(&shared.replace_budget),
                 "since_start": {
                     "connects": shared.connects.load(Ordering::Relaxed), "drops": shared.drops.load(Ordering::Relaxed), "slow_sockets_replaced": shared.replaced.load(Ordering::Relaxed),
                     "frames_out": shared.frames_out.load(Ordering::Relaxed), "frames_in": shared.frames_in.load(Ordering::Relaxed),
@@ -1864,6 +1891,10 @@ mod tests {
         assert_eq!(replace_backoff(1), Duration::ZERO);
         assert!(replace_backoff(2) < replace_backoff(3) && replace_backoff(3) < replace_backoff(4));
         assert!(replace_backoff(9) <= Duration::from_secs(15), "never a long wait: a waiting bot does not play");
+        // The cap on replacements never waits and never goes over.
+        let b = Budget::new("socket replacement", 2, Duration::from_secs(600));
+        assert!(b.try_take() && b.try_take());
+        assert!(!b.try_take());
         assert_eq!(median(&[5.0, 1.0, 9.0]), 5.0);
     }
 }

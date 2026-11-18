@@ -124,13 +124,17 @@ What the gateway owns:
   connection). It tests each socket: three pings when it opens (the round trip is logged;
   with `"ping_reject_ms"` set, a slow one is dropped at once), and in play the wire time
   of every turn, which is what the ladder charged us less what the bot process took. A
-  socket whose median wire time is over 180 ms after twenty turns, or that lost two turns
-  on the wire, is replaced, mid-match (the match resumes on the new socket). Replacements
-  are spaced 10 s apart across the fleet. A bot that draws slow sockets in a row tries
-  again at once, then after 2, 5, 10 and 15 s (about half of all new sockets were slow on
-  2026-11-18, so runs of them are ordinary); after ten in a row it keeps what it has for
-  three minutes and then tries again. With `"ping_reject_ms"` set (120 now), a socket
-  whose ping is over the limit is also replaced between matches, after two slow pings.
+  socket that loses two turns on the wire in a match is replaced in play (the match
+  resumes on the new one). Otherwise a slow socket is only given up when a reconnect is
+  cheap: at connect (ping over `"ping_reject_ms"`, 120 now: up to three tries, at 0, 2 and
+  5 s), with one quick ping when a match is being resumed (two tries), and between
+  matches after two slow pings. All of it sits under one cap, `"replacements_per_10min"`
+  (8), across the whole fleet: when the cap is spent a bot keeps the socket it has. About
+  half of all new sockets are slow whatever we do (ping 150 to 260 ms and 300 to 450 ms
+  on the wire per turn, against 40 to 65 and 70), and the ladder resets a socket every
+  few minutes anyway; an eager version of this test reconnected 33 times in four minutes
+  on 2026-11-18 and left most bots on slow sockets. Replacing in play for slowness alone
+  is off unless `"slow_wire_ms"` is set.
 - **The ladder's protocol**, as the ladder's guide says. After a match it queues again. On
   `quota_exceeded` the bot stays queued and waits: no second `queue`, no reconnect. After
   a reconnect it queues as usual and the ladder resumes a match in progress (the match
