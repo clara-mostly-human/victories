@@ -122,6 +122,10 @@ pub struct Playbook {
     /// rollouts and plans. 1 = always (the old assumption). Replays of the top twelve put
     /// it near 0.2 for a target whose step was spent when the shot left.
     pub dodge_prob: f64,
+    /// the same for a shot that needs a tick more to arrive (negative = use `dodge_prob`).
+    /// Replays: a target with its step in hand is hit 43 to 52% of the time by a shot two
+    /// ticks out and 18 to 38% by one three ticks out.
+    pub dodge_prob_far: f64,
     /// added to a frostburst's merit when the target's dash stays on cooldown until the
     /// burst goes off. Replays: such bursts are worth 11 to 13 hp over ten ticks (the
     /// target is slowed nine times in ten and the next shot lands), all others about 0.
@@ -211,6 +215,7 @@ impl Default for Playbook {
             threads: 1,
             hard_ms: 250,
             dodge_prob: 1.0,
+            dodge_prob_far: -1.0,
             frost_combo: 0.0,
             frost_wait_cost: 0.0,
             dash_cost_frosted: -1.0,
@@ -268,6 +273,7 @@ impl Playbook {
         f("prior_weight", &mut p.prior_weight);
         f("their_dash_cost", &mut p.their_dash_cost);
         f("dodge_prob", &mut p.dodge_prob);
+        f("dodge_prob_far", &mut p.dodge_prob_far);
         f("frost_combo", &mut p.frost_combo);
         f("frost_wait_cost", &mut p.frost_wait_cost);
         f("dash_cost_frosted", &mut p.dash_cost_frosted);
@@ -441,7 +447,7 @@ fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
     if s.fighters[me].state == FState::Stunned && my0.state != FState::Stunned {
         v -= pb.stun_bonus;
     }
-    for _ in 0..rollout {
+    for r in 0..rollout {
         if s.result.is_some() {
             break;
         }
@@ -510,7 +516,8 @@ fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
             // when the shot left still gets hit about four times in five, so the damage
             // the opponent side-stepped here is credited at the rate it really lands.
             if dodge[1 - me].mv != plan[1 - me].mv {
-                v += (1.0 - pb.dodge_prob) * sum.hp_lost[1 - me] as f64;
+                let p = if r > 0 && pb.dodge_prob_far >= 0.0 { pb.dodge_prob_far } else { pb.dodge_prob };
+                v += (1.0 - p) * sum.hp_lost[1 - me] as f64;
             }
             if dashed > 0.0 {
                 v += (1.0 - dashed) * sum.hp_lost[1 - me] as f64;

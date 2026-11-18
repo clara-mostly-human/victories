@@ -46,6 +46,9 @@ struct Cell {
     hold_swing: f64,
     lead: u32,
     lead_hit: u32,
+    /// held ticks on which a shot at the target's tile would have hit, given what both
+    /// sides went on to do (an upper bound once the flight is long enough to react to)
+    would_hit: u32,
 }
 
 fn main() {
@@ -98,7 +101,7 @@ fn main() {
         let mut events = Vec::new();
         let mut hp: Vec<[i32; 2]> = Vec::new();
         // (tick index, fighter, situation key, fired, lead, projectile id)
-        let mut rows: Vec<(usize, usize, String, bool, bool, Option<u32>)> = Vec::new();
+        let mut rows: Vec<(usize, usize, String, bool, bool, Option<u32>, bool)> = Vec::new();
         let mut hits: std::collections::HashSet<u32> = Default::default();
         for (ti, t) in replay.ticks.iter().enumerate() {
             if s.result.is_some() {
@@ -146,7 +149,30 @@ fn main() {
                     Event::ProjectileSpawn { projectile, owner, attack, .. } if *owner as usize == x + 1 && *attack as usize == ranged => Some(*projectile),
                     _ => None,
                 });
-                rows.push((ti, x, key, fired && id.is_some(), lead, id));
+                // A held tick: play it again with the shot added and see whether it lands.
+                let mut would_hit = false;
+                if !(fired && id.is_some()) {
+                    let mut alt = before;
+                    let mut turns = t.turns;
+                    turns[x] = turns[x].with_attack(ranged as u8, o.pos);
+                    let mut evs = Vec::new();
+                    for step in 0..4 {
+                        if alt.result.is_some() {
+                            break;
+                        }
+                        let tt = if step == 0 { turns } else { match replay.ticks.get(ti + step) { Some(n) => n.turns, None => break } };
+                        e.step_events(&mut alt, &tt, &mut evs);
+                        if evs.iter().any(|ev| matches!(ev, Event::Hit { attacker, attack, .. } if *attacker as usize == x + 1 && *attack as usize == ranged)) {
+                            would_hit = true;
+                            break;
+                        }
+                        // a later shot of ours in the record must not be counted: stop once the first one is gone
+                        if step > 0 && alt.fighters[x].cd_attack[ranged] == 0 {
+                            break;
+                        }
+                    }
+                }
+                rows.push((ti, x, key, fired && id.is_some(), lead, id, would_hit));
             }
             for ev in &events {
                 if let Event::ProjectileEnd { projectile, reason: "hit", .. } = ev {
@@ -155,7 +181,7 @@ fn main() {
             }
         }
         hp.push([s.fighters[0].hp, s.fighters[1].hp]);
-        for (ti, x, key, fired, lead, id) in rows {
+        for (ti, x, key, fired, lead, id, would_hit) in rows {
             let j = (ti + horizon).min(hp.len() - 1);
             let swing = ((hp[ti][1 - x] - hp[j][1 - x]) - (hp[ti][x] - hp[j][x])) as f64;
             let c = table.entry(key).or_default();
@@ -172,12 +198,16 @@ fn main() {
             } else {
                 c.held += 1;
                 c.hold_swing += swing;
+                c.would_hit += would_hit as u32;
             }
         }
     }
     println!("{fighter_games} counted fighter-games");
     println!("{games} games, {decisions} ticks with the shot ready and the opponent in sight within 6 tiles; swing = hp gained on the opponent over the next {horizon} ticks");
-    println!("{:<52} {:>6} {:>6} {:>5} {:>9} {:>6} {:>9} {:>10} {:>12}", "situation", "fired", "rate", "hit", "swing", "held", "swing", "fire-hold", "lead shots");
+    println!(
+        "{:<52} {:>6} {:>6} {:>5} {:>9} {:>6} {:>9} {:>10} {:>12} {:>16}",
+        "situation", "fired", "rate", "hit", "swing", "held", "swing", "fire-hold", "lead shots", "held: would hit"
+    );
     for (k, c) in &table {
         if c.fired + c.held < 40 {
             continue;
@@ -185,7 +215,7 @@ fn main() {
         let fs = if c.fired > 0 { c.fire_swing / c.fired as f64 } else { 0.0 };
         let hs = if c.held > 0 { c.hold_swing / c.held as f64 } else { 0.0 };
         println!(
-            "{:<52} {:>6} {:>5.0}% {:>4.0}% {:>+9.1} {:>6} {:>+9.1} {:>+10.1} {:>5} at {:>3.0}%",
+            "{:<52} {:>6} {:>5.0}% {:>4.0}% {:>+9.1} {:>6} {:>+9.1} {:>+10.1} {:>5} at {:>3.0}% {:>6} = {:>3.0}%",
             k,
             c.fired,
             100.0 * c.fired as f64 / (c.fired + c.held) as f64,
@@ -195,7 +225,9 @@ fn main() {
             hs,
             fs - hs,
             c.lead,
-            if c.lead > 0 { 100.0 * c.lead_hit as f64 / c.lead as f64 } else { 0.0 }
+            if c.lead > 0 { 100.0 * c.lead_hit as f64 / c.lead as f64 } else { 0.0 },
+            c.would_hit,
+            if c.held > 0 { 100.0 * c.would_hit as f64 / c.held as f64 } else { 0.0 }
         );
     }
 }
