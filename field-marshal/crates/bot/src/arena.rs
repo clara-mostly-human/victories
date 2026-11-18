@@ -22,8 +22,8 @@ pub struct GameResult {
     pub mismatches: u32,
     pub sims: u64,
     /// per seat: damage dealt by ranged, area, burst, wall slam; zone damage taken;
-    /// bursts thrown (areas); dashes; shots fired
-    pub stats: [[u32; 8]; 2],
+    /// bursts thrown (areas); dashes; shots fired; power pads taken
+    pub stats: [[u32; 9]; 2],
 }
 
 /// Plays one game. `books[i]` is the playbook of fighter index `i`.
@@ -93,6 +93,7 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
                 Event::AreaSpawn { owner, .. } => out.stats[*owner as usize - 1][5] += 1,
                 Event::Dash { fighter, .. } => out.stats[*fighter as usize - 1][6] += 1,
                 Event::ProjectileSpawn { owner, .. } => out.stats[*owner as usize - 1][7] += 1,
+                Event::Pickup { fighter, kind: victris_engine::map::PadKind::Power, .. } => out.stats[*fighter as usize - 1][8] += 1,
                 _ => {}
             }
         }
@@ -113,7 +114,7 @@ pub struct Tally {
     pub mismatches: u32,
     pub sims: u64,
     /// the game statistics of `GameResult::stats`, summed for A and for B
-    pub stats: [[u64; 8]; 2],
+    pub stats: [[u64; 9]; 2],
 }
 
 impl Tally {
@@ -126,7 +127,7 @@ impl Tally {
         self.mismatches += o.mismatches;
         self.sims += o.sims;
         for x in 0..2 {
-            for k in 0..8 {
+            for k in 0..9 {
                 self.stats[x][k] += o.stats[x][k];
             }
         }
@@ -170,7 +171,7 @@ pub fn run_match_with(a: &Playbook, b: Option<&Playbook>, pairs: u32, first_seed
                         t.sims += g.sims;
                         for seat in 0..2 {
                             let side = if (seat == 0) != swapped { 0 } else { 1 };
-                            for k in 0..8 {
+                            for k in 0..9 {
                                 t.stats[side][k] += g.stats[seat][k] as u64;
                             }
                         }

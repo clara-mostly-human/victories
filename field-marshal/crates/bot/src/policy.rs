@@ -122,6 +122,13 @@ pub struct Playbook {
     /// at tick 23 (it appears at tick 20) and took it in 39 of our 50 games against them;
     /// they average 1.64 power pads a game against us to our 0.54.
     pub pad_race: bool,
+    /// what ending a turn on a power pad that is there (or appears next tick) is worth, in
+    /// hp, while we have no buff; above 0 we also stop yielding a pad just because the
+    /// opponent is nearer, and walk to a pad goal with more weight. Today's replays: in
+    /// our games against the top group they take 1.75 power pads a game and we 0.40, and
+    /// a buffed Shelbot3 took us from 118 hp to 21 in six ticks while we stood one tile
+    /// from the second pad. The buff is damage x3/2 for 50 ticks.
+    pub pad_bonus: f64,
     /// weight (hp per unit of log probability) of the learned movement prior: how likely
     /// a strong bot is to hold, step toward, away, sideways or dash in our situation
     /// (`movemodel`, fitted on 922 replay games; it predicts 50% of their moves in unseen
@@ -254,6 +261,7 @@ impl Default for Playbook {
             prior_hold: 0.5,
             prior_model: false,
             pad_race: false,
+            pad_bonus: 0.0,
             move_prior_weight: 0.0,
             attack_prior_weight: 0.0,
             rollout_punish: false,
@@ -304,6 +312,7 @@ impl Playbook {
         f("frost_combo", &mut p.frost_combo);
         f("frost_wait_cost", &mut p.frost_wait_cost);
         f("move_prior_weight", &mut p.move_prior_weight);
+        f("pad_bonus", &mut p.pad_bonus);
         f("attack_prior_weight", &mut p.attack_prior_weight);
         f("dash_cost_frosted", &mut p.dash_cost_frosted);
         f("dash_dodge", &mut p.dash_dodge);
@@ -1222,8 +1231,14 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 PadKind::Power => my.power_until == NO_BUFF,
             };
             let reach = if def.kind == PadKind::Health { 10 } else if racing { 9 } else { 7 };
-            // Do not race the opponent to a pad it is clearly closer to.
-            let contested = visible && chebyshev(en.pos, def.pos) + 1 < d;
+            // Do not race the opponent to a pad it is clearly closer to. With `pad_bonus`
+            // a power pad is only given up when the opponent is all but standing on it.
+            let their_d = chebyshev(en.pos, def.pos);
+            let contested = if pb.pad_bonus > 0.0 && def.kind == PadKind::Power {
+                visible && their_d + 1 < d && their_d <= 1
+            } else {
+                visible && their_d + 1 < d
+            };
             // Waiting on a pad that the next shrink leaves outside the zone costs more than it gives.
             let closing = racing && view.next_shrink.map(|(r, _)| outside(def.pos, r)).unwrap_or(false);
             if soon && wanted && d <= reach && !contested && !closing && !outside(def.pos, zone_now) && best.map(|(bd, _, _)| d < bd).unwrap_or(true) {
@@ -1353,6 +1368,17 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             }
         }
         place -= pb.goal_weight * walk(*dest);
+        if pb.pad_bonus > 0.0 && my.power_until == NO_BUFF {
+            if goal_note == "power pad" {
+                place -= pb.pad_bonus / 8.0 * walk(*dest);
+            }
+            let on_pad = e.map.pads.iter().enumerate().any(|(i, def)| {
+                def.kind == PadKind::Power && def.pos == *dest && (s.pads[i].available || s.pads[i].respawn_tick - s.tick <= 1)
+            });
+            if on_pad {
+                place += pb.pad_bonus;
+            }
+        }
         if let Some(p) = &move_prior {
             let c = movemodel::class(*kind, my.pos, *dest, en.pos);
             place += pb.move_prior_weight * (p[c].max(1e-3) as f64).ln();

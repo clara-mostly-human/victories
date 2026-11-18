@@ -1,7 +1,7 @@
 //! padstats: who takes the pads and what that is worth, measured on ladder replays
 //! (workstream 6 of the plan: value and resources).
 //!
-//!   padstats [--bots A,B,C] [--versus X,Y*] [--map NAME] <replay dir or files>...
+//!   padstats [--bots A,B,C] [--versus X,Y*] [--map NAME] [--trace N] <replay dir or files>...
 //!
 //! For every game of a counted bot it records who took the first power pad and the first
 //! health pad and when, how many of each the two sides took in all, and who won. A power
@@ -43,6 +43,8 @@ fn main() {
     let versus: Option<Vec<String>> = opt("--versus").map(|s| s.split(',').map(str::to_string).collect());
     let is_versus = |name: &str| versus.as_ref().map(|v| v.iter().any(|p| p.strip_suffix('*').map(|pre| name.starts_with(pre)).unwrap_or(p == name))).unwrap_or(true);
     let only_map: Option<String> = opt("--map");
+    // --trace N: print the first 44 ticks of up to N games, every other tick: where both stand, hp, pickups
+    let mut trace: u32 = opt("--trace").and_then(|s| s.parse().ok()).unwrap_or(0);
     let mut files = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -50,7 +52,7 @@ fn main() {
             skip = false;
             continue;
         }
-        if a == "--bots" || a == "--versus" || a == "--map" {
+        if a == "--bots" || a == "--versus" || a == "--map" || a == "--trace" {
             skip = true;
             continue;
         }
@@ -96,6 +98,12 @@ fn main() {
         let mut ticks = 0usize;
         let mut at19: Option<[i32; 2]> = None;
         let mut early = [0u32; 2];
+        let tracing = trace > 0;
+        let us = if counted[0] { 0 } else { 1 };
+        if tracing {
+            trace -= 1;
+            println!("--- {} (us) vs {} on {}; power pads at {:?}", replay.bots[us], replay.bots[1 - us], e.map.name, e.map.pads.iter().filter(|p| p.kind == PadKind::Power).map(|p| p.pos).collect::<Vec<_>>());
+        }
         for (ti, t) in replay.ticks.iter().enumerate() {
             if s.result.is_some() {
                 break;
@@ -106,6 +114,17 @@ fn main() {
             }
             e.step_events(&mut s, &t.turns, &mut events);
             ticks = ti + 1;
+            if tracing && ti < 44 {
+                let picks: Vec<String> = events.iter().filter_map(|ev| match ev {
+                    Event::Pickup { fighter, kind, pos, .. } => Some(format!("{} takes {:?} pad at {:?}", if *fighter as usize - 1 == us { "we" } else { "they" }, kind, pos)),
+                    Event::Hit { attacker, damage, .. } => Some(format!("{} hit for {}", if *attacker as usize - 1 == us { "we" } else { "they" }, damage)),
+                    Event::Dash { fighter, .. } => Some(format!("{} dash", if *fighter as usize - 1 == us { "we" } else { "they" })),
+                    _ => None,
+                }).collect();
+                if ti % 2 == 1 || !picks.is_empty() {
+                    println!("  tick {:>2}: we {:?} hp {:>3} | they {:?} hp {:>3} | apart {} {}", ti, s.fighters[us].pos, s.fighters[us].hp, s.fighters[1 - us].pos, s.fighters[1 - us].hp, chebyshev(s.fighters[us].pos, s.fighters[1 - us].pos), picks.join("; "));
+                }
+            }
             if ti < 40 {
                 for ev in &events {
                     if let Event::Pickup { fighter, kind: PadKind::Power, .. } = ev {

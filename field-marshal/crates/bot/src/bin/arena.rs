@@ -48,8 +48,8 @@ fn main() {
     for (name, x) in [("A", 0), ("B", 1)] {
         let v = |k: usize| t.stats[x][k] as f64 / g;
         println!(
-            "{name} a game: dealt ranged {:.0}, frost {:.0}, repulsor {:.0}, slam {:.0}; zone taken {:.0}; bursts thrown {:.1}, dashes {:.1}, shots {:.1}",
-            v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7)
+            "{name} a game: dealt ranged {:.0}, frost {:.0}, repulsor {:.0}, slam {:.0}; zone taken {:.0}; bursts thrown {:.1}, dashes {:.1}, shots {:.1}, power pads {:.2}",
+            v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7), v(8)
         );
     }
 }
