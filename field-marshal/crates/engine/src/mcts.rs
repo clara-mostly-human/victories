@@ -44,12 +44,21 @@ pub struct Config {
     pub value_gen: usize,
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
+    /// fighters (bit 0 = fighter 0, bit 1 = fighter 1) whose standing shots may lead, in
+    /// addition to `lead` (both): to expect the opponent's lead shots without firing ours
+    pub lead_mask: u8,
     /// the quiet play-out at a leaf also plays a wall slam that is there for the taking
     pub quiet_slam: bool,
     /// a dash may carry the repulsor from up to the dash distance farther (`actions_with`)
     pub dash_burst: bool,
     /// the priors come from the search's own choices (`models_own`) instead of the ladder bots'
     pub own_priors: bool,
+    /// visits a new position gets (judged by its leaf value only) before it gets move lists
+    /// and children; 0 = at once, as before
+    pub expand_at: u32,
+    /// the most positions the tree may hold (0 = no limit); past it, new positions are
+    /// judged as leaves, which bounds the search's memory
+    pub max_nodes: u32,
     /// not 0: the priors at the root are jittered from this seed, so that several searches
     /// run side by side on separate threads grow different trees (their visits are added)
     pub noise_seed: u64,
@@ -61,7 +70,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, lead: false, quiet_slam: false, own_priors: false, dash_burst: false, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -213,6 +222,9 @@ pub fn actions_with(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, l
             }
         }
     }
+    // The list was sized for every move with every attack; most positions have far fewer.
+    // Every position in the tree keeps two of these, so the spare room is most of its memory.
+    out.shrink_to_fit();
     out
 }
 
@@ -371,6 +383,17 @@ impl<'a> Search<'a> {
         self.done = 0;
     }
 
+    /// Positions in the tree.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    /// Bytes held by the move lists (capacity), the bulk of the tree's memory.
+    pub fn list_bytes(&self) -> usize {
+        self.nodes.iter().map(|n| (n.acts[0].capacity() + n.acts[1].capacity()) * std::mem::size_of::<Act>()).sum::<usize>()
+            + self.nodes.capacity() * std::mem::size_of::<Node>()
+    }
+
     /// What the tree holds at the root now.
     pub fn result(&self) -> RootResult {
         let list = |x: usize| self.nodes[0].acts[x].iter().map(|a| (a.turn, a.n, if a.n > 0 { a.w / a.n as f64 } else { 0.0 })).collect();
@@ -387,17 +410,24 @@ impl<'a> Search<'a> {
             let mut leaf = 0.0;
             for depth in 0..self.cfg.depth {
                 if self.nodes[node].acts[0].is_empty() {
-                    for x in 0..2 {
-                        self.nodes[node].acts[x] = match (depth, fixed[x]) {
-                            (0, Some(t)) => vec![Act { turn: t, prior: 1.0, n: 0, w: 0.0 }],
-                            _ => actions_with(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead, self.cfg.own_priors, self.cfg.dash_burst),
-                        };
-                    }
-                    if depth > 0 {
+                    // With `expand_at`, a new position is first only judged; it gets its
+                    // move lists (the costly part, in time and memory) once visited again.
+                    if depth > 0 && self.nodes[node].n < self.cfg.expand_at {
+                        self.nodes[node].n += 1;
                         leaf = leaf_value(self.e, &s, &self.cfg);
                         break;
                     }
-                    if self.cfg.noise_seed != 0 {
+                    for x in 0..2 {
+                        self.nodes[node].acts[x] = match (depth, fixed[x]) {
+                            (0, Some(t)) => vec![Act { turn: t, prior: 1.0, n: 0, w: 0.0 }],
+                            _ => actions_with(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst),
+                        };
+                    }
+                    if depth > 0 && self.cfg.expand_at == 0 {
+                        leaf = leaf_value(self.e, &s, &self.cfg);
+                        break;
+                    }
+                    if depth == 0 && self.cfg.noise_seed != 0 {
                         let mut rng = self.cfg.noise_seed | 1;
                         for x in 0..2 {
                             let acts = &mut self.nodes[node].acts[x];
@@ -426,6 +456,11 @@ impl<'a> Search<'a> {
                 let key = ((node as u64) << 32) | ((i0 as u64) << 16) | i1 as u64;
                 node = match self.children.get(&key) {
                     Some(c) => *c as usize,
+                    None if self.cfg.max_nodes > 0 && self.nodes.len() >= self.cfg.max_nodes as usize => {
+                        // The tree is as big as it may grow: judge this position as a leaf.
+                        leaf = leaf_value(self.e, &s, &self.cfg);
+                        break;
+                    }
                     None => {
                         self.nodes.push(Node::default());
                         let c = self.nodes.len() - 1;

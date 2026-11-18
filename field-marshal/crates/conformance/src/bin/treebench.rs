@@ -26,6 +26,7 @@ fn main() {
     for t in replay.ticks.iter().take(tick) {
         e.step(&mut s, &t.turns);
     }
+    println!("one turn in the tree takes {} bytes", std::mem::size_of::<victris_engine::mcts::Act>());
     println!("{} tick {}: hp {} and {}, {} tiles apart", e.map.name, s.tick, s.fighters[0].hp, s.fighters[1].hp, victris_engine::geom::chebyshev(s.fighters[0].pos, s.fighters[1].pos));
     let base = Config { value_weight: 1.0, value_gen: 1, buff_value: 0.0, ..Default::default() };
     let variants: Vec<(&str, Config)> = vec![
@@ -36,6 +37,9 @@ fn main() {
         ("depth 6", Config { depth: 6, ..base }),
         ("depth 3", Config { depth: 3, ..base }),
         ("judgment with 31 features (candidate 4)", Config { value_gen: 4, ..base }),
+        ("expand on the second visit", Config { expand_at: 1, ..base }),
+        ("expand on the second visit, dash + repulsor", Config { expand_at: 1, dash_burst: true, ..base }),
+        ("dash + repulsor", Config { dash_burst: true, ..base }),
     ];
     for (name, cfg) in variants {
         let mut search = Search::new(e, cfg);
@@ -45,7 +49,7 @@ fn main() {
         let secs = started.elapsed().as_secs_f64();
         let root = search.result();
         let best = |x: usize| root.acts[x].iter().max_by_key(|a| a.1).map(|a| (a.1, a.2)).unwrap_or((0, 0.0));
-        println!("  {:<46} {:>7.0} iterations/s   root value {:+.1}, top turn share {:.0}% and {:.0}%, {} and {} turns", name, iterations as f64 / secs, root.value,
+        println!("  {:<46} {:>7.0} iterations/s, {:>6} nodes, {:>5.1} MB of move lists   root value {:+.1}, top turn share {:.0}% and {:.0}%, {} and {} turns", name, iterations as f64 / secs, search.node_count(), search.list_bytes() as f64 / 1048576.0, root.value,
             100.0 * best(0).0 as f64 / iterations as f64, 100.0 * best(1).0 as f64 / iterations as f64, root.acts[0].len(), root.acts[1].len());
     }
 }

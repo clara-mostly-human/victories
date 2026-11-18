@@ -151,6 +151,13 @@ pub struct Playbook {
     pub tree_own_priors: bool,
     /// the tree search considers dash + repulsor from beyond the repulsor's reach (both sides)
     pub tree_dash_burst: bool,
+    /// the tree search expects the opponent's standing shots to lead (aim where we could
+    /// step), without leading ours
+    pub tree_lead_them: bool,
+    /// visits a new position in the tree gets before its move lists are made (0 = at once)
+    pub tree_expand_at: u32,
+    /// the most positions one search's tree may hold (0 = no limit)
+    pub tree_max_nodes: u32,
     /// tree search settings, for tuning offline: ticks of quiet play-out at a leaf (6),
     /// the exploration constant (1.5), the share of the prior spread evenly (0.25)
     pub tree_quiet: u32,
@@ -303,6 +310,9 @@ impl Default for Playbook {
             tree_slam: false,
             tree_own_priors: false,
             tree_dash_burst: false,
+            tree_lead_them: false,
+            tree_expand_at: 0,
+            tree_max_nodes: 0,
             tree_quiet: 6,
             tree_threads: 1,
             tree_fog_samples: 1,
@@ -407,7 +417,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -417,6 +427,12 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_fog").and_then(Value::as_i64) {
             p.tree_fog = x as i32;
+        }
+        if let Some(x) = v.get("tree_max_nodes").and_then(Value::as_u64) {
+            p.tree_max_nodes = x as u32;
+        }
+        if let Some(x) = v.get("tree_expand_at").and_then(Value::as_u64) {
+            p.tree_expand_at = x as u32;
         }
         if let Some(x) = v.get("tree_fog_samples").and_then(Value::as_u64) {
             p.tree_fog_samples = x as u32;
@@ -1233,7 +1249,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     // the gateway's quick fallback calls us with `search` off and wants the plain heuristic.
     let guessed = pb.tree_fog > 0 && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_fog).unwrap_or(s.tick <= pb.tree_fog);
     if pb.tree_ms > 0 && pb.search && (visible || guessed) && t.think_cap_ms(pb.tree_ms) >= 20 {
-        let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
+        let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, lead_mask: if pb.tree_lead_them { 1u8 << (1 - me) } else { 0 }, expand_at: pb.tree_expand_at, max_nodes: pb.tree_max_nodes, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
         if pb.tree_value != 0.0 {
             cfg.buff_value = 0.0;
         }
