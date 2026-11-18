@@ -46,6 +46,8 @@ pub struct Config {
     pub lead: bool,
     /// the quiet play-out at a leaf also plays a wall slam that is there for the taking
     pub quiet_slam: bool,
+    /// a dash may carry the repulsor from up to the dash distance farther (`actions_with`)
+    pub dash_burst: bool,
     /// the priors come from the search's own choices (`models_own`) instead of the ladder bots'
     pub own_priors: bool,
     /// not 0: the priors at the root are jittered from this seed, so that several searches
@@ -59,7 +61,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, lead: false, quiet_slam: false, own_priors: false, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, lead: false, quiet_slam: false, own_priors: false, dash_burst: false, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -85,7 +87,15 @@ struct Node {
 /// hurt or stun the opponent at once if it stands still are tried first, the way a chess
 /// engine tries captures and checks first; this costs one engine step per turn, so it is
 /// used only near the root.
+/// `dash_burst`: a dash may also carry the repulsor when the dash can bring the fighter
+/// within reach (the dash resolves first, so dash + repulsor hits from up to the dash
+/// distance farther away; strong bots slam from 4 to 5 tiles this way).
 pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: bool, own: bool) -> Vec<Act> {
+    actions_with(e, s, x, even, forcing, lead, own, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn actions_with(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: bool, own: bool, dash_burst: bool) -> Vec<Act> {
     let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
     let idle = vec![Act { turn: RawTurn::IDLE, prior: 1.0, n: 0, w: 0.0 }];
     if f.state != FState::Idle || !f.alive || !o.alive {
@@ -136,6 +146,12 @@ pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: 
         }).map(|(i, _)| i as u8)
     };
     let (shot, frost, burst) = (ready(0), ready(1), ready(2));
+    // The repulsor after a dash, from farther away than it reaches standing.
+    let burst_far = if dash_burst && burst.is_none() && f.cd_dash == 0 && d <= 3 + e.rules.dash_distance {
+        e.rules.attacks.iter().enumerate().find(|(i, a)| f.cd_attack[*i] == 0 && matches!(a.kind, AttackKind::Burst { .. })).map(|(i, _)| i as u8)
+    } else {
+        None
+    };
     let (ws, wb, wf) = if own { (&own::SHOT_OWN, &own::BURST_OWN, &own::FROST_OWN) } else { (&SHOT_WEIGHTS, &BURST_WEIGHTS, &FROST_WEIGHTS) };
     let ps = if shot.is_some() { yes_prob(ws, &feat) } else { 0.0 };
     let pb = if burst.is_some() { yes_prob(wb, &feat) } else { 0.0 };
@@ -165,6 +181,10 @@ pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: 
         }
         if let Some(a) = burst {
             out.push(Act { turn: mv.with_burst(a), prior: pm * attack_p[2], n: 0, w: 0.0 });
+        }
+        if let (Some(a), 4) = (burst_far, *c) {
+            // The burst model was fitted within 2 tiles; from farther it gets a fixed share.
+            out.push(Act { turn: mv.with_burst(a), prior: pm * 0.3, n: 0, w: 0.0 });
         }
         if let Some(a) = frost {
             out.push(Act { turn: mv.with_attack(a, o.pos), prior: pm * attack_p[3], n: 0, w: 0.0 });
@@ -370,7 +390,7 @@ impl<'a> Search<'a> {
                     for x in 0..2 {
                         self.nodes[node].acts[x] = match (depth, fixed[x]) {
                             (0, Some(t)) => vec![Act { turn: t, prior: 1.0, n: 0, w: 0.0 }],
-                            _ => actions(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead, self.cfg.own_priors),
+                            _ => actions_with(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead, self.cfg.own_priors, self.cfg.dash_burst),
                         };
                     }
                     if depth > 0 {

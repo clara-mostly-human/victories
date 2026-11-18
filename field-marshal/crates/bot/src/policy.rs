@@ -149,11 +149,16 @@ pub struct Playbook {
     pub tree_slam: bool,
     /// the tree search's priors come from its own choices instead of the ladder bots'
     pub tree_own_priors: bool,
+    /// the tree search considers dash + repulsor from beyond the repulsor's reach (both sides)
+    pub tree_dash_burst: bool,
     /// tree search settings, for tuning offline: ticks of quiet play-out at a leaf (6),
     /// the exploration constant (1.5), the share of the prior spread evenly (0.25)
     pub tree_quiet: u32,
     /// searches run side by side on this many threads, their visits added (1 = one search)
     pub tree_threads: u32,
+    /// out of sight, each search thread splits its time over this many guesses of where
+    /// the opponent stands (needs `tree_fog`)
+    pub tree_fog_samples: u32,
     pub tree_c: f64,
     pub tree_even: f64,
     /// weight (hp per unit of log probability) of the learned movement prior: how likely
@@ -297,8 +302,10 @@ impl Default for Playbook {
             tree_lead: false,
             tree_slam: false,
             tree_own_priors: false,
+            tree_dash_burst: false,
             tree_quiet: 6,
             tree_threads: 1,
+            tree_fog_samples: 1,
             tree_c: 1.5,
             tree_even: 0.25,
             move_prior_weight: 0.0,
@@ -400,7 +407,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -410,6 +417,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_fog").and_then(Value::as_i64) {
             p.tree_fog = x as i32;
+        }
+        if let Some(x) = v.get("tree_fog_samples").and_then(Value::as_u64) {
+            p.tree_fog_samples = x as u32;
         }
         if let Some(x) = v.get("tree_threads").and_then(Value::as_u64) {
             p.tree_threads = x as u32;
@@ -1223,37 +1233,89 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     // the gateway's quick fallback calls us with `search` off and wants the plain heuristic.
     let guessed = pb.tree_fog > 0 && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_fog).unwrap_or(s.tick <= pb.tree_fog);
     if pb.tree_ms > 0 && pb.search && (visible || guessed) && t.think_cap_ms(pb.tree_ms) >= 20 {
-        let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
+        let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
         if pb.tree_value != 0.0 {
             cfg.buff_value = 0.0;
         }
         // The think time, cut down when the match budget could not carry it to the tick limit.
         let deadline = t.think_cap_ms(pb.tree_ms);
-        let run = |cfg: victris_engine::mcts::Config| {
-            let mut search = victris_engine::mcts::Search::new(e, cfg);
-            search.start();
-            let mut done = 0u32;
-            loop {
-                search.iterate(&s, [None, None], 1000);
-                done += 1000;
-                if started.elapsed().as_millis() as u64 >= deadline {
-                    break;
+        // Out of sight, each search gets its own guess at where the opponent stands: the
+        // first the tracker's ghost, the others a tile drawn from those it could be on. The
+        // turns at the root are then pooled by turn, so a move good against most of the
+        // guesses wins. (In sight every search starts from the same state.)
+        let root_for = |k: u32| -> victris_engine::State {
+            if visible || k == 0 {
+                return s;
+            }
+            let w = e.map.w;
+            let tiles: Vec<P> = t.possible.iter().enumerate().filter(|(_, b)| **b).map(|(i, _)| [(i as i32) % w, (i as i32) / w]).collect();
+            if tiles.is_empty() {
+                return s;
+            }
+            let mut rng = 0x9e3779b97f4a7c15u64.wrapping_mul(k as u64 + 7) ^ ((s.tick as u64) << 20) | 1;
+            let pick = tiles[((victris_engine::clone::next(&mut rng) * tiles.len() as f32) as usize).min(tiles.len() - 1)];
+            let mut st = s;
+            st.fighters[1 - me].pos = pick;
+            st
+        };
+        // Out of sight a thread can also split its time over several guesses
+        // (`tree_fog_samples`), each searched on its own and pooled turn by turn.
+        let per_thread = if visible { 1 } else { pb.tree_fog_samples.max(1) };
+        let pool = |into: &mut victris_engine::mcts::RootResult, r: &victris_engine::mcts::RootResult| {
+            for x in 0..2 {
+                for b in r.acts[x].iter() {
+                    match into.acts[x].iter_mut().find(|a| a.0 == b.0) {
+                        Some(a) => {
+                            let n = a.1 + b.1;
+                            if n > 0 {
+                                a.2 = (a.2 * a.1 as f64 + b.2 * b.1 as f64) / n as f64;
+                            }
+                            a.1 = n;
+                        }
+                        None => into.acts[x].push(*b),
+                    }
                 }
             }
-            (search.result(), done)
+        };
+        // The starting states, made here: the tracker cannot be shared between threads.
+        let starts: Vec<victris_engine::State> = (0..pb.tree_threads.max(1) * per_thread).map(root_for).collect();
+        let run = |cfg: victris_engine::mcts::Config, thread: u32| {
+            let mut out: Option<victris_engine::mcts::RootResult> = None;
+            let mut done = 0u32;
+            let begun = started.elapsed().as_millis() as u64;
+            for j in 0..per_thread {
+                let root = starts[(thread + j * pb.tree_threads.max(1)) as usize];
+                // this guess's share of the time left
+                let until = begun + (deadline.saturating_sub(begun)) * (j as u64 + 1) / per_thread as u64;
+                let mut search = victris_engine::mcts::Search::new(e, cfg);
+                search.start();
+                loop {
+                    search.iterate(&root, [None, None], 1000);
+                    done += 1000;
+                    if started.elapsed().as_millis() as u64 >= until {
+                        break;
+                    }
+                }
+                let r = search.result();
+                match out.as_mut() {
+                    None => out = Some(r),
+                    Some(o) => pool(o, &r),
+                }
+            }
+            (out.expect("at least one search"), done)
         };
         let (root, done) = if pb.tree_threads <= 1 {
-            run(cfg)
+            run(cfg, 0)
         } else {
-            // Several searches side by side, each with its own jitter on the root priors;
-            // the root's turns come out in the same order in each, so visits add up.
+            // Several searches side by side, each with its own jitter on the root priors
+            // (and out of sight its own guesses); visits are added turn by turn.
             let results: Vec<_> = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..pb.tree_threads)
                     .map(|k| {
                         let mut c = cfg;
                         c.noise_seed = if k == 0 { 0 } else { 0x9e3779b97f4a7c15u64.wrapping_mul(k as u64 + 1) ^ (s.tick as u64) };
                         let run = &run;
-                        scope.spawn(move || run(c))
+                        scope.spawn(move || run(c, k))
                     })
                     .collect();
                 handles.into_iter().filter_map(|h| h.join().ok()).collect()
@@ -1262,15 +1324,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             let Some((mut root, mut done)) = it.next() else { return idle };
             for (r, d) in it {
                 done += d;
-                for x in 0..2 {
-                    for (a, b) in root.acts[x].iter_mut().zip(r.acts[x].iter()) {
-                        let n = a.1 + b.1;
-                        if n > 0 {
-                            a.2 = (a.2 * a.1 as f64 + b.2 * b.1 as f64) / n as f64;
-                        }
-                        a.1 = n;
-                    }
-                }
+                pool(&mut root, &r);
             }
             (root, done)
         };
