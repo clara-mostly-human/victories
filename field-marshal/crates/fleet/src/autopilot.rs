@@ -78,6 +78,10 @@ impl Autopilot {
         if self.failed_builds.contains(sha) {
             return None;
         }
+        // A build is batch work: it waits while the load guard holds (memory, disk, load).
+        if crate::online::pause_file(root).exists() {
+            return None;
+        }
         match release::build(root, store, sha, Some(note), true) {
             Ok(r) => {
                 log_line(root, "PIPELINE", &format!("built {} from {} ({note})", r.id, &sha[..7]));

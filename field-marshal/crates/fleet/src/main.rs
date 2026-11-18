@@ -820,7 +820,19 @@ fn health(root: &Path, as_json: bool) -> Result<i32, String> {
         return Ok(2);
     }
     println!("{}", if star.level == "ok" { "OK: every bot is playing or waiting for a match".to_string() } else { format!("DEGRADED: {}", star.verdict) });
-    for r in rows.iter().filter(|r| r.bot != "*") {
+    let machine = rows.iter().find(|r| r.bot == "machine");
+    match machine {
+        Some(m) => println!(
+            "machine         {} {}{} ({} s ago)",
+            if m.level == "bad" { "SHORT:" } else { "ok:" },
+            m.verdict,
+            m.detail.get("worst_stall_ms").and_then(Value::as_u64).map(|x| format!(", worst CPU wait {x} ms in 15 s")).unwrap_or_default(),
+            (now_ms() - m.ts_ms) / 1000
+        ),
+        None => println!("machine         no reading yet (the watchdog writes it every 15 s: `fleet install online`)"),
+    }
+    let machine_short = machine.map(|m| m.level == "bad").unwrap_or(false);
+    for r in rows.iter().filter(|r| r.bot != "*" && r.bot != "machine") {
         let b = &r.detail;
         let s = |path: &[&str]| path.iter().fold(Some(b), |x, k| x.and_then(|x| x.get(*k))).filter(|x| !x.is_null()).map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).unwrap_or_else(|| "-".into());
         let rot = match b.get("rotation") {
@@ -844,7 +856,7 @@ fn health(root: &Path, as_json: bool) -> Result<i32, String> {
             s(&["flow", "last_turn_s"]),
         );
     }
-    Ok(if star.level == "ok" { 0 } else { 1 })
+    Ok(if star.level == "ok" && !machine_short { 0 } else { 1 })
 }
 
 fn main_inner() -> Result<i32, String> {
@@ -1195,6 +1207,7 @@ fn main_inner() -> Result<i32, String> {
                 drop(store);
                 fleet::online::run(&root, &|| STOP.load(Ordering::Relaxed));
             } else {
+                println!("machine: {}", fleet::machine::read(&root).summary());
                 println!(
                     "load average {:.1} (guard at {:.0}); batch work {}",
                     fleet::online::load_average(),

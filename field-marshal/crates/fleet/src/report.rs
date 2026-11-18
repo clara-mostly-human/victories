@@ -129,7 +129,16 @@ pub fn gateway_health(store: &Store) -> Option<GatewayHealth> {
         age_s: (now_ms() - star.ts_ms) / 1000,
         ..Default::default()
     };
-    for r in rows.iter().filter(|r| r.bot != "*") {
+    // The machine's own row (memory, swap, disk), from the watchdog: a problem of its own.
+    if let Some(m) = rows.iter().find(|r| r.bot == "machine") {
+        if m.level == "bad" {
+            h.problems.insert(0, format!("the Mac is short of room: {}", m.verdict));
+            h.word = "degraded".into();
+        } else if let Some(ms) = m.detail.get("worst_stall_ms").and_then(|x| x.as_u64()).filter(|ms| *ms > 500) {
+            h.problems.insert(0, format!("the Mac kept a process waiting {ms} ms for the CPU in the last 15 s"));
+        }
+    }
+    for r in rows.iter().filter(|r| r.bot != "*" && r.bot != "machine") {
         h.bots.insert(r.bot.clone(), (r.verdict.clone(), r.level.clone()));
         h.detail.insert(r.bot.clone(), r.detail.clone());
         if let Some(id) = r.socket_id {

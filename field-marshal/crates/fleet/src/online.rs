@@ -271,6 +271,10 @@ pub fn recent_resets(root: &Path, bots: &[String], window_ms: i64) -> usize {
 
 /// Why batch work should stand still right now, if it should.
 pub fn overload(root: &Path, cfg: &Config) -> Option<String> {
+    // Memory and disk first: a machine that pages stalls every process, the bots' too.
+    if let Some(p) = crate::machine::read(root).problems(cfg).into_iter().next() {
+        return Some(p);
+    }
     let load = load_average();
     if load > cfg.guard_load {
         return Some(format!("load average {load:.1} is above {:.0}", cfg.guard_load));
@@ -430,6 +434,8 @@ impl Stalls {
 }
 
 struct Guard {
+    /// the machine (memory, swap, disk) was short at the last check
+    machine_short: bool,
     paused: bool,
     calm: u32,
     /// a burst of reset connections is going on
@@ -473,8 +479,35 @@ impl Guard {
         }
     }
 
+    /// The machine's reading, as the `machine` row of `gateway_state`, and an alert line when
+    /// it becomes short of memory or disk and when it recovers.
+    fn note_machine(&mut self, root: &Path, cfg: &Config) {
+        let m = crate::machine::read(root);
+        let stall = crate::machine::take_worst_stall();
+        let problems = m.problems(cfg);
+        let short = !problems.is_empty();
+        let verdict = if short { problems.join("; ") } else { m.summary() };
+        if let Ok(store) = Store::open(&default_db(root), Duration::from_secs(2)) {
+            let _ = store.conn.execute(
+                "INSERT INTO gateway_state (bot, ts_ms, level, verdict, socket_id, detail) VALUES ('machine', ?1, ?2, ?3, NULL, ?4)
+                 ON CONFLICT(bot) DO UPDATE SET ts_ms = ?1, level = ?2, verdict = ?3, socket_id = NULL, detail = ?4",
+                rusqlite::params![crate::store::now_ms(), if short { "bad" } else if stall > 500 { "warn" } else { "ok" }, verdict, m.detail(stall).to_string()],
+            );
+        }
+        if stall > 500 {
+            log_line(root, "STALL", &format!("a process waited {stall} ms for the CPU in the last 15 s ({})", m.summary()));
+        }
+        if short && !self.machine_short {
+            log_line(root, "ALERT", &format!("the machine is short: {verdict}; batch work is paused until it recovers"));
+        } else if !short && self.machine_short {
+            log_line(root, "RECOVERED", &format!("the machine has room again: {}", m.summary()));
+        }
+        self.machine_short = short;
+    }
+
     fn check(&mut self, root: &Path, cfg: &Config) {
         self.note_resets(root, cfg);
+        self.note_machine(root, cfg);
         match overload(root, cfg) {
             Some(why) => {
                 self.calm = 0;
@@ -510,7 +543,8 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
     let mut bots: HashMap<String, Watch> = HashMap::new();
     let mut api_down_since: Option<Instant> = None;
     let mut api_alerted = false;
-    let mut guard = Guard { paused: false, calm: 0, resetting: false, reset_calm: 0 };
+    crate::machine::start_stall_probe();
+    let mut guard = Guard { machine_short: false, paused: false, calm: 0, resetting: false, reset_calm: 0 };
     let mut stalled = Stalls::default();
     eprintln!("{} watchdog started", utc_stamp());
     while !stop() {

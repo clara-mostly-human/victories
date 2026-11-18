@@ -23,6 +23,7 @@ pub mod config;
 pub mod fights;
 pub mod gateway;
 pub mod ingest;
+pub mod machine;
 pub mod mock;
 pub mod net;
 pub mod online;
