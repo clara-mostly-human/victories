@@ -5,8 +5,12 @@
 //! fuse), keeping off walls a repulsor could slam us into, taking pickups when they are
 //! cheap. With the opponent in view the exchange itself is then solved as a matrix game:
 //! each of our turns against each movement the opponent could make, played on the exact
-//! engine and a few ticks on, solved by regret matching (playbook "matrix-1"). Out of
+//! engine and a few ticks on, solved by regret matching. Out of
 //! view, or with `search` off, the turn with the best worst case is taken ("safe-2").
+//!
+//! matrix-2 adds what the first ladder games taught: most wall slams there are a dash
+//! to the opponent's side with a repulsor in the same tick. We now consider that turn
+//! ourselves (`dash_slam`) and avoid tiles where it would work against us (`slam_risk`).
 //!
 //! All numbers live in [`Playbook`], so a playbook for a named opponent can change them.
 //! They were tuned in the arena and then confirmed against other bots. Two findings are
@@ -66,12 +70,19 @@ pub struct Playbook {
     pub sample: bool,
     /// search: consider shots aimed where the opponent could step
     pub lead_shots: bool,
+    /// consider dashing to the opponent's side and firing the repulsor in the same tick
+    pub dash_slam: bool,
+    /// cost of ending on a tile where a step-in or dash-in repulsor would slam us into a wall
+    pub slam_risk: f64,
+    /// search: include the opponent's repulsor among its options even when its other
+    /// attacks are left out (a step in and a shove into a wall is the ladder's staple)
+    pub model_repulsor: bool,
 }
 
 impl Default for Playbook {
     fn default() -> Self {
         Playbook {
-            name: "matrix-1".into(),
+            name: "matrix-2".into(),
             fire_cost: 3.0,
             repulsor_cost: 1.0,
             frost_cost: 0.5,
@@ -92,6 +103,9 @@ impl Default for Playbook {
             model_attacks: false,
             sample: false,
             lead_shots: true,
+            model_repulsor: false,
+            dash_slam: true,
+            slam_risk: 5.0,
         }
     }
 }
@@ -119,13 +133,14 @@ impl Playbook {
         f("goal_weight", &mut p.goal_weight);
         f("incoming_weight", &mut p.incoming_weight);
         f("step_cost_under_fire", &mut p.step_cost_under_fire);
+        f("slam_risk", &mut p.slam_risk);
         if let Some(x) = v.get("health_pad_missing_hp").and_then(Value::as_i64) {
             p.health_pad_missing_hp = x as i32;
         }
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -385,7 +400,7 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
         if k.ranged.map(|a| my.cd_attack[a as usize] == 0).unwrap_or(false) {
             attacks.push(Atk::Ranged);
         }
-        if k.repulsor.map(|a| my.cd_attack[a as usize] == 0).unwrap_or(false) && dist_now <= 2 {
+        if k.repulsor.map(|a| my.cd_attack[a as usize] == 0).unwrap_or(false) && dist_now <= if pb.dash_slam { 5 } else { 2 } {
             attacks.push(Atk::Repulsor);
         }
         if let Some((a, range)) = k.frost {
@@ -584,7 +599,26 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
             }
         }
 
+        // The ladder's staple: a step or a dash to our side and a repulsor in the same tick,
+        // shoving us into a wall. If any movement the opponent has would do that to us on
+        // this tile, the tile is exposed.
+        if visible && pb.slam_risk > 0.0 && en_repulsor && *kind != 2 {
+            let burst = k.repulsor.unwrap();
+            for r in &replies {
+                let mut after = s;
+                let sum = e.step(&mut after, &turns(*mv, r.with_burst(burst)));
+                sims += 1;
+                if sum.slammed[me] {
+                    place -= pb.slam_risk;
+                    break;
+                }
+            }
+        }
+
         for atk in &attacks {
+            if *atk == Atk::Repulsor && chebyshev(*dest, en.pos) > 2 {
+                continue; // a repulsor only reaches the tiles around us
+            }
             if *atk == Atk::Frost {
                 // An area is judged from the tile we end on: in range and in sight from there.
                 let (_, range) = k.frost.unwrap();
@@ -652,7 +686,7 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
             if en_ranged && pb.model_attacks {
                 theirs.push((r.with_attack(k.ranged.unwrap(), my.pos), moved + pb.fire_cost));
             }
-            if en_repulsor && pb.model_attacks && dist_now <= 3 {
+            if en_repulsor && (pb.model_attacks || pb.model_repulsor) && dist_now <= 3 {
                 theirs.push((r.with_burst(k.repulsor.unwrap()), moved + pb.repulsor_cost));
             }
         }
