@@ -47,6 +47,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let bot = opt("--bot").unwrap_or_else(|| "A".into());
+    let names: Vec<String> = bot.split(',').map(str::to_string).collect();
     let iterations: u32 = opt("--iterations").and_then(|s| s.parse().ok()).unwrap_or(27_000);
     let dash_burst = args.iter().any(|a| a == "--dash-burst");
     let show: usize = opt("--show").and_then(|s| s.parse().ok()).unwrap_or(8);
@@ -69,7 +70,7 @@ fn main() {
             continue;
         }
         let Ok(replay) = parse_replay(&text) else { continue };
-        let Some(me) = replay.bots.iter().position(|b| *b == bot) else { continue };
+        let Some(me) = replay.bots.iter().position(|b| names.contains(b)) else { continue };
         games += 1;
         let e = &replay.engine;
         let mut s = e.new_match(replay.seed);
