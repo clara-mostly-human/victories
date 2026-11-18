@@ -1169,7 +1169,9 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             let reach = if def.kind == PadKind::Health { 10 } else if racing { 9 } else { 7 };
             // Do not race the opponent to a pad it is clearly closer to.
             let contested = visible && chebyshev(en.pos, def.pos) + 1 < d;
-            if soon && wanted && d <= reach && !contested && !outside(def.pos, zone_now) && best.map(|(bd, _, _)| d < bd).unwrap_or(true) {
+            // Waiting on a pad that the next shrink leaves outside the zone costs more than it gives.
+            let closing = racing && view.next_shrink.map(|(r, _)| outside(def.pos, r)).unwrap_or(false);
+            if soon && wanted && d <= reach && !contested && !closing && !outside(def.pos, zone_now) && best.map(|(bd, _, _)| d < bd).unwrap_or(true) {
                 best = Some((d, def.pos, if def.kind == PadKind::Health { "health pad" } else { "power pad" }));
             }
         }
