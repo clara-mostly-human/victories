@@ -62,7 +62,7 @@
   "corpus_branch": true,
   "autopilot_moves_bots": false,
   "gateway": {
-    "ping_reject_ms": 120,
+    "ping_reject_ms": 0,
     "replacements_per_10min": 8
   }
 }
