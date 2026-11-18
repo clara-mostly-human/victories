@@ -1,0 +1,80 @@
+{
+  "version": "0.22.1",
+  "ticks_per_second": 10,
+  "max_ticks": 600,
+  "stats": {
+    "max_hp": 130,
+    "move_cooldown": 2,
+    "sight_radius": 8,
+    "armor": 0
+  },
+  "attacks": {
+    "ranged": {
+      "kind": "projectile",
+      "damage": 12,
+      "speed": 2,
+      "cooldown": 6,
+      "bounces": 1
+    },
+    "frostburst": {
+      "kind": "area",
+      "damage": 14,
+      "range": 7,
+      "cooldown": 14,
+      "fuse": 6,
+      "radius": 1,
+      "slow": 2
+    },
+    "repulsor": {
+      "kind": "burst",
+      "damage": 5,
+      "range": 1,
+      "cooldown": 12,
+      "push": 3
+    }
+  },
+  "dash": {
+    "distance": 3,
+    "cooldown": 12,
+    "recovery": 1
+  },
+  "knockback": {
+    "wall_slam_damage": 10,
+    "wall_slam_stun": 3,
+    "fighter_collision_damage": 5
+  },
+  "zone": {
+    "start_tick": 200,
+    "interval": 60,
+    "step": 2,
+    "min_radius": 1,
+    "warning_ticks": 20,
+    "damage_base": 5,
+    "damage_step": 5,
+    "damage_step_ticks": 20
+  },
+  "pickups": {
+    "first_spawn": 20,
+    "health": {
+      "amount": 32,
+      "respawn": 120
+    },
+    "power": {
+      "duration": 50,
+      "damage_multiplier": [3, 2],
+      "respawn": 200
+    }
+  },
+  "shout": {
+    "max_length": 40,
+    "cooldown": 10
+  },
+  "limits": {
+    "startup_ms": 10000,
+    "tick_ms": 1000,
+    "match_budget_ms": 300000,
+    "max_consecutive_failures": 10,
+    "reconnect_grace_ms": 10000,
+    "max_message_bytes": 4096
+  }
+}

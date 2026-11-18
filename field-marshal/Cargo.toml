@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/engine", "crates/conformance", "crates/bot"]
+
+[workspace.package]
+edition = "2021"
+publish = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = 1
+
+[profile.test]
+opt-level = 2
