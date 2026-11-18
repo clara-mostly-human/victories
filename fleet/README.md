@@ -76,14 +76,15 @@ paused. Anything else long-running on this machine should check the same file.
   every bot's connection was dropped at once (2026-11-18). So: nothing on the home network
   loads the Victris site or its replays while the bots play; the fleet itself sends the
   ladder nothing but the bots' own frames.
-- **Edge addresses differ.** A connection keeps the edge address it landed on for life, and
-  one address was fast (about 100 ms charged per turn) while another lost turns to the
-  one-second limit. The client resolves the host itself, tries `prefer_addresses` from
-  `fleet/bots.json` first and addresses that were just slow last, records the address and
-  what the ladder charged per turn in every match row (`fleet stats --by remote`,
-  `--by connection`, `--by arm-remote`), and after a match on a slow connection (charge p50
-  over 180 ms with a fast engine, or any turn charged a full second) it reconnects before it
-  queues again, up to four times in a row.
+- **Connections differ in speed, for life.** Some connections are charged about 100 ms a
+  turn and others 230 ms and more, with turns lost to the one-second limit, and a connection
+  keeps its speed until it is replaced. It first looked like a property of the edge address,
+  but the same address has since been both fast and slow, so no address is preferred
+  (`prefer_addresses` in `fleet/bots.json` is empty). What works is measuring: the client
+  records the address and what the ladder charged per turn in every match row
+  (`fleet stats --by remote`, `--by connection`, `--by arm-remote`), and after a match on a
+  slow connection (charge p50 over 180 ms with a fast engine, or two or more turns charged a
+  full second) it reconnects before it queues again, up to four times in a row.
 - **The standings, twice an hour.** Opponent ratings and ranks on the status page come from
   the `ladder` table, filled by one request for the ladder's standings every
   `ladder_refresh_minutes` (30; `fleet ladder` does it by hand). It is the only request the

@@ -46,9 +46,7 @@
     "load": 8,
     "think_p99_ms": 300
   },
-  "prefer_addresses": [
-    "104.21.89.84"
-  ],
+  "prefer_addresses": [],
   "queue_gap_ms": 1000,
   "comms": {
     "connects_per_minute": 20,

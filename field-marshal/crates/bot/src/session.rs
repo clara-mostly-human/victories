@@ -575,11 +575,14 @@ impl Session {
             let charge = |p: f64| m.charges.get(((m.charges.len() as f64 - 1.0) * p).max(0.0) as usize).copied().unwrap_or(0);
             // Turns charged a full second were lost to the limit, whatever we sent.
             let lost = m.charges.iter().filter(|c| **c >= 1000).count();
-            // A connection is slow when the trip, not the thinking, eats the turn: the
-            // ladder's edge addresses differ, and a connection keeps its address for life.
+            // A connection is slow when the trip, not the thinking, eats the turn. Speed
+            // belongs to the connection and stays with it for life; the same address can be
+            // fast on one connection and slow on the next.
             // (ARENA_SLOW_P50_MS moves the 180 ms line; the local tests set it to 0.)
             let line = std::env::var("ARENA_SLOW_P50_MS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(180);
-            slow = m.charges.len() >= 20 && ((charge(0.5) > line && pct(0.5) < 50_000) || lost > 0);
+            // One lost turn is not enough to call a connection slow: on 2026-11-18 a single
+            // one moved the flagship off an address that was otherwise fine. Two are.
+            slow = m.charges.len() >= 20 && ((charge(0.5) > line && pct(0.5) < 50_000) || lost >= 2);
             let mut diffs: Vec<(&String, &u32)> = m.truth_diffs.iter().collect();
             diffs.sort_by(|a, b| b.1.cmp(a.1));
             let line = json!({
