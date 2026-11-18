@@ -54,5 +54,6 @@
     "matches_per_day": 15000
   },
   "ladder_refresh_minutes": 30,
-  "baseline_playbooks": ["matrix-5", "matrix-6"]
+  "baseline_playbooks": ["matrix-5", "matrix-6"],
+  "corpus_branch": true
 }

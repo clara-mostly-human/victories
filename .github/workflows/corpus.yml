@@ -1,0 +1,53 @@
+# Grows the replay corpus from GitHub's network, not from the address the live bots play
+# from (replay downloads from there came with dropped bot connections). Every three hours
+# it fetches up to 300 new replays (the top bots' games and our own) and commits them to
+# the `corpus` branch. The Mac pulls that branch, verifies every replay on the exact engine
+# and indexes it (`fleet collect import`, run by the health pass).
+name: Replay corpus
+
+on:
+  schedule:
+    - cron: "17 */3 * * *"
+  workflow_dispatch:
+    inputs:
+      max:
+        description: "Most replays to fetch in this run"
+        default: "300"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: corpus
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the fetch script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: fleet/tools
+      - name: Check out the corpus branch
+        uses: actions/checkout@v4
+        with:
+          ref: corpus
+          path: corpus
+      - name: Fetch replays
+        env:
+          MAX: ${{ inputs.max || '300' }}
+        run: python3 fleet/tools/fetch_replays.py --out corpus --max "$MAX"
+      - name: Commit
+        working-directory: corpus
+        run: |
+          git config user.name "replay-collector"
+          git config user.email "replay-collector@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "nothing new"
+          else
+            git commit -q -m "replays: $(git diff --cached --name-only | grep -c 'jsonl.gz$') added"
+            git push origin HEAD:corpus
+          fi
