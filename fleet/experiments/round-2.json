@@ -1,0 +1,12 @@
+{
+  "name": "round-2",
+  "note": "Second round, on a new baseline. Round one (tempo-on-off) ended with one change that held up on the ladder: holding the frostburst for the opening against bots rated 2250 and up (+15 points at 2.1 standard errors there, -11 under 2250). The scouts' default playbook becomes that rating-based playbook (field-marshal/playbooks/default.json written by tools/flagship-playbook.py --out, same as the flagship's), and control is that default. The three arms are questions round one left open because their games were played before the connection fix or were cut short: frost-escape (dash out of a burst thrown at us; +5 points after 51 games), no-tempo (is the tempo evaluation at the leaves worth having; 13 clean games), plan-8 (eight ticks of our own lines against an opponent model; no clean games). Each arm is laid over the per-opponent default, so it changes one thing against every opponent. Every opponent, balanced by opponent, map and seat. Read each arm against control and the plain default games over the same hours, by opponent rating band.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "frost-escape": { "dash_cost_frosted": 2 },
+    "no-tempo": { "tempo_weight": 0 },
+    "plan-8": { "plan_depth": 8 }
+  }
+}

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Writes field-marshal/playbooks/flagship.json from the ladder standings in the fleet store.
 
-  tools/flagship-playbook.py [--threshold 2250] [--dry-run]
+  tools/flagship-playbook.py [--threshold 2250] [--out field-marshal/playbooks/default.json] [--dry-run]
 
 The flagship holds its frostburst for the opening (matrix-6) only against opponents rated
 at or above the threshold, and plays the old way (matrix-5) against everyone else. Why:
@@ -10,6 +10,9 @@ by opponent rating: 2500 and up 26% against 7%; 2250 to 2500 57% against 40%; 20
 75% against 72%; under 2000 89% against 98%. Against weaker bots the thrown burst is what
 slows the target and sets up our shots; held back, we stop shooting and games run to the
 tick limit. Against stronger bots a burst thrown while their dash is ready is punished.
+
+With --out the same playbook can be written as the scouts' default (playbooks/default.json),
+which makes it the baseline that new experiment arms are laid over.
 
 The standings come from data/fleet.db (table `ladder`, refreshed by the fleet every 30
 minutes; this script only reads it). Run it again when the ladder has moved, then restart
@@ -31,6 +34,7 @@ text = json.dumps(book, indent=2) + "\n"
 if "--dry-run" in args:
     print(text)
 else:
-    with open(os.path.join(root, "field-marshal", "playbooks", "flagship.json"), "w") as f:
+    out = args[args.index("--out") + 1] if "--out" in args else os.path.join("field-marshal", "playbooks", "flagship.json")
+    with open(os.path.join(root, out), "w") as f:
         f.write(text)
 print(f"{len(strong)} opponents rated {threshold:.0f} and up hold the burst: {', '.join(strong)}", file=sys.stderr)
