@@ -1,0 +1,10 @@
+{
+  "name": "frost-escape",
+  "note": "Workstream 3 of the field-marshal plan, the defensive half. froststats --received over 1,602 replays: when a frostburst is thrown at one of the top two owners' bots while its dash is ready, it dashes out 70% of the time and the thrower ends 5.2 hp behind over ten ticks. Thrown at us in the same situation we dash out 26% of the time, are slowed 89% of the time (we walk out) and the thrower ends only 1.9 behind. Bursts thrown at us with the dash ready come 3.9 times a game. The dash (12 ticks) is back before the next burst can come (14), so spending it here is cheap. This arm prices our dash at 2 instead of 10 while we stand in the opponent's burst. Predicts: beats control, less ranged damage taken in the ticks after a burst. Needs a release at or after the commit that adds dash_cost_frosted. Every opponent, balanced by opponent, map and seat.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "frost-escape": { "dash_cost_frosted": 2 }
+  }
+}

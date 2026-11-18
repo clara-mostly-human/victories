@@ -1,7 +1,7 @@
 //! shotstats: what a ranged shot is worth, measured on ladder replays (workstream 1 of
 //! the plan).
 //!
-//!   shotstats [--bots A,B,C] [--horizon 8] <replay dir or files>...
+//!   shotstats [--bots A,B,C] [--map NAME] [--fine] [--horizon 8] <replay dir or files>...
 //!
 //! For every tick where a fighter could act, had its shot ready and the opponent in sight
 //! within 6 tiles, it records the situation (range, whether the target could step or
@@ -53,6 +53,9 @@ fn main() {
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let bots: Option<Vec<String>> = opt("--bots").map(|s| s.split(',').map(str::to_string).collect());
     let horizon: usize = opt("--horizon").and_then(|s| s.parse().ok()).unwrap_or(8);
+    let only_map: Option<String> = opt("--map");
+    // --fine: one row per exact distance and per tick the target still has to wait to step
+    let fine = args.iter().any(|a| a == "--fine");
     let mut files = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -60,7 +63,10 @@ fn main() {
             skip = false;
             continue;
         }
-        if a == "--bots" || a == "--horizon" {
+        if a == "--fine" {
+            continue;
+        }
+        if a == "--bots" || a == "--horizon" || a == "--map" {
             skip = true;
             continue;
         }
@@ -75,6 +81,9 @@ fn main() {
         }
         let Ok(replay) = parse_replay(&text) else { continue };
         let e = &replay.engine;
+        if only_map.as_ref().is_some_and(|m| *m != e.map.name) {
+            continue;
+        }
         let Some(ranged) = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Projectile { .. })) else { continue };
         let counted: Vec<bool> = (0..2).map(|i| bots.as_ref().map(|b| replay.bots.get(i).map(|n| b.contains(n)).unwrap_or(false)).unwrap_or(true)).collect();
         if !counted[0] && !counted[1] {
@@ -115,7 +124,15 @@ fn main() {
                     "step ready     "
                 };
                 let dash = if o.state == FState::Idle && o.cd_dash == 0 { "dash ready" } else { "no dash   " };
-                let key = format!("{band} | target {mobility} | {dash}");
+                let key = if fine {
+                    let wait = if o.state != FState::Idle { "cannot act".to_string() } else { format!("steps in {}", o.cd_move) };
+                    // ticks of flight at two tiles a tick along the straight line
+                    let (dx, dy) = ((f.pos[0] - o.pos[0]) as f64, (f.pos[1] - o.pos[1]) as f64);
+                    let flight = ((dx * dx + dy * dy).sqrt() / 2.0).ceil() as i32;
+                    format!("flight {flight} | target {wait:<10} | {dash}")
+                } else {
+                    format!("{band} | target {mobility} | {dash}")
+                };
                 let (fired, lead) = match t.turns[x].attack {
                     AttackIn::Named { attack, target } if attack as usize == ranged => (true, !matches!(target, TargetIn::Tile(p) if p == o.pos)),
                     _ => (false, false),

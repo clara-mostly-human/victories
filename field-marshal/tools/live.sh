@@ -12,6 +12,10 @@
 # fleet release is used, and from the frozen build's VERSION file otherwise.
 cd "$(dirname "$0")/../.."
 ours="field-marshal,foot-soldier,shock-trooper,quarter-master,spy-master"
+# The ladder site has two addresses. Connections to this one were charged about 110 ms a
+# tick; the other one 230 to 290 ms with timed-out ticks (2026-11-18). The client (r10 on)
+# tries it first and falls back to the rest.
+export ARENA_PREFER_ADDRESS="${ARENA_PREFER_ADDRESS:-104.21.89.84}"
 if [ -f data/releases/field-marshal-use-fleet ] && [ -x data/releases/live/marshal ]; then
   rel="data/releases/live"
   RELEASE="$(readlink "$rel" 2>/dev/null | xargs basename 2>/dev/null)"

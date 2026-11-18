@@ -1,0 +1,10 @@
+{
+  "name": "frost-timing",
+  "note": "Workstream 3 of the field-marshal plan. froststats over 1,602 replays: a frostburst launched while the target's dash stays on cooldown for the whole six-tick fuse is worth 11 to 13 hp over ten ticks, for the top two owners and for us alike (target slowed nine times in ten, the follow-up shot lands 61-79%). A burst thrown while the dash is ready or comes back before the blow is worth about zero (-1 to +2). The top two owners throw 6.1 bursts a game and 2.2 are the good kind; we throw 12.3 and 1.0 are, because ours is usually on its 14-tick cooldown when the opening comes. This arm adds 8 to a burst's merit in the opening and takes 4 off outside it, so the burst is held for the opening. In habits, attack agreement with StuartSutcliffe rises from 49% to 83% (we stop throwing about 1,400 bursts he holds). Predicts: beats control, fewer bursts thrown, more ranged damage dealt. Needs a release at or after the commit that adds frost_combo. Every opponent, balanced by opponent, map and seat.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "frost-timing": { "frost_combo": 8, "frost_wait_cost": 4 }
+  }
+}

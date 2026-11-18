@@ -122,6 +122,25 @@ pub struct Playbook {
     /// rollouts and plans. 1 = always (the old assumption). Replays of the top twelve put
     /// it near 0.2 for a target whose step was spent when the shot left.
     pub dodge_prob: f64,
+    /// added to a frostburst's merit when the target's dash stays on cooldown until the
+    /// burst goes off. Replays: such bursts are worth 11 to 13 hp over ten ticks (the
+    /// target is slowed nine times in ten and the next shot lands), all others about 0.
+    pub frost_combo: f64,
+    /// taken from a frostburst's merit when the target can dash before it goes off: the
+    /// price of having it on cooldown when the opening comes.
+    pub frost_wait_cost: f64,
+    /// the price of our dash while we stand in the opponent's frostburst (negative = the
+    /// usual `dash_cost`). Replays: the top bots dash out of a burst 70% of the time when
+    /// they can and come out 5 hp ahead; we dash out 26% of the time, walk out slowed and
+    /// come out 2 ahead. The dash (12 ticks) is back before the next burst (14).
+    pub dash_cost_frosted: f64,
+    /// how often the opponent dashes out of a hit it cannot step away from, in rollouts
+    /// (0 = never, the old assumption). Replays: a shot at a target whose step is spent
+    /// and whose dash is ready lands about 60% of the time against 88% with the dash gone.
+    pub dash_dodge: f64,
+    /// the same for a slowed opponent (two or more ticks from its next step), which
+    /// dashes far more often: our shots at such targets land 8 to 36% of the time.
+    pub dash_dodge_slowed: f64,
     /// plan search: ticks looked ahead along our own plans against the opponent model
     /// (0 or 1 = off)
     pub plan_depth: u32,
@@ -192,6 +211,11 @@ impl Default for Playbook {
             threads: 1,
             hard_ms: 250,
             dodge_prob: 1.0,
+            frost_combo: 0.0,
+            frost_wait_cost: 0.0,
+            dash_cost_frosted: -1.0,
+            dash_dodge: 0.0,
+            dash_dodge_slowed: 0.0,
             plan_depth: 0,
             plan_width: 12,
             plan_margin: 2.0,
@@ -244,6 +268,11 @@ impl Playbook {
         f("prior_weight", &mut p.prior_weight);
         f("their_dash_cost", &mut p.their_dash_cost);
         f("dodge_prob", &mut p.dodge_prob);
+        f("frost_combo", &mut p.frost_combo);
+        f("frost_wait_cost", &mut p.frost_wait_cost);
+        f("dash_cost_frosted", &mut p.dash_cost_frosted);
+        f("dash_dodge", &mut p.dash_dodge);
+        f("dash_dodge_slowed", &mut p.dash_dodge_slowed);
         f("plan_margin", &mut p.plan_margin);
         f("plan_solve_weight", &mut p.plan_solve_weight);
         f("plan_fire_cost", &mut p.plan_fire_cost);
@@ -432,24 +461,47 @@ fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
         // looks for a way out (keeping any attack it had planned).
         let mut dodge = plan;
         let mut any = false;
+        let mut dashed = 0.0; // the chance the opponent really dashes out, when the model lets it
         for x in 0..2 {
             let f = &base.fighters[x];
-            if sum.hp_lost[x] == 0 || f.state != FState::Idle || f.cd_move != 0 || plan[x].mv != victris_engine::turn::DirIn::None {
+            if sum.hp_lost[x] == 0 || f.state != FState::Idle || plan[x].mv != victris_engine::turn::DirIn::None {
                 continue;
             }
-            for d in 0..8u8 {
-                if e.map.step_blocked(f.pos, d) {
-                    continue;
+            let mut stepped = false;
+            if f.cd_move == 0 {
+                for d in 0..8u8 {
+                    if e.map.step_blocked(f.pos, d) {
+                        continue;
+                    }
+                    let mut trial = base;
+                    let mut t2 = dodge;
+                    t2[x].mv = victris_engine::turn::DirIn::Dir(d);
+                    let r = e.step(&mut trial, &t2);
+                    *sims += 1;
+                    if r.hp_lost[x] == 0 {
+                        dodge[x].mv = victris_engine::turn::DirIn::Dir(d);
+                        any = true;
+                        stepped = true;
+                        break;
+                    }
                 }
-                let mut trial = base;
-                let mut t2 = dodge;
-                t2[x].mv = victris_engine::turn::DirIn::Dir(d);
-                let r = e.step(&mut trial, &t2);
-                *sims += 1;
-                if r.hp_lost[x] == 0 {
-                    dodge[x].mv = victris_engine::turn::DirIn::Dir(d);
-                    any = true;
-                    break;
+            }
+            // No step saves it. The opponent may spend its dash instead, and a slowed one
+            // usually does.
+            let p = if f.cd_move >= 2 { pb.dash_dodge_slowed } else { pb.dash_dodge };
+            if !stepped && x != me && p > 0.0 && f.cd_dash == 0 && plan[x].dash == victris_engine::turn::DirIn::None {
+                for d in 0..8u8 {
+                    let mut trial = base;
+                    let mut t2 = dodge;
+                    t2[x].dash = victris_engine::turn::DirIn::Dir(d);
+                    let r = e.step(&mut trial, &t2);
+                    *sims += 1;
+                    if r.hp_lost[x] == 0 {
+                        dodge[x].dash = victris_engine::turn::DirIn::Dir(d);
+                        any = true;
+                        dashed = p;
+                        break;
+                    }
                 }
             }
         }
@@ -459,6 +511,9 @@ fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
             // the opponent side-stepped here is credited at the rate it really lands.
             if dodge[1 - me].mv != plan[1 - me].mv {
                 v += (1.0 - pb.dodge_prob) * sum.hp_lost[1 - me] as f64;
+            }
+            if dashed > 0.0 {
+                v += (1.0 - dashed) * sum.hp_lost[1 - me] as f64;
             }
             s = base;
             e.step(&mut s, &dodge);
@@ -895,6 +950,8 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     let me = t.me;
     let my = s.fighters[me];
     let en = s.fighters[1 - me];
+    // standing in the opponent's frostburst before it goes off
+    let frosted = s.areas().iter().any(|b| b.owner as usize != me && t.engine.map.in_blast(b.pos, b.radius, my.pos));
     if my.state != FState::Idle {
         return idle;
     }
@@ -1083,7 +1140,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         }
         place -= pb.goal_weight * walk(*dest);
         if *kind == 2 {
-            place -= pb.dash_cost;
+            place -= if frosted && pb.dash_cost_frosted >= 0.0 { pb.dash_cost_frosted } else { pb.dash_cost };
         }
         if visible {
             let d = chebyshev(*dest, en.pos);
@@ -1170,7 +1227,15 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 Atk::None => (*mv, 0.0, 0.0, goal_note),
                 Atk::Ranged => (mv.with_attack(k.ranged.unwrap(), en.pos), pb.fire_cost, 0.0, "sure shot"),
                 Atk::Repulsor => (mv.with_burst(k.repulsor.unwrap()), pb.repulsor_cost, 0.0, "repulsor"),
-                Atk::Frost => (mv.with_attack(k.frost.unwrap().0, en.pos), pb.frost_cost, pb.frost_value, "frostburst"),
+                Atk::Frost => {
+                    let a = k.frost.unwrap().0;
+                    let fuse = match e.rules.attacks[a as usize].kind {
+                        victris_engine::rules::AttackKind::Area { fuse, .. } => fuse,
+                        _ => 0,
+                    };
+                    let timing = if en.cd_dash > fuse { pb.frost_combo } else { -pb.frost_wait_cost };
+                    (mv.with_attack(a, en.pos), pb.frost_cost, pb.frost_value + timing, "frostburst")
+                }
             };
             if matrix {
                 cands.push((mine, place - cost + bonus, note));
