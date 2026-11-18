@@ -1,9 +1,9 @@
 {
   "default": {
-    "name": "tree-dash-burst",
+    "name": "tree-pads",
     "tree_ms": 150,
     "tree_value": 1.0,
-    "tree_gen": 1,
+    "tree_gen": 6,
     "tree_dash_burst": true,
     "tree_threads": 1
   },
