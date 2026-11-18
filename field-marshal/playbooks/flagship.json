@@ -1,12 +1,10 @@
 {
   "default": {
-    "name": "tree-fog",
+    "name": "tree-dash-burst",
     "tree_ms": 150,
     "tree_value": 1.0,
     "tree_gen": 1,
     "tree_dash_burst": true,
-    "tree_fog": 999,
-    "tree_fog_samples": 4,
     "tree_threads": 1
   },
   "opponents": {}
