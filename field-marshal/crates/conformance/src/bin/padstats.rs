@@ -71,6 +71,12 @@ fn main() {
     // how far from the nearest power pad we are at tick 19, as a histogram 0..=9+
     let mut our_hist = [0u32; 10];
     let mut their_hist = [0u32; 10];
+    // chances we let go: a power pad lay there, we had no buff, we were within 3 tiles of
+    // it and no farther from it than the opponent. (ticks like that; pads that the
+    // opponent then took after we had had at least 4 such ticks on them; games with one)
+    let mut chance_ticks = 0u32;
+    let mut given_away = 0u32;
+    let mut games_given = 0u32;
     for path in &files {
         let mut text = String::new();
         if std::fs::File::open(path).map(|f| GzDecoder::new(f).read_to_string(&mut text)).is_err() {
@@ -98,6 +104,10 @@ fn main() {
         let mut ticks = 0usize;
         let mut at19: Option<[i32; 2]> = None;
         let mut early = [0u32; 2];
+        // per fighter, per pad: ticks on which that fighter had the chance described above
+        let mut chance = [[0u32; 8]; 2];
+        let mut gave = [0u32; 2];
+        let mut chances = [0u32; 2];
         let tracing = trace > 0;
         let us = if counted[0] { 0 } else { 1 };
         if tracing {
@@ -107,6 +117,21 @@ fn main() {
         for (ti, t) in replay.ticks.iter().enumerate() {
             if s.result.is_some() {
                 break;
+            }
+            for x in 0..2 {
+                let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
+                if f.power_until != victris_engine::state::NO_BUFF {
+                    continue;
+                }
+                for (pi, def) in e.map.pads.iter().enumerate().take(8) {
+                    if def.kind == PadKind::Power && s.pads[pi].available {
+                        let (md, td) = (chebyshev(f.pos, def.pos), chebyshev(o.pos, def.pos));
+                        if md <= 3 && md <= td {
+                            chance[x][pi] += 1;
+                            chances[x] += 1;
+                        }
+                    }
+                }
             }
             if ti == 19 {
                 let near = |f: usize| e.map.pads.iter().filter(|p| p.kind == PadKind::Power).map(|p| chebyshev(s.fighters[f].pos, p.pos)).min().unwrap_or(99);
@@ -136,6 +161,16 @@ fn main() {
                 if let Event::Pickup { fighter, kind, .. } = ev {
                     let k = if *kind == PadKind::Power { 0 } else { 1 };
                     let f = *fighter as usize - 1;
+                    if let Event::Pickup { pad, .. } = ev {
+                        let pi = (*pad as usize).saturating_sub(1).min(7);
+                        if k == 0 {
+                            if chance[1 - f][pi] >= 4 {
+                                gave[1 - f] += 1;
+                            }
+                            chance[0][pi] = 0;
+                            chance[1][pi] = 0;
+                        }
+                    }
                     taken[f][k] += 1;
                     first[k].get_or_insert((ti, f));
                 }
@@ -147,6 +182,9 @@ fn main() {
                 continue;
             }
             n += 1;
+            chance_ticks += chances[x];
+            given_away += gave[x];
+            games_given += (gave[x] > 0) as u32;
             if let Some(d) = at19 {
                 open_games += 1;
                 open_dist[0] += d[x] as u64;
@@ -199,6 +237,13 @@ fn main() {
         open_dist[1] as f64 / og,
         open_taken[0] as f64 / og,
         open_taken[1] as f64 / og
+    );
+    println!(
+        "chances let go: {:.1} ticks a game with a power pad lying within 3 tiles, no farther from us than from them, and no buff on us; {} pads the opponent then took after we had 4 or more such ticks on them, in {} of {} games",
+        chance_ticks as f64 / g,
+        given_away,
+        games_given,
+        n
     );
     println!("our distance at tick 19, games by tiles 0..9+: {:?}", our_hist);
     println!("their distance at tick 19, games by tiles 0..9+: {:?}", their_hist);
