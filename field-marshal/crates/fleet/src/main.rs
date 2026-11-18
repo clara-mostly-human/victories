@@ -247,7 +247,7 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
             // Each arm against the control's games from that arm's own first game on, so an
             // arm that joined late is not compared with a control that played in other times.
             println!("\neach arm against control over the arm's own time");
-            println!("{:<18} {:>5} {:>13}   {:>5} {:>13}   {:>8}  {}", "arm", "games", "record", "games", "control", "diff", "sure it is better");
+            println!("{:<18} {:>5} {:>13} {:>6}   {:>5} {:>13} {:>6}   {:>8}  {}", "arm", "games", "record", "ticks", "games", "control", "ticks", "diff", "sure it is better");
             let mut names: Vec<String> = x.arms.iter().map(|(n, _)| n.clone()).chain(x.stopped.iter().map(|(n, _)| n.clone())).filter(|n| n != "control").collect();
             names.dedup();
             for arm in names {
@@ -263,6 +263,8 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                 let window = Filter { experiment: Some(name.to_string()), since_ms: Some(t0), ..Filter::default() };
                 let rows = store.records("arm", &window).map_err(e)?;
                 let rec = |n: &str| rows.iter().find(|r| r.key == n).map(|r| r.record).unwrap_or_default();
+                // average length of a game, in ticks
+                let ticks = |n: &str| rows.iter().find(|r| r.key == n).map(|r| format!("{:.0}", r.ticks)).unwrap_or_else(|| "-".into());
                 let (ar, cr) = (rec(&arm), rec("control"));
                 let (line, sure) = if ar.games() > 0 && cr.games() > 0 {
                     // Smoothed variances: a 6 and 0 record must not claim to be certain.
@@ -277,12 +279,14 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                     ("-".to_string(), "-".to_string())
                 };
                 println!(
-                    "{:<18} {:>5} {:>13}   {:>5} {:>13}   {:>8}  {}",
+                    "{:<18} {:>5} {:>13} {:>6}   {:>5} {:>13} {:>6}   {:>8}  {}",
                     arm,
                     ar.games(),
                     format!("{}W {}L {}D", ar.wins, ar.losses, ar.draws),
+                    ticks(&arm),
                     cr.games(),
                     format!("{}W {}L {}D", cr.wins, cr.losses, cr.draws),
+                    ticks("control"),
                     line,
                     sure
                 );
