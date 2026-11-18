@@ -1,7 +1,7 @@
 //! froststats: how frostbursts are used and what they lead to, measured on ladder replays
 //! (workstream 3 of the plan).
 //!
-//!   froststats [--bots A,B,C] [--received] [--map NAME] [--horizon 10] <replay dir or files>...
+//!   froststats [--bots A,B,C] [--versus X,Y] [--received] [--map NAME] [--horizon 10] <replay dir or files>...
 //!
 //! For every frostburst a counted fighter launches it records the situation at launch
 //! (range to the target, whether the target's dash was ready, how far the burst was
@@ -66,6 +66,9 @@ fn main() {
     let horizon: usize = opt("--horizon").and_then(|s| s.parse().ok()).unwrap_or(10);
     let only_map: Option<String> = opt("--map");
     let received = args.iter().any(|a| a == "--received");
+    // --versus: only games against these opponents (names, or prefixes ending in *)
+    let versus: Option<Vec<String>> = opt("--versus").map(|s| s.split(',').map(str::to_string).collect());
+    let is_versus = |name: &str| versus.as_ref().map(|v| v.iter().any(|p| p.strip_suffix('*').map(|pre| name.starts_with(pre)).unwrap_or(p == name))).unwrap_or(true);
     let mut files = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -76,7 +79,7 @@ fn main() {
         if a == "--received" {
             continue;
         }
-        if a == "--bots" || a == "--horizon" || a == "--map" {
+        if a == "--bots" || a == "--horizon" || a == "--map" || a == "--versus" {
             skip = true;
             continue;
         }
@@ -102,7 +105,12 @@ fn main() {
         let AttackKind::Area { fuse, range, .. } = e.rules.attacks[frost].kind else { continue };
         // per fighter: (inside an opening, burst was ready in it, burst was thrown in it)
         let mut open = [(false, false, false); 2];
-        let counted: Vec<bool> = (0..2).map(|i| bots.as_ref().map(|b| replay.bots.get(i).map(|n| b.contains(n)).unwrap_or(false)).unwrap_or(true)).collect();
+        let counted: Vec<bool> = (0..2)
+            .map(|i| {
+                bots.as_ref().map(|b| replay.bots.get(i).map(|n| b.contains(n)).unwrap_or(false)).unwrap_or(true)
+                    && replay.bots.get(1 - i).map(|n| is_versus(n)).unwrap_or(false)
+            })
+            .collect();
         if !counted[0] && !counted[1] {
             continue;
         }
