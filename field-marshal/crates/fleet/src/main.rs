@@ -265,7 +265,12 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                 let rec = |n: &str| rows.iter().find(|r| r.key == n).map(|r| r.record).unwrap_or_default();
                 let (ar, cr) = (rec(&arm), rec("control"));
                 let (line, sure) = if ar.games() > 0 && cr.games() > 0 {
-                    let se = (ar.variance() / ar.games() as f64 + cr.variance() / cr.games() as f64).sqrt();
+                    // Smoothed variances: a 6 and 0 record must not claim to be certain.
+                    let smooth = |r: &fleet::stats::Record| {
+                        let p = (r.wins as f64 + 0.5 * r.draws as f64 + 1.0) / (r.games() as f64 + 2.0);
+                        p * (1.0 - p) / r.games() as f64
+                    };
+                    let se = (smooth(&ar) + smooth(&cr)).sqrt();
                     let diff = ar.score() - cr.score();
                     (format!("{:+.0} pts", 100.0 * diff), if se > 0.0 { format!("{:.0}%", 100.0 * fleet::stats::normal_cdf(diff / se)) } else { "-".into() })
                 } else {
