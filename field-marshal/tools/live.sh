@@ -12,10 +12,11 @@
 # fleet release is used, and from the frozen build's VERSION file otherwise.
 cd "$(dirname "$0")/../.."
 ours="field-marshal,foot-soldier,shock-trooper,quarter-master,spy-master"
-# The ladder site has two addresses. Connections to this one were charged about 110 ms a
-# tick; the other one 230 to 290 ms with timed-out ticks (2026-11-18). The client (r10 on)
-# tries it first and falls back to the rest.
-export ARENA_PREFER_ADDRESS="${ARENA_PREFER_ADDRESS:-104.21.89.84}"
+# No address preference is set here. On 2026-11-18 one connection to 172.67.157.96 was slow
+# for its whole life (230 to 290 ms a tick, timed-out ticks) while 104.21.89.84 was fast;
+# hours later a connection to 172.67.157.96 ran at 66 ms a tick and 104.21.89.84 at 110.
+# So it is the connection, not the address: the client's reconnect after a slow match is
+# the remedy. Set ARENA_PREFER_ADDRESS in the environment to force one for a test.
 if [ -f data/releases/field-marshal-use-fleet ] && [ -x data/releases/live/marshal ]; then
   rel="data/releases/live"
   RELEASE="$(readlink "$rel" 2>/dev/null | xargs basename 2>/dev/null)"
