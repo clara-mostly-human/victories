@@ -28,9 +28,16 @@ if [ -f data/releases/field-marshal-use-fleet ] && [ -x data/releases/live/marsh
   # moves when the flagship is promoted.
   book="$rel/playbooks/default.json"
   [ -f field-marshal/playbooks/flagship.json ] && book="field-marshal/playbooks/flagship.json"
-  exec /usr/bin/caffeinate -i "$rel/marshal" --bot field-marshal --version "$version" \
-    --playbooks "$book" --log-dir logs/field-marshal --token-file bots/field-marshal \
-    --fleet-db data/fleet.db --release "${RELEASE:-unknown}" --ours "$ours"
+  # Behind the fleet gateway since 2026-11-18 16:20Z: the gateway process holds the ladder
+  # socket (and the token), this process attaches to it over a local socket and talks to
+  # it on stdin and stdout, so restarting the bot no longer closes its connection. With
+  # --provisional the bot also hands over a quick answer that the gateway plays if the
+  # search is late. To roll back: remove "gateway": true for field-marshal in
+  # fleet/bots.json and run the marshal directly again with --token-file bots/field-marshal
+  # in place of --stdio --provisional.
+  exec /usr/bin/caffeinate -i data/bin/fleet attach field-marshal -- "$rel/marshal" --bot field-marshal \
+    --version "$version" --playbooks "$book" --log-dir logs/field-marshal \
+    --fleet-db data/fleet.db --release "${RELEASE:-unknown}" --ours "$ours" --stdio --provisional
 fi
 rel="data/releases/field-marshal-current"
 if [ ! -x "$rel/marshal" ]; then
