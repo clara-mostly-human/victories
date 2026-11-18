@@ -58,6 +58,9 @@ pub struct Config {
     pub comms_matches_per_day: usize,
     /// how often the health pass asks the ladder for its standings (0: never)
     pub ladder_refresh_minutes: u64,
+    /// the playbook names the default playbook file plays; games outside an experiment on
+    /// one of these count towards an experiment's baseline (`"baseline_playbooks": [...]`)
+    pub baseline_playbooks: Vec<String>,
 }
 
 impl Default for Config {
@@ -65,7 +68,7 @@ impl Default for Config {
         Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0, habits_bots: vec!["StuartSutcliffe".into(), "Shelbot4".into()], corpus_branch: false, prefer_addresses: Vec::new(), queue_gap_ms: 1000,
             // The ladder's own quotas are 20,000 matches a day per owner and one match start
             // per bot every 300 ms; these sit well inside them.
-            comms_connects_per_minute: 20, comms_queues_per_minute: 90, comms_matches_per_day: 15_000, ladder_refresh_minutes: 0 }
+            comms_connects_per_minute: 20, comms_queues_per_minute: 90, comms_matches_per_day: 15_000, ladder_refresh_minutes: 0, baseline_playbooks: vec!["matrix-5".into()] }
     }
 }
 
@@ -109,6 +112,7 @@ impl Config {
             comms_queues_per_minute: comms("queues_per_minute", d.comms_queues_per_minute),
             comms_matches_per_day: comms("matches_per_day", d.comms_matches_per_day),
             ladder_refresh_minutes: v.get("ladder_refresh_minutes").and_then(Value::as_u64).unwrap_or(0),
+            baseline_playbooks: v.get("baseline_playbooks").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).filter(|l: &Vec<String>| !l.is_empty()).unwrap_or(d.baseline_playbooks),
         }
     }
 

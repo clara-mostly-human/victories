@@ -15,7 +15,7 @@
 //!   fleet ingest [bot ...]                        read marshal logs into the store
 //!
 //!   fleet plan list | show <name> | add <file.json> | pause <name> | resume <name> | stop <name>
-//!   fleet plan show <name> [--since 90m|04:45|<epoch>] [--baseline-playbook matrix-5] [--control-only]
+//!   fleet plan show <name> [--since 90m|04:45|<epoch>] [--baseline-playbook matrix-5,matrix-6] [--control-only]
 //!                                                 arms, and each arm against the default playbook over the arm's own time, by opponent rating
 //!   fleet plan add-arm <name> <arm> '<settings json>' | stop-arm <name> <arm> [--reason text] | resume-arm <name> <arm> | rebalance <name> | quota <name> <games>
 //!   fleet epoch add <name> <time> [--note text] | list        named moments, usable wherever --since is
@@ -251,7 +251,15 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
             // arm, and games of our bots outside any experiment that ran the default (the
             // canary; the flagship while it plays the default). `--baseline-playbook` names
             // it; `--control-only` narrows the baseline to the control arm.
-            let default_playbook = a.get("--baseline-playbook").unwrap_or("matrix-5").to_string();
+            // The default playbook file may play more than one named playbook (matrix-5, and
+            // matrix-6 against the strong bots), so the baseline is a list of names: from
+            // `--baseline-playbook a,b`, else `baseline_playbooks` in fleet/bots.json.
+            let baseline_names: Vec<String> = match a.get("--baseline-playbook") {
+                Some(l) => l.split(',').map(|n| n.trim().to_string()).filter(|n| !n.is_empty()).collect(),
+                None => Config::load(&fleet::store::repo_root()).map(|c| c.baseline_playbooks).unwrap_or_else(|_| vec!["matrix-5".to_string()]),
+            };
+            let default_playbook = baseline_names.join(", ");
+            let baseline_json = serde_json::to_string(&baseline_names).unwrap_or_else(|_| "[]".into());
             let control_only = a.has("--control-only");
             const BAND: &str = "CASE WHEN opponent_rating >= 2500 THEN '2500 and up' WHEN opponent_rating >= 2250 THEN '2250 to 2500' WHEN opponent_rating IS NULL THEN 'not rated' ELSE 'under 2250' END";
             let by_band = |clause: &str, p: &[&dyn rusqlite::ToSql]| -> Result<Vec<(String, fleet::stats::Record, f64)>, String> {
@@ -329,8 +337,8 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                     by_band("experiment_id = ?1 AND arm = 'control' AND started_ms >= ?2", &[&x.id, &t0])?
                 } else {
                     by_band(
-                        "((experiment_id = ?1 AND arm = 'control') OR (experiment_id IS NULL AND playbook = ?2 AND opponent_ours = 0)) AND started_ms >= ?3",
-                        &[&x.id, &default_playbook, &t0],
+                        "((experiment_id = ?1 AND arm = 'control') OR (experiment_id IS NULL AND playbook IN (SELECT value FROM json_each(?2)) AND opponent_ours = 0)) AND started_ms >= ?3",
+                        &[&x.id, &baseline_json, &t0],
                     )?
                 };
                 let ((ar, at), (cr, ct)) = (total(&arm_rows), total(&base_rows));

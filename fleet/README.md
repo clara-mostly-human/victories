@@ -172,6 +172,13 @@ match row are one transaction, so several bots can draw at once.
     fleet plan add-arm slam-risk-vs-top risk2 '{"slam_risk": 2}'   # joins a running experiment
     fleet plan pause|resume|stop <name>
 
+`plan show` reads each arm against a baseline over the arm's own time: the control arm, plus
+games of our bots outside any experiment that played the default playbook. The default file
+can play more than one named playbook (matrix-5, and matrix-6 against bots rated 2250 and
+up), so the names are a list: `"baseline_playbooks"` in `fleet/bots.json`, or
+`--baseline-playbook a,b` for one reading. `--control-only` keeps to the control arm. For
+the closed `tempo-on-off`, whose default was matrix-5 alone, pass `--baseline-playbook matrix-5`.
+
 In the client this is the `Strategist` trait in `crates/bot/src/session.rs`: asked once at
 `hello`, told the result at `end`. `marshal --fleet-db <file> [--experiments]` plugs the fleet
 in; without the flag a bot plays its playbooks file exactly as before. The search code never

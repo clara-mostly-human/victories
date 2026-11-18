@@ -53,5 +53,6 @@
     "queues_per_minute": 90,
     "matches_per_day": 15000
   },
-  "ladder_refresh_minutes": 30
+  "ladder_refresh_minutes": 30,
+  "baseline_playbooks": ["matrix-5", "matrix-6"]
 }
