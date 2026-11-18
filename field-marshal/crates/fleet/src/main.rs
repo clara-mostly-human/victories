@@ -354,27 +354,52 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                     }
                 }
             }
-            // Pads taken per game, by arm: the direct read-out of anything that changes how
-            // the bot goes for pads. From the pickups each bot counts in its match line.
+            // Pads taken per game, by arm and by opponent strength: the direct read-out of
+            // anything that changes how the bot goes for pads. From the pickups each bot
+            // counts in its match line. The strong opponents are where pads are contested,
+            // so each arm gets a line for 2250 and up, one for 2500 and up within that, and
+            // one for the rest.
             {
                 let mut q = store
                     .conn
-                    .prepare(
-                        "SELECT arm, COUNT(*),
-                                AVG(COALESCE(json_extract(detail, '$.damage.\"pickup:mine:power\"'), 0)), AVG(COALESCE(json_extract(detail, '$.damage.\"pickup:theirs:power\"'), 0)),
-                                AVG(COALESCE(json_extract(detail, '$.damage.\"pickup:mine:health\"'), 0)), AVG(COALESCE(json_extract(detail, '$.damage.\"pickup:theirs:health\"'), 0))
-                         FROM matches WHERE experiment_id = ?1 AND result IS NOT NULL AND voided = 0 AND detail IS NOT NULL AND started_ms >= ?2 GROUP BY arm ORDER BY arm",
-                    )
+                    .prepare(&format!(
+                        "SELECT arm, {BAND}, COUNT(*),
+                                SUM(COALESCE(json_extract(detail, '$.damage.\"pickup:mine:power\"'), 0)), SUM(COALESCE(json_extract(detail, '$.damage.\"pickup:theirs:power\"'), 0)),
+                                SUM(COALESCE(json_extract(detail, '$.damage.\"pickup:mine:health\"'), 0)), SUM(COALESCE(json_extract(detail, '$.damage.\"pickup:theirs:health\"'), 0))
+                         FROM matches WHERE experiment_id = ?1 AND result IS NOT NULL AND voided = 0 AND detail IS NOT NULL AND started_ms >= ?2 GROUP BY 1, 2 ORDER BY 1"
+                    ))
                     .map_err(e)?;
-                let rows: Vec<(String, i64, f64, f64, f64, f64)> = q
-                    .query_map(rusqlite::params![x.id, from.unwrap_or(0)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+                let rows: Vec<(String, String, i64, [f64; 4])> = q
+                    .query_map(rusqlite::params![x.id, from.unwrap_or(0)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, [r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?])))
                     .map_err(e)?
                     .filter_map(|r| r.ok())
                     .collect();
                 println!("\npads taken per game");
-                println!("{:<18} {:>5}   {:>10} {:>12}   {:>11} {:>13}", "arm", "games", "power, we", "power, they", "health, we", "health, they");
-                for (arm, n, pm, pt, hm, ht) in rows {
-                    println!("{arm:<18} {n:>5}   {pm:>10.2} {pt:>12.2}   {hm:>11.2} {ht:>13.2}");
+                println!("{:<26} {:>5}   {:>10} {:>12}   {:>11} {:>13}", "arm, opponents", "games", "power, we", "power, they", "health, we", "health, they");
+                let mut arms: Vec<&String> = rows.iter().map(|r| &r.0).collect();
+                arms.dedup();
+                for arm in arms {
+                    let sum = |bands: &[&str]| -> (i64, [f64; 4]) {
+                        let mut n = 0;
+                        let mut t = [0.0; 4];
+                        for r in rows.iter().filter(|r| &r.0 == arm && bands.contains(&r.1.as_str())) {
+                            n += r.2;
+                            for k in 0..4 {
+                                t[k] += r.3[k];
+                            }
+                        }
+                        (n, t)
+                    };
+                    let line = |label: &str, (n, t): (i64, [f64; 4])| {
+                        if n > 0 {
+                            let g = n as f64;
+                            println!("{label:<26} {n:>5}   {:>10.2} {:>12.2}   {:>11.2} {:>13.2}", t[0] / g, t[1] / g, t[2] / g, t[3] / g);
+                        }
+                    };
+                    line(arm, sum(&["2500 and up", "2250 to 2500", "under 2250", "not rated"]));
+                    line("    2250 and up", sum(&["2500 and up", "2250 to 2500"]));
+                    line("      of those, 2500 up", sum(&["2500 and up"]));
+                    line("    under 2250", sum(&["under 2250"]));
                 }
             }
             for (arm, why) in &x.stopped {
