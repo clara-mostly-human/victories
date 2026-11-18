@@ -15,7 +15,11 @@ builds, `data/run/` pid files. Per-bot settings are in `fleet/bots.json` (in git
 
 - `fleet status` and `fleet online`: every bot, the live release, experiments, load and think times.
 - `http://Claras-Mac-mini.local:8787/` (or the Mac's address on the home network, port 8787):
-  the status page, live. `com.victris.fleet-status` (`fleet serve`) builds it from the store
+  the status page, live. It lists every game as it ends (bot, result, opponent with rating
+  and rank, map, seat, length, our rating after, damage, experiment arm, what the ladder
+  charged per turn; `/?bot=<name>` shows one bot), the bots, the experiment arms also split
+  by opponent strength, the releases and the alert log. It replaces looking at the Victris
+  site from home. `com.victris.fleet-status` (`fleet serve`) builds it from the store
   on every request, so it is never older than the last finished game, and it reloads itself
   every 20 seconds. It only reads the store and talks to nothing outside the Mac.
 - `data/status.html`: the same page as a file, rewritten every five minutes.
@@ -80,6 +84,18 @@ paused. Anything else long-running on this machine should check the same file.
   `--by connection`, `--by arm-remote`), and after a match on a slow connection (charge p50
   over 180 ms with a fast engine, or any turn charged a full second) it reconnects before it
   queues again, up to four times in a row.
+- **The standings, twice an hour.** Opponent ratings and ranks on the status page come from
+  the `ladder` table, filled by one request for the ladder's standings every
+  `ladder_refresh_minutes` (30; `fleet ladder` does it by hand). It is the only request the
+  fleet makes to the ladder apart from the bots' own connections. A bot learns only its
+  rating change from the ladder, so its rating after each game is carried forward from the
+  standings, within one version (the ladder rates every version from scratch, which is why
+  scouts keep one version label across deploys).
+- **The first answer for a tick is final.** Tested live on 2026-11-18: an empty turn sent
+  ahead of the real one was the one the ladder applied, 18 times of 18, and the second was
+  ignored without complaint. So a bot cannot answer at once and correct itself later.
+  Behind the gateway the engine instead writes a quick heuristic turn first, which the
+  gateway holds and sends only if the real decision is not there after 800 ms.
 - **Five bots, five match slots.** The account may play five matches at once. Every bot but
   the flagship waits `queue_gap_ms` (one second) after a match before queueing, so the
   flagship gets a freed slot first, and a refused queue is retried after a few seconds.
