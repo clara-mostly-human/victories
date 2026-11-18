@@ -11,10 +11,38 @@
     "foot-soldier": {
       "role": "canary",
       "managed": true,
+      "experiments": false,
+      "note": "The fleet's canary since 2026-11-18: the Rust bot under the fleet supervisor. Gated releases meet the ladder here first, so it takes no experiment arms: its record is the record of one release. The TypeScript bot it replaced (foot-soldier/, v1 and v2) is retired.",
+      "expect_online": true,
+      "owner": "the fleet (infrastructure thread)"
+    },
+    "shock-trooper": {
+      "role": "scout",
+      "managed": true,
       "experiments": true,
-      "note": "The fleet's canary since 2026-11-18: the Rust bot under the fleet supervisor. Gated releases meet the ladder here first. The TypeScript bot it replaced (foot-soldier/, v1 and v2) is retired.",
+      "note": "Scout: runs the current release and takes arms from the experiment plan.",
+      "expect_online": true,
+      "owner": "the fleet (infrastructure thread)"
+    },
+    "quarter-master": {
+      "role": "scout",
+      "managed": true,
+      "experiments": true,
+      "note": "Scout: runs the current release and takes arms from the experiment plan.",
+      "expect_online": true,
+      "owner": "the fleet (infrastructure thread)"
+    },
+    "spy-master": {
+      "role": "scout",
+      "managed": true,
+      "experiments": true,
+      "note": "Scout: runs the current release and takes arms from the experiment plan.",
       "expect_online": true,
       "owner": "the fleet (infrastructure thread)"
     }
+  },
+  "guard": {
+    "load": 8,
+    "think_p99_ms": 300
   }
 }

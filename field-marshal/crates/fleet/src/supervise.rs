@@ -67,6 +67,10 @@ fn say(bot: &str, text: &str) {
 
 /// Does this release's `marshal` know the fleet flags? Releases built before the hook do not.
 fn release_has_hook(dir: &Path) -> bool {
+    // The search thread's own releases mark it with a `fleet` file.
+    if dir.join("fleet").is_file() {
+        return true;
+    }
     std::fs::read_to_string(dir.join("release.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())

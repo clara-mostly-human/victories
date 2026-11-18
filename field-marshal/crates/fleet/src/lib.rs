@@ -3,6 +3,7 @@
 //! - `store`: the shared SQLite results store.
 //! - `plan`: the experiment plan and the arm a bot plays against a target opponent.
 //! - `stats`: records, intervals and the tests the release pipeline uses.
+//! - `autopilot`: the pipeline run by itself: build, gate, canary, evidence, scouts' base.
 //! - `collect`: the replay collector and the corpus index.
 //! - `config`: per-bot settings from `fleet/bots.json`.
 //! - `ingest`: backfill from `marshal` logs.
@@ -13,6 +14,7 @@
 //! The bot binary links this crate only for `plan` and `store`; nothing here knows about
 //! the search.
 
+pub mod autopilot;
 pub mod collect;
 pub mod config;
 pub mod ingest;

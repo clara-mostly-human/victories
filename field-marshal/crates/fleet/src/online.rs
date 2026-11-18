@@ -145,7 +145,7 @@ pub fn overload(root: &Path, cfg: &Config) -> Option<String> {
 }
 
 /// A line in the alert log without a notification on screen.
-fn log_line(root: &Path, kind: &str, text: &str) {
+pub fn log_line(root: &Path, kind: &str, text: &str) {
     let line = format!("{} {kind} {text}", utc_stamp());
     eprintln!("{line}");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(alert_log(root)) {

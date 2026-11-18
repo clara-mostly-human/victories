@@ -1,0 +1,10 @@
+{
+  "name": "tempo-on-off",
+  "note": "matrix-5 (tempo evaluation at the leaves, tempo_weight 1) against the same search without it (tempo_weight 0, which is matrix-4's evaluation). Every opponent, balanced by opponent, map and seat.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "no-tempo": { "tempo_weight": 0 }
+  }
+}

@@ -2,8 +2,8 @@
 //!
 //!   fleet status                                  every bot: running? which release? today's record
 //!   fleet run <bot>                               the supervisor (launchd runs this)
-//!   fleet install <bot> | watch | collector | online      install a launchd agent
-//!   fleet uninstall <bot> | watch | collector | online
+//!   fleet install <bot> | watch | collector | online | autopilot      install a launchd agent
+//!   fleet uninstall <bot> | watch | collector | online | autopilot
 //!   fleet stop <bot> | resume <bot> | restart <bot>
 //!   fleet deploy <bot> <release> [--version vN] [--force "<reason>"]
 //!
@@ -28,6 +28,7 @@
 //!   fleet corpus [--min-rating 2400] [--bot name] [--ours | --not-ours] [--since 24h] [--limit N] [--count]
 //!   fleet watch                                   one health pass (launchd runs this every 5 minutes)
 //!   fleet online [run]                            is each bot online on the ladder? `run` is the offline watchdog
+//!   fleet autopilot [run]                         one step of the automatic pipeline; `run` keeps going
 //!   fleet alerts [N]                              the last N lines of the alert log
 
 use fleet::collect::{self, Collector};
@@ -112,7 +113,14 @@ fn e<T: std::fmt::Display>(x: T) -> String {
     x.to_string()
 }
 
+/// For a bot the fleet does not run: the release or version of its latest game.
+fn last_seen(store: &Store, bot: &str, column: &str) -> Option<String> {
+    assert!(column == "release" || column == "version");
+    store.conn.query_row(&format!("SELECT {column} FROM matches WHERE bot = ?1 ORDER BY started_ms DESC LIMIT 1"), [bot], |r| r.get(0)).ok().flatten()
+}
+
 fn status(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
+    let _ = release::sync_flagship(root, store, cfg);
     println!("bot             role      agent    process   release        version  last game     24h record");
     for b in &cfg.bots {
         let st = store.bot_state(&b.name).map_err(e)?;
@@ -133,8 +141,8 @@ fn status(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
             b.role,
             if loaded { "loaded" } else { "-" },
             process,
-            st.as_ref().and_then(|s| s.release.clone()).unwrap_or_else(|| "-".into()),
-            st.as_ref().and_then(|s| s.version.clone()).unwrap_or_else(|| "-".into()),
+            st.as_ref().and_then(|s| s.release.clone()).or_else(|| last_seen(store, &b.name, "release")).unwrap_or_else(|| "-".into()),
+            st.as_ref().and_then(|s| s.version.clone()).or_else(|| last_seen(store, &b.name, "version")).unwrap_or_else(|| "-".into()),
             ago(last),
             rec
         );
@@ -248,11 +256,11 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
 fn release_cmd(root: &Path, store: &Store, cfg: &Config, a: &Args) -> Result<(), String> {
     match a.word(1, "a release command (list, build, gate, canary, evidence, promote, mark)")? {
         "list" => {
-            println!("release        status    built         arena gate                      ladder evidence");
+            println!("release                    status    built         arena gate                               ladder evidence");
             for r in store.releases().map_err(e)? {
-                let gate = r.gate.as_ref().map(|g| format!("{} {:.0}% of {} vs {}", g["verdict"].as_str().unwrap_or("?"), 100.0 * g["score"].as_f64().unwrap_or(0.0), g["games"], g["against"].as_str().unwrap_or("?"))).unwrap_or_else(|| "-".into());
+                let gate = r.gate.as_ref().map(|g| if g["games"].is_null() { format!("{} ({})", g["verdict"].as_str().unwrap_or("?"), g["against"].as_str().or(g["note"].as_str()).unwrap_or("")) } else { format!("{} {:.0}% of {} vs {}", g["verdict"].as_str().unwrap_or("?"), 100.0 * g["score"].as_f64().unwrap_or(0.0), g["games"], g["against"].as_str().unwrap_or("?")) }).unwrap_or_else(|| "-".into());
                 let ev = r.evidence.as_ref().map(|v| format!("{} ({} games, {:+.1} points, {:.0}% sure)", v["verdict"].as_str().unwrap_or("?"), v["candidate"]["games"], 100.0 * v["score_difference"].as_f64().unwrap_or(0.0), 100.0 * v["confidence_better"].as_f64().unwrap_or(0.0))).unwrap_or_else(|| "-".into());
-                println!("{:<14} {:<9} {:<13} {:<31} {}", r.id, r.status, ago(Some(r.created_ms)), gate, ev);
+                println!("{:<26} {:<9} {:<13} {:<40} {}", r.id, r.status, ago(Some(r.created_ms)), gate, ev);
                 if let Some(n) = r.note {
                     println!("    {n}");
                 }
@@ -393,7 +401,7 @@ fn watch(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
 }
 
 /// Agents that are not bots.
-const SERVICES: [&str; 3] = ["watch", "collector", "online"];
+const SERVICES: [&str; 4] = ["watch", "collector", "online", "autopilot"];
 
 /// Once a day: a snapshot of the store, and old tick logs of the bots we run compressed.
 /// Nothing is deleted except our own snapshots beyond the newest seven.
@@ -443,6 +451,7 @@ fn agent_spec(root: &Path, what: &str) -> (String, Vec<String>, std::path::PathB
     match what {
         "watch" => ("com.victris.fleet-watch".into(), vec![bin, "watch".into()], root.join("logs").join("fleet-watch.log"), Some(300)),
         "collector" => ("com.victris.fleet-collector".into(), vec![bin, "collect".into(), "run".into()], root.join("logs").join("fleet-collector.log"), None),
+        "autopilot" => ("com.victris.fleet-autopilot".into(), vec![bin, "autopilot".into(), "run".into()], root.join("logs").join("fleet-autopilot.log"), None),
         "online" => ("com.victris.fleet-online".into(), vec![bin, "online".into(), "run".into()], root.join("logs").join("fleet-online.log"), None),
         bot => (label(bot), vec![bin, "run".into(), bot.to_string()], root.join("logs").join(bot).join("run.log"), None),
     }
@@ -484,7 +493,7 @@ fn main_inner() -> Result<i32, String> {
             if let Some(dir) = log.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            supervise::install_agent(&lbl, &supervise::plist(&lbl, &root, &args, &log, interval, what == "collector"))?;
+            supervise::install_agent(&lbl, &supervise::plist(&lbl, &root, &args, &log, interval, what == "collector" || what == "autopilot"))?;
             println!("{lbl} installed and loaded; log {}", log.display());
         }
         "uninstall" => {
@@ -657,6 +666,19 @@ fn main_inner() -> Result<i32, String> {
                     };
                     println!("{:<15} {:<8} {}", b.name, state, if b.expect_online { "watched" } else { "not watched" });
                 }
+            }
+        }
+        "autopilot" => {
+            drop(store);
+            let mut pilot = fleet::autopilot::Autopilot::default();
+            if a.words.get(1).map(String::as_str) == Some("run") {
+                unsafe {
+                    libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+                    libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+                }
+                pilot.run(&root, &|| STOP.load(Ordering::Relaxed));
+            } else {
+                pilot.step(&root)?;
             }
         }
         "alerts" => {

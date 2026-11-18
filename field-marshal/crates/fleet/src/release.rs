@@ -116,6 +116,62 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
     store.release(&id).map_err(|e| e.to_string())?.ok_or_else(|| "release not stored".to_string())
 }
 
+/// The paths whose content decides how the bot plays. Two commits that agree on these are
+/// the same bot.
+pub const BOT_PATHS: [&str; 3] = ["field-marshal/crates/bot", "field-marshal/crates/engine", "field-marshal/playbooks"];
+
+/// The commit a release was built from, when it can be told: a full sha from the store,
+/// or the short one at the end of a release name (`field-marshal-v6-db462ca`).
+pub fn release_commit(r: &Release) -> Option<String> {
+    if r.git_sha.len() >= 7 && r.git_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Some(r.git_sha.clone());
+    }
+    None
+}
+
+/// Do two commits hold the same bot code and playbooks? `None` when git cannot say.
+pub fn same_bot(root: &Path, a: &str, b: &str) -> Option<bool> {
+    let st = Command::new("git").current_dir(root).args(["diff", "--quiet", a, b, "--"]).args(BOT_PATHS).status().ok()?;
+    match st.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
+/// The flagship is run by its own thread, which freezes its builds under
+/// `data/releases/<bot>-current -> <bot>-<version>-<sha>`. Whatever that points at is the
+/// live release: it is brought into the store here so the gate and the ladder evidence
+/// compare against the build the flagship really runs. Returns the live release id.
+pub fn sync_flagship(root: &Path, store: &Store, cfg: &Config) -> Result<Option<String>, String> {
+    let dir = data_dir(root).join("releases");
+    for b in cfg.bots.iter().filter(|b| b.role == "flagship" && !b.managed) {
+        let Ok(target) = std::fs::read_link(dir.join(format!("{}-current", b.name))) else { continue };
+        let Some(id) = target.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
+        let path = dir.join(&id);
+        if !path.join("marshal").is_file() {
+            continue;
+        }
+        let live = store.live_release().map_err(|e| e.to_string())?;
+        if live.as_ref().map(|l| l.id == id).unwrap_or(false) {
+            return Ok(Some(id));
+        }
+        if store.release(&id).map_err(|e| e.to_string())?.is_none() {
+            // `...-db462ca` or `...-db462ca-dirty`: a dirty build has no commit to compare with.
+            let sha = id.rsplit('-').next().filter(|s| s.len() == 7 && s.chars().all(|c| c.is_ascii_hexdigit())).unwrap_or("unknown");
+            let seq = store.next_release_seq().map_err(|e| e.to_string())?;
+            store.add_release(&id, seq, sha, &path.display().to_string(), Some(&format!("built and shipped by {}'s own thread", b.name))).map_err(|e| e.to_string())?;
+        }
+        if let Some(l) = live {
+            store.set_release_status(&l.id, "retired").map_err(|e| e.to_string())?;
+        }
+        store.set_release_status(&id, "live").map_err(|e| e.to_string())?;
+        store.event(Some(&b.name), "flagship_release", &json!({ "release": id }));
+        return Ok(Some(id));
+    }
+    Ok(store.live_release().map_err(|e| e.to_string())?.map(|r| r.id))
+}
+
 fn get(store: &Store, id: &str) -> Result<Release, String> {
     store.release(id).map_err(|e| e.to_string())?.ok_or_else(|| format!("no release {id}; `fleet release list` shows them"))
 }
@@ -264,11 +320,12 @@ pub fn deploy(root: &Path, store: &Store, cfg: &Config, bot: &str, id: &str, ver
     Ok(version)
 }
 
-/// Puts a gated release on the ladder with every managed scout and canary bot.
+/// Puts a gated release on the ladder with every managed canary bot.
 pub fn canary(root: &Path, store: &Store, cfg: &Config, id: &str, force: Option<&str>) -> Result<Vec<(String, String)>, String> {
-    let scouts: Vec<&str> = cfg.bots.iter().filter(|b| b.managed && (b.role == "scout" || b.role == "canary")).map(|b| b.name.as_str()).collect();
+    // Scouts stay on the live release and run experiments; a candidate goes to the canary.
+    let scouts: Vec<&str> = cfg.bots.iter().filter(|b| b.managed && b.role == "canary").map(|b| b.name.as_str()).collect();
     if scouts.is_empty() {
-        return Err("no managed scout or canary bot in fleet/bots.json".into());
+        return Err("no managed canary bot in fleet/bots.json".into());
     }
     let mut out = Vec::new();
     for bot in scouts {
