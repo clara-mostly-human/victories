@@ -137,21 +137,25 @@ impl Autopilot {
         // Early stopping: an arm that is two standard errors behind control after 100 games
         // has had its chance, and its games go to the arms still in the running.
         for e in store.experiments(true).map_err(|e| e.to_string())? {
-            let rows = store.records("arm", &crate::stats::Filter { experiment: Some(e.name.clone()), ..Default::default() }).map_err(|e| e.to_string())?;
-            let Some(control) = rows.iter().find(|r| r.key == "control").map(|r| r.record) else { continue };
-            if control.games() < 50 {
-                continue;
-            }
             for (arm, _) in e.arms.iter().filter(|(a, _)| a != "control") {
-                let Some(r) = rows.iter().find(|r| r.key == *arm).map(|r| r.record) else { continue };
-                if r.games() < 100 {
+                // The arm against the control's games from the arm's own first game on: a
+                // control that played in other times is not a fair yardstick.
+                let first: Option<i64> = store
+                    .conn
+                    .query_row("SELECT MIN(started_ms) FROM matches WHERE experiment_id = ?1 AND arm = ?2 AND result IS NOT NULL", rusqlite::params![e.id, arm], |r| r.get(0))
+                    .map_err(|e| e.to_string())?;
+                let Some(t0) = first else { continue };
+                let rows = store.records("arm", &crate::stats::Filter { experiment: Some(e.name.clone()), since_ms: Some(t0), ..Default::default() }).map_err(|e| e.to_string())?;
+                let rec = |n: &str| rows.iter().find(|r| r.key == n).map(|r| r.record).unwrap_or_default();
+                let (r, control) = (rec(arm), rec("control"));
+                if r.games() < 100 || control.games() < 50 {
                     continue;
                 }
                 let se = (r.variance() / r.games() as f64 + control.variance() / control.games() as f64).sqrt();
                 let behind = (control.score() - r.score()) / se.max(1e-9);
                 if behind >= 2.0 {
                     let why = format!(
-                        "{:.0}% over {} games against control's {:.0}% over {}, {behind:.1} standard errors behind",
+                        "{:.0}% over {} games against control's {:.0}% over {} in the same time, {behind:.1} standard errors behind",
                         100.0 * r.score(),
                         r.games(),
                         100.0 * control.score(),

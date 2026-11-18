@@ -3,7 +3,15 @@
 //! An experiment names its target opponents and two or more arms (playbook settings). When
 //! any bot that takes part draws one of the targets, `assign` hands it the arm that has
 //! played the fewest games in that exact cell (opponent, map, seat), so every arm meets
-//! every opponent on every map from both seats equally often. Assignment and the match row
+//! every opponent on every map from both seats equally often.
+//!
+//! The counting starts afresh whenever the set of arms changes (an arm added, stopped or
+//! resumed). A new arm is therefore not given games first to catch up: from that moment
+//! every running arm, control included, gets an equal share. Catching up would put the new
+//! arm's games in a different stretch of time from the control's, and anything that
+//! changes with time (a faster connection, a different mix of opponents) would then look
+//! like a difference between arms. Compare an arm with the control's games from the arm's
+//! own start (`fleet plan show`). Assignment and the match row
 //! are written in one transaction, so two bots starting matches at the same moment cannot
 //! both take the same slot.
 
@@ -121,15 +129,32 @@ impl Store {
     /// Adds an arm to an experiment that is already running. The new arm has no games yet,
     /// so it is handed out first in every cell until it has caught up with the others.
     pub fn add_arm(&self, experiment: &str, arm: &str, playbook: &Value) -> rusqlite::Result<usize> {
-        self.conn.execute(
+        let n = self.conn.execute(
             "INSERT INTO arms (experiment_id, name, playbook) SELECT id, ?2, ?3 FROM experiments WHERE name = ?1",
             params![experiment, arm, playbook.to_string()],
-        )
+        )?;
+        self.rebalance(experiment)?;
+        Ok(n)
+    }
+
+    /// From now on every running arm of the experiment gets an equal share: the balance
+    /// counts only games started after this moment.
+    pub fn rebalance(&self, experiment: &str) -> rusqlite::Result<usize> {
+        self.conn.execute("UPDATE experiments SET balance_from_ms = ?2 WHERE name = ?1", params![experiment, now_ms()])
+    }
+
+    /// Hands a stopped arm out again.
+    pub fn resume_arm(&self, experiment_id: i64, arm: &str) -> rusqlite::Result<usize> {
+        let n = self.conn.execute("UPDATE arms SET stopped = NULL WHERE experiment_id = ?1 AND name = ?2 AND stopped IS NOT NULL", params![experiment_id, arm])?;
+        self.conn.execute("UPDATE experiments SET balance_from_ms = ?2 WHERE id = ?1", params![experiment_id, now_ms()])?;
+        Ok(n)
     }
 
     /// Stops handing out one arm; its games stay in the record.
     pub fn stop_arm(&self, experiment_id: i64, arm: &str, why: &str) -> rusqlite::Result<usize> {
-        self.conn.execute("UPDATE arms SET stopped = ?3 WHERE experiment_id = ?1 AND name = ?2 AND stopped IS NULL", params![experiment_id, arm, why])
+        let n = self.conn.execute("UPDATE arms SET stopped = ?3 WHERE experiment_id = ?1 AND name = ?2 AND stopped IS NULL", params![experiment_id, arm, why])?;
+        self.conn.execute("UPDATE experiments SET balance_from_ms = ?2 WHERE id = ?1", params![experiment_id, now_ms()])?;
+        Ok(n)
     }
 
     pub fn set_experiment_status(&self, name: &str, status: &str) -> rusqlite::Result<usize> {
@@ -137,8 +162,8 @@ impl Store {
     }
 
     /// Games an arm has finished (not voided), plus the ones in play right now.
-    fn arm_games(&self, exp: i64, arm: &str, cell: Option<(&str, &str, Option<i64>)>, now: i64) -> rusqlite::Result<i64> {
-        let live = "voided = 0 AND (result IS NOT NULL OR started_ms > ?3)";
+    fn arm_games(&self, exp: i64, arm: &str, cell: Option<(&str, &str, Option<i64>)>, now: i64, from: i64) -> rusqlite::Result<i64> {
+        let live = &format!("voided = 0 AND (result IS NOT NULL OR started_ms > ?3) AND started_ms >= {from}");
         match cell {
             None => self.conn.query_row(
                 &format!("SELECT COUNT(*) FROM matches WHERE experiment_id = ?1 AND arm = ?2 AND {live}"),
@@ -196,19 +221,23 @@ impl Store {
                     // Fewest games in this cell, then against this opponent, then overall.
                     let mut best: Option<((i64, i64, i64), usize)> = None;
                     let mut open = false;
+                    // The balance counts from the last change to the set of arms; the quota
+                    // counts everything an arm has played.
+                    let from: i64 = self.conn.query_row("SELECT COALESCE(balance_from_ms, 0) FROM experiments WHERE id = ?1", [e.id], |r| r.get(0))?;
                     for (k, (arm, _)) in e.arms.iter().enumerate() {
-                        let total = self.arm_games(e.id, arm, None, now)?;
+                        let total = self.arm_games(e.id, arm, None, now, 0)?;
                         if total >= e.games_per_arm {
                             continue;
                         }
                         open = true;
-                        let cell = self.arm_games(e.id, arm, Some((&m.opponent, &m.map, m.seat)), now)?;
+                        let cell = self.arm_games(e.id, arm, Some((&m.opponent, &m.map, m.seat)), now, from)?;
                         let versus: i64 = self.conn.query_row(
-                            "SELECT COUNT(*) FROM matches WHERE experiment_id = ?1 AND arm = ?2 AND opponent = ?3 AND voided = 0 AND (result IS NOT NULL OR started_ms > ?4)",
-                            params![e.id, arm, m.opponent, now - PENDING_MS],
+                            "SELECT COUNT(*) FROM matches WHERE experiment_id = ?1 AND arm = ?2 AND opponent = ?3 AND voided = 0 AND (result IS NOT NULL OR started_ms > ?4) AND started_ms >= ?5",
+                            params![e.id, arm, m.opponent, now - PENDING_MS, from],
                             |r| r.get(0),
                         )?;
-                        let key = (cell, versus, total);
+                        let recent = self.arm_games(e.id, arm, None, now, from)?;
+                        let key = (cell, versus, recent);
                         if best.map(|(b, _)| key < b).unwrap_or(true) {
                             best = Some((key, k));
                         }
@@ -288,6 +317,28 @@ mod tests {
         // 6 rounds over 3 arms: exactly 2 games per arm in each of the 8 cells.
         assert_eq!(seen.len(), 24);
         assert!(seen.values().all(|n| *n == 2), "{seen:?}");
+    }
+
+    #[test]
+    fn a_new_arm_gets_an_equal_share_not_a_head_start() {
+        let mut s = temp_store("share");
+        let arms = vec![("control".to_string(), json!({})), ("a".to_string(), json!({ "x": 1 }))];
+        s.add_experiment("e", &["rival".to_string()], None, &arms, 1000, 0, None).unwrap();
+        for id in 0..20 {
+            s.assign(&start(id, "rival", "m", 1), "base", true, false).unwrap();
+        }
+        // A third arm joins after 20 games. Over the next 30 each arm gets 10: the new one
+        // does not take them all to catch up.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        s.add_arm("e", "late", &json!({ "x": 2 })).unwrap();
+        let mut got = std::collections::HashMap::new();
+        for id in 100..130 {
+            let a = s.assign(&start(id, "rival", "m", 1), "base", true, false).unwrap().unwrap();
+            *got.entry(a.arm).or_insert(0) += 1;
+        }
+        assert_eq!(got.get("control"), Some(&10), "{got:?}");
+        assert_eq!(got.get("a"), Some(&10), "{got:?}");
+        assert_eq!(got.get("late"), Some(&10), "{got:?}");
     }
 
     #[test]

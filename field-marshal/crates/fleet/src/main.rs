@@ -15,7 +15,9 @@
 //!   fleet ingest [bot ...]                        read marshal logs into the store
 //!
 //!   fleet plan list | show <name> | add <file.json> | pause <name> | resume <name> | stop <name>
-//!   fleet plan add-arm <name> <arm> '<settings json>' | stop-arm <name> <arm> [--reason text]
+//!   fleet plan show <name> [--since 90m|04:45|<epoch>]   arms, and each arm against control over the arm's own time
+//!   fleet plan add-arm <name> <arm> '<settings json>' | stop-arm <name> <arm> [--reason text] | resume-arm <name> <arm> | rebalance <name>
+//!   fleet epoch add <name> <time> [--note text] | list        named moments, usable wherever --since is
 //!   fleet assign --bot b --opponent o --map m --seat n --match id     what the plan would hand out (writes the row)
 //!
 //!   fleet release list
@@ -105,6 +107,24 @@ fn since(text: &str) -> Result<i64, String> {
     Ok(now_ms() - n * ms)
 }
 
+/// A moment: "90m", "24h" or "7d" before now; "04:45" today in UTC; a full
+/// "2026-11-18T04:45:00Z"; or the name of an epoch in the store.
+fn when(store: &Store, text: &str) -> Result<i64, String> {
+    if let Ok(ms) = store.conn.query_row("SELECT ts_ms FROM epochs WHERE name = ?1", [text], |r| r.get::<_, i64>(0)) {
+        return Ok(ms);
+    }
+    if let Some(ms) = collect::iso_ms(text) {
+        return Ok(ms);
+    }
+    if let Some((h, m)) = text.split_once(':') {
+        if let (Ok(h), Ok(m)) = (h.parse::<i64>(), m.parse::<i64>()) {
+            let day = now_ms() - now_ms().rem_euclid(86_400_000);
+            return Ok(day + (h * 60 + m) * 60_000);
+        }
+    }
+    since(text).map_err(|_| format!("'{text}' is not a time: use 90m, 24h, 7d, 04:45 (UTC today), 2026-11-18T04:45:00Z or an epoch's name (`fleet epoch list`)"))
+}
+
 fn ago(ms: Option<i64>) -> String {
     let Some(ms) = ms else { return "never".into() };
     let s = (now_ms() - ms).max(0) / 1000;
@@ -189,7 +209,7 @@ fn status(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
 }
 
 fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
-    match a.word(1, "a plan command (list, show, add, add-arm, pause, resume, stop)")? {
+    match a.word(1, "a plan command (list, show, add, add-arm, stop-arm, resume-arm, rebalance, pause, resume, stop)")? {
         "list" => {
             for x in store.experiments(false).map_err(e)? {
                 let done: i64 = store.conn.query_row("SELECT COUNT(*) FROM matches WHERE experiment_id = ?1 AND result IS NOT NULL AND voided = 0", [x.id], |r| r.get(0)).map_err(e)?;
@@ -215,8 +235,53 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
             for (arm, settings) in &x.arms {
                 println!("  arm {arm}: {settings}");
             }
-            let f = Filter { experiment: Some(name.to_string()), ..Filter::default() };
+            let from = match a.get("--since").or(a.get("--epoch")) {
+                Some(t) => Some(when(store, t)?),
+                None => None,
+            };
+            if let Some(t) = from {
+                println!("counting games started {} or later", ago(Some(t)));
+            }
+            let f = Filter { experiment: Some(name.to_string()), since_ms: from, ..Filter::default() };
             print!("\n{}", table("arm", &store.records("arm", &f).map_err(e)?));
+            // Each arm against the control's games from that arm's own first game on, so an
+            // arm that joined late is not compared with a control that played in other times.
+            println!("\neach arm against control over the arm's own time");
+            println!("{:<18} {:>5} {:>13}   {:>5} {:>13}   {:>8}  {}", "arm", "games", "record", "games", "control", "diff", "sure it is better");
+            let mut names: Vec<String> = x.arms.iter().map(|(n, _)| n.clone()).chain(x.stopped.iter().map(|(n, _)| n.clone())).filter(|n| n != "control").collect();
+            names.dedup();
+            for arm in names {
+                let first: Option<i64> = store
+                    .conn
+                    .query_row(
+                        "SELECT MIN(started_ms) FROM matches WHERE experiment_id = ?1 AND arm = ?2 AND result IS NOT NULL AND started_ms >= ?3",
+                        rusqlite::params![x.id, arm, from.unwrap_or(0)],
+                        |r| r.get(0),
+                    )
+                    .map_err(e)?;
+                let Some(t0) = first else { continue };
+                let window = Filter { experiment: Some(name.to_string()), since_ms: Some(t0), ..Filter::default() };
+                let rows = store.records("arm", &window).map_err(e)?;
+                let rec = |n: &str| rows.iter().find(|r| r.key == n).map(|r| r.record).unwrap_or_default();
+                let (ar, cr) = (rec(&arm), rec("control"));
+                let (line, sure) = if ar.games() > 0 && cr.games() > 0 {
+                    let se = (ar.variance() / ar.games() as f64 + cr.variance() / cr.games() as f64).sqrt();
+                    let diff = ar.score() - cr.score();
+                    (format!("{:+.0} pts", 100.0 * diff), if se > 0.0 { format!("{:.0}%", 100.0 * fleet::stats::normal_cdf(diff / se)) } else { "-".into() })
+                } else {
+                    ("-".to_string(), "-".to_string())
+                };
+                println!(
+                    "{:<18} {:>5} {:>13}   {:>5} {:>13}   {:>8}  {}",
+                    arm,
+                    ar.games(),
+                    format!("{}W {}L {}D", ar.wins, ar.losses, ar.draws),
+                    cr.games(),
+                    format!("{}W {}L {}D", cr.wins, cr.losses, cr.draws),
+                    line,
+                    sure
+                );
+            }
             for (arm, why) in &x.stopped {
                 println!("  arm {arm} was stopped: {why}");
             }
@@ -275,6 +340,23 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                 Ok(_) => return Err(format!("no experiment named {name}")),
                 Err(x) => return Err(format!("cannot add the arm: {x}")),
             }
+        }
+        "resume-arm" => {
+            let name = a.word(2, "the experiment's name")?;
+            let arm = a.word(3, "the arm's name")?;
+            let x = store.experiment(name).map_err(e)?.ok_or_else(|| format!("no experiment named {name}"))?;
+            if store.resume_arm(x.id, arm).map_err(e)? == 0 {
+                return Err(format!("{name} has no stopped arm named {arm}"));
+            }
+            store.event(None, "arm_resumed", &json!({ "experiment": name, "arm": arm }));
+            println!("arm {arm} of {name} runs again; every running arm gets an equal share from now");
+        }
+        "rebalance" => {
+            let name = a.word(2, "the experiment's name")?;
+            if store.rebalance(name).map_err(e)? == 0 {
+                return Err(format!("no experiment named {name}"));
+            }
+            println!("{name}: every running arm gets an equal share from now");
         }
         "stop-arm" => {
             let name = a.word(2, "the experiment's name")?;
@@ -634,7 +716,7 @@ fn main_inner() -> Result<i32, String> {
                 version: a.get("--version").map(str::to_string),
                 release: a.get("--release").map(str::to_string),
                 experiment: a.get("--experiment").map(str::to_string),
-                since_ms: a.get("--since").map(since).transpose()?,
+                since_ms: a.get("--since").or(a.get("--epoch")).map(|t| when(&store, t)).transpose()?,
                 no_ours: !a.has("--all"),
                 min_opponent_rating: a.num("--min-opp-rating")?,
             };
@@ -815,6 +897,22 @@ fn main_inner() -> Result<i32, String> {
             fleet::report::serve(&root, port, &|| STOP.load(Ordering::Relaxed)).map_err(|x| format!("cannot serve on port {port}: {x}"))?;
         }
         "digest" => print!("{}", fleet::report::digest(&fleet::report::snapshot(&root, &store, &cfg))),
+        "epoch" => match a.word(1, "add or list")? {
+            "add" => {
+                let name = a.word(2, "the epoch's name")?;
+                let at = when(&store, a.word(3, "the time")?)?;
+                store.conn.execute("INSERT OR REPLACE INTO epochs (name, ts_ms, note) VALUES (?1, ?2, ?3)", rusqlite::params![name, at, a.get("--note")]).map_err(e)?;
+                println!("epoch {name} set to {}", ago(Some(at)));
+            }
+            "list" => {
+                let mut q = store.conn.prepare("SELECT name, ts_ms, COALESCE(note, '') FROM epochs ORDER BY ts_ms").map_err(e)?;
+                let rows: Vec<(String, i64, String)> = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).map_err(e)?.filter_map(|r| r.ok()).collect();
+                for (name, ts, note) in rows {
+                    println!("{name:<20} {:<12} {note}", ago(Some(ts)));
+                }
+            }
+            other => return Err(format!("unknown epoch command {other}")),
+        },
         "ladder" => {
             let n = fleet::online::refresh_ladder(&store, &cfg.names())?;
             println!("standings of {n} bots stored");

@@ -160,6 +160,11 @@ CREATE TABLE IF NOT EXISTS replays (
   note TEXT
 );
 CREATE INDEX IF NOT EXISTS replays_queue ON replays (status, priority, ended);
+CREATE TABLE IF NOT EXISTS epochs (
+  name TEXT PRIMARY KEY,
+  ts_ms INTEGER NOT NULL,
+  note TEXT
+);
 CREATE TABLE IF NOT EXISTS ladder (
   name TEXT PRIMARY KEY,
   rank INTEGER,
@@ -234,7 +239,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         // Columns added after the first version of the store.
-        for (table, column, kind) in [("matches", "opponent_rating", "REAL"), ("matches", "rating_before", "REAL"), ("arms", "stopped", "TEXT"), ("matches", "remote", "TEXT"), ("matches", "charge_p50_ms", "INTEGER"), ("matches", "charge_p99_ms", "INTEGER"), ("matches", "lost_turns", "INTEGER"), ("matches", "rating_after", "REAL")] {
+        for (table, column, kind) in [("matches", "opponent_rating", "REAL"), ("matches", "rating_before", "REAL"), ("arms", "stopped", "TEXT"), ("matches", "remote", "TEXT"), ("matches", "charge_p50_ms", "INTEGER"), ("matches", "charge_p99_ms", "INTEGER"), ("matches", "lost_turns", "INTEGER"), ("matches", "rating_after", "REAL"), ("experiments", "balance_from_ms", "INTEGER")] {
             let has: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), [column], |r| r.get(0))?;
             if has == 0 {
                 // Another process may add it at the same moment; that is fine.
