@@ -376,14 +376,15 @@ pub fn deploy(root: &Path, store: &Store, cfg: &Config, bot: &str, id: &str, ver
         ));
     }
     let current = store.bot_state(bot).map_err(|e| e.to_string())?;
-    let same = current.as_ref().map(|c| c.release.as_deref() == Some(id)).unwrap_or(false);
-    // A new release on a bot is a new version on the ladder, so its rating is tracked apart.
-    // A scout plays a different arm every match, so its label says nothing about what it
-    // runs: it keeps one label, and with it a rating that can settle. (The ladder starts
-    // every new version from scratch.) The canary's label changes with every release.
-    let version = match (version, same || b.role == "scout", current.as_ref().and_then(|c| c.version.clone())) {
-        (Some(v), _, _) => v.to_string(),
-        (None, true, Some(v)) => v,
+    // Every bot keeps its label across releases: the ladder rates each label apart and starts a
+    // new one from scratch (2026-11-18: foot-soldier's v26 sat at 1934 while v25 had 2370; the
+    // flagship's v11 at 2373 against v10's 2441), so a new label throws the settled rating away.
+    // What a release scores is read from our own match records (by release), not from the
+    // label. A new label only when asked for (`--version`), or when the ladder refuses the
+    // current one (version_limit, handled by the gateway).
+    let version = match (version, current.as_ref().and_then(|c| c.version.clone())) {
+        (Some(v), _) => v.to_string(),
+        (None, Some(v)) => v,
         _ => store.next_version(bot).map_err(|e| e.to_string())?,
     };
     store.set_deployment(bot, id, &version, force.unwrap_or("deploy")).map_err(|e| e.to_string())?;
