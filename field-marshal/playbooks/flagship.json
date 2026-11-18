@@ -1,6 +1,12 @@
 {
   "default": { "name": "matrix-6", "frost_combo": 8, "frost_wait_cost": 4 },
   "opponents": {
-    "house-ts-starter": { "name": "matrix-5" }
+    "house-ts-starter": { "name": "matrix-5" },
+    "Res_AI": { "name": "matrix-5" },
+    "Sonnet-5-5": { "name": "matrix-5" },
+    "house-brawler": { "name": "matrix-5" },
+    "daydream": { "name": "matrix-5" },
+    "house-kiter": { "name": "matrix-5" },
+    "blacklight": { "name": "matrix-5" }
   }
 }
