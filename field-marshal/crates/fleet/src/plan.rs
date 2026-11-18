@@ -220,7 +220,10 @@ impl Store {
             let mut chosen: Option<Assignment> = None;
             if experiments {
                 for e in self.experiments(true)? {
-                    if e.arms.len() < 2 || !e.opponents.iter().any(|p| name_matches(p, &m.opponent)) {
+                    // One running arm is still an experiment: its bots play that arm, never
+                    // fall back to the default playbook (2026-11-18: with one arm left, the
+                    // scouts played matrix for ten minutes).
+                    if e.arms.is_empty() || !e.opponents.iter().any(|p| name_matches(p, &m.opponent)) {
                         continue;
                     }
                     if let Some(bots) = &e.bots {
