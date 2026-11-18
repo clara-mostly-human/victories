@@ -12,6 +12,10 @@
 //! to the opponent's side with a repulsor in the same tick. We now consider that turn
 //! ourselves (`dash_slam`) and avoid tiles where it would work against us (`slam_risk`).
 //!
+//! matrix-3 looks a second tick ahead: the sixteen turns the first solve likes best are
+//! played out with the next tick itself solved as a game (`deepen`). Deepening more
+//! turns, or adding dodge-only ticks after the second, did not help.
+//!
 //! All numbers live in [`Playbook`], so a playbook for a named opponent can change them.
 //! They were tuned in the arena and then confirmed against other bots. Two findings are
 //! built into the defaults and deserve suspicion later, against stronger opponents: the
@@ -70,6 +74,12 @@ pub struct Playbook {
     pub sample: bool,
     /// search: consider shots aimed where the opponent could step
     pub lead_shots: bool,
+    /// search: how many of the best turns to play out a second tick (0 = one tick only)
+    pub deepen: usize,
+    /// search: dodge-only ticks played after the second tick
+    pub deep_rollout: i32,
+    /// search: deepen only when the opponent is within this many tiles
+    pub deep_range: i32,
     /// consider dashing to the opponent's side and firing the repulsor in the same tick
     pub dash_slam: bool,
     /// cost of ending on a tile where a step-in or dash-in repulsor would slam us into a wall
@@ -82,7 +92,7 @@ pub struct Playbook {
 impl Default for Playbook {
     fn default() -> Self {
         Playbook {
-            name: "matrix-2".into(),
+            name: "matrix-3".into(),
             fire_cost: 3.0,
             repulsor_cost: 1.0,
             frost_cost: 0.5,
@@ -106,6 +116,9 @@ impl Default for Playbook {
             model_repulsor: false,
             dash_slam: true,
             slam_risk: 5.0,
+            deepen: 16,
+            deep_rollout: 1,
+            deep_range: 6,
         }
     }
 }
@@ -147,6 +160,15 @@ impl Playbook {
         }
         if let Some(x) = v.get("rollout_ticks").and_then(Value::as_i64) {
             p.rollout_ticks = x as i32;
+        }
+        if let Some(x) = v.get("deepen").and_then(Value::as_i64) {
+            p.deepen = x.max(0) as usize;
+        }
+        if let Some(x) = v.get("deep_rollout").and_then(Value::as_i64) {
+            p.deep_rollout = x as i32;
+        }
+        if let Some(x) = v.get("deep_range").and_then(Value::as_i64) {
+            p.deep_range = x as i32;
         }
         p
     }
@@ -245,10 +267,11 @@ fn outcome(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Pla
 /// One cell of the matrix game: both turns played on the exact engine, then a few ticks
 /// in which each side only steps out of what would hit it. The value is hp taken from
 /// the opponent minus hp lost, with a bonus for stuns and a large one for a kill.
-fn cell_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Playbook, sims: &mut u32) -> f64 {
+fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Playbook, rollout: i32, sims: &mut u32) -> (f64, State) {
     let mut s = *before;
     e.step(&mut s, turns);
     *sims += 1;
+    let after_tick = s;
     let (my0, en0) = (before.fighters[me], before.fighters[1 - me]);
     let mut v = 0.0;
     if s.fighters[1 - me].state == FState::Stunned && en0.state != FState::Stunned {
@@ -257,7 +280,7 @@ fn cell_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
     if s.fighters[me].state == FState::Stunned && my0.state != FState::Stunned {
         v -= pb.stun_bonus;
     }
-    for _ in 0..pb.rollout_ticks {
+    for _ in 0..rollout {
         if s.result.is_some() {
             break;
         }
@@ -304,7 +327,89 @@ fn cell_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
     if !s.fighters[me].alive {
         v -= 1000.0;
     }
-    v
+    (v, after_tick)
+}
+
+fn cell_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Playbook, sims: &mut u32) -> f64 {
+    tick_value(e, before, me, turns, pb, pb.rollout_ticks, sims).0
+}
+
+/// Where a dash from `from` in `dir` would stop, ignoring anything that moves meanwhile.
+fn dash_end(e: &Engine, s: &State, mover: usize, dir: u8) -> P {
+    let mut p = s.fighters[mover].pos;
+    let other = s.fighters[1 - mover].pos;
+    for _ in 0..e.rules.dash_distance {
+        if e.map.step_blocked(p, dir) {
+            break;
+        }
+        let n = add(p, DIR_VEC[dir as usize]);
+        if n == other {
+            break;
+        }
+        p = n;
+    }
+    p
+}
+
+/// The value for `me` of the tick that starts in `s`, with both sides choosing: our
+/// movements with or without a shot or a repulsor, against the opponent's movements.
+/// This is the second tick of the deepened search, so it keeps to the turns that decide
+/// exchanges and leaves positional merits to the first tick.
+fn subgame_value(e: &Engine, s: &State, me: usize, pb: &Playbook, k: &Kit, sims: &mut u32) -> f64 {
+    let turns = |mine: RawTurn, theirs: RawTurn| if me == 0 { [mine, theirs] } else { [theirs, mine] };
+    let (my, en) = (s.fighters[me], s.fighters[1 - me]);
+    let mut mine: Vec<(RawTurn, f64)> = Vec::with_capacity(52);
+    if my.state != FState::Idle {
+        mine.push((RawTurn::IDLE, 0.0));
+    } else {
+        let shot = k.ranged.filter(|a| my.cd_attack[*a as usize] == 0);
+        let burst = k.repulsor.filter(|a| my.cd_attack[*a as usize] == 0);
+        let add_with = |mv: RawTurn, dest: P, cost: f64, mine: &mut Vec<(RawTurn, f64)>| {
+            mine.push((mv, cost));
+            if let Some(a) = shot {
+                mine.push((mv.with_attack(a, en.pos), cost + pb.fire_cost));
+            }
+            if let Some(a) = burst {
+                if chebyshev(dest, en.pos) <= 2 {
+                    mine.push((mv.with_burst(a), cost + pb.repulsor_cost));
+                }
+            }
+        };
+        add_with(RawTurn::IDLE, my.pos, 0.0, &mut mine);
+        for d in 0..8u8 {
+            if my.cd_move == 0 && !e.map.step_blocked(my.pos, d) {
+                let dest = add(my.pos, DIR_VEC[d as usize]);
+                if dest != en.pos {
+                    add_with(RawTurn::step(d), dest, 0.0, &mut mine);
+                }
+            }
+            if my.cd_dash == 0 {
+                let dest = dash_end(e, s, me, d);
+                if dest != my.pos {
+                    add_with(RawTurn::dash(d), dest, pb.dash_cost, &mut mine);
+                }
+            }
+        }
+    }
+    let mut theirs: Vec<(RawTurn, f64)> = vec![(RawTurn::IDLE, 0.0)];
+    if en.state == FState::Idle {
+        for d in 0..8u8 {
+            if en.cd_move == 0 && !e.map.step_blocked(en.pos, d) {
+                theirs.push((RawTurn::step(d), 0.0));
+            }
+            if en.cd_dash == 0 {
+                theirs.push((RawTurn::dash(d), pb.dash_cost));
+            }
+        }
+    }
+    let (rows, cols) = (mine.len(), theirs.len());
+    let mut payoff = vec![0.0f64; rows * cols];
+    for (m, (mt, cost)) in mine.iter().enumerate() {
+        for (c, (tt, their_cost)) in theirs.iter().enumerate() {
+            payoff[m * cols + c] = tick_value(e, s, me, &turns(*mt, *tt), pb, pb.deep_rollout, sims).0 - cost + their_cost;
+        }
+    }
+    solve_matrix(&payoff, rows, cols, 60).1
 }
 
 /// Solves a zero-sum matrix game by regret matching. `a[m * cols + e]` is the row
@@ -707,7 +812,30 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
                 payoff[m * cols + c] = cell_value(e, &s, me, &turns(*mine, *reply), pb, &mut sims) + merit + their_cost;
             }
         }
-        let (mut mix, value) = solve_matrix(&payoff, rows, cols, 300);
+        let (mut mix, mut value) = solve_matrix(&payoff, rows, cols, 300);
+        // Deepening: the turns the first solve likes best are played out one tick further,
+        // with the next tick itself solved as a game, and the choice is made among them.
+        if pb.deepen > 0 && dist_now <= pb.deep_range && rows > 1 {
+            let mut order: Vec<usize> = (0..rows).collect();
+            let row_mean = |m: usize| payoff[m * cols..(m + 1) * cols].iter().sum::<f64>() / cols as f64;
+            order.sort_by(|a, b| (mix[*b], row_mean(*b)).partial_cmp(&(mix[*a], row_mean(*a))).unwrap());
+            order.truncate(pb.deepen);
+            let mut deep = vec![0.0f64; order.len() * cols];
+            for (i, &m) in order.iter().enumerate() {
+                let (mine, merit, _) = cands[m];
+                for (c, (reply, their_cost)) in theirs.iter().enumerate() {
+                    let (v1, s1) = tick_value(e, &s, me, &turns(mine, *reply), pb, 0, &mut sims);
+                    let later = if s1.result.is_none() { subgame_value(e, &s1, me, pb, &k, &mut sims) } else { 0.0 };
+                    deep[i * cols + c] = v1 + later + merit + their_cost;
+                }
+            }
+            let (deep_mix, deep_value) = solve_matrix(&deep, order.len(), cols, 300);
+            mix = vec![0.0; rows];
+            for (i, &m) in order.iter().enumerate() {
+                mix[m] = deep_mix[i];
+            }
+            value = deep_value;
+        }
         // Play from the mixed strategy, ignoring the tail regret matching leaves behind.
         let top = mix.iter().cloned().fold(0.0, f64::max);
         mix.iter_mut().for_each(|p| {
