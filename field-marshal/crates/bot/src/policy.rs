@@ -21,6 +21,10 @@
 //! wall slams land the tick after we step, when we cannot move. A search that plays the
 //! opponent's punishment on the second tick stops stepping into it.
 //!
+//! matrix-5 values the leaves of the search with a tempo evaluation fitted from 1,287
+//! ladder replays (`victris_engine::tempo`): what it is worth, in hp over the next
+//! twelve ticks of real games, to hold the step and the shot while the opponent does not.
+//!
 //! All numbers live in [`Playbook`], so a playbook for a named opponent can change them.
 //! They were tuned in the arena and then confirmed against other bots. Two findings are
 //! built into the defaults and deserve suspicion later, against stronger opponents: the
@@ -96,6 +100,9 @@ pub struct Playbook {
     pub think_ms: u64,
     /// search threads
     pub threads: usize,
+    /// search: hard limit in ms on the second tick's deepening; turns not reached by then
+    /// are left out of the choice
+    pub hard_ms: u64,
     /// search: weight of the fitted tempo evaluation at the leaves (0 = off)
     pub tempo_weight: f64,
     /// cost of ending a step (so with no step next tick) within `stuck_range` tiles of an
@@ -123,7 +130,7 @@ pub struct Playbook {
 impl Default for Playbook {
     fn default() -> Self {
         Playbook {
-            name: "matrix-4".into(),
+            name: "matrix-5".into(),
             fire_cost: 3.0,
             repulsor_cost: 1.0,
             frost_cost: 0.5,
@@ -153,7 +160,8 @@ impl Default for Playbook {
             inner_cols: 3,
             think_ms: 0,
             threads: 1,
-            tempo_weight: 0.0,
+            hard_ms: 350,
+            tempo_weight: 1.0,
             stuck_penalty: 0.0,
             stuck_range: 3,
             model_shots: true,
@@ -209,6 +217,9 @@ impl Playbook {
         }
         if let Some(x) = u("threads") {
             p.threads = x as usize;
+        }
+        if let Some(x) = u("hard_ms") {
+            p.hard_ms = x;
         }
         if let Some(x) = v.get("stuck_range").and_then(Value::as_i64) {
             p.stuck_range = x as i32;
@@ -975,9 +986,19 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 total
             };
             let mut deep = vec![0.0f64; order.len() * cols];
+            // A hard stop for the second tick too: a crowded position on a busy machine
+            // must not turn into a missed deadline. Rows not reached are dropped.
+            let hard_stop = started + std::time::Duration::from_millis(pb.hard_ms.max(1));
+            let mut reached = 0;
             for (i, &m) in order.iter().enumerate() {
+                if i > 0 && Instant::now() >= hard_stop {
+                    break;
+                }
                 sims += deepen_row(m, 1, None, &mut deep[i * cols..(i + 1) * cols]);
+                reached = i + 1;
             }
+            order.truncate(reached);
+            deep.truncate(reached * cols);
             let (mut deep_mix, _, mut deep_value) = solve_matrix(&deep, order.len(), cols, 300);
             // With time left, the turns still in contention get a third tick, best first,
             // until the clock runs out. Rows are replaced whole, so a row is never half deep.
