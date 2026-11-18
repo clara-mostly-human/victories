@@ -1,7 +1,7 @@
 //! shotstats: what a ranged shot is worth, measured on ladder replays (workstream 1 of
 //! the plan).
 //!
-//!   shotstats [--bots A,B,C] [--map NAME] [--fine] [--horizon 8] <replay dir or files>...
+//!   shotstats [--bots A,B,C] [--received] [--map NAME] [--fine] [--horizon 8] <replay dir or files>...
 //!
 //! For every tick where a fighter could act, had its shot ready and the opponent in sight
 //! within 6 tiles, it records the situation (range, whether the target could step or
@@ -56,6 +56,9 @@ fn main() {
     let only_map: Option<String> = opt("--map");
     // --fine: one row per exact distance and per tick the target still has to wait to step
     let fine = args.iter().any(|a| a == "--fine");
+    // --received: count the shots fired at the named bots (the situation is then theirs as targets)
+    let received = args.iter().any(|a| a == "--received");
+    let mut fighter_games = 0u32;
     let mut files = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -63,7 +66,7 @@ fn main() {
             skip = false;
             continue;
         }
-        if a == "--fine" {
+        if a == "--fine" || a == "--received" {
             continue;
         }
         if a == "--bots" || a == "--horizon" || a == "--map" {
@@ -90,6 +93,7 @@ fn main() {
             continue;
         }
         games += 1;
+        fighter_games += counted.iter().filter(|c| **c).count() as u32;
         let mut s = e.new_match(replay.seed);
         let mut events = Vec::new();
         let mut hp: Vec<[i32; 2]> = Vec::new();
@@ -104,7 +108,7 @@ fn main() {
             let before = s;
             e.step_events(&mut s, &t.turns, &mut events);
             for x in 0..2 {
-                if !counted[x] {
+                if !counted[if received { 1 - x } else { x }] {
                     continue;
                 }
                 let (f, o) = (&before.fighters[x], &before.fighters[1 - x]);
@@ -171,6 +175,7 @@ fn main() {
             }
         }
     }
+    println!("{fighter_games} counted fighter-games");
     println!("{games} games, {decisions} ticks with the shot ready and the opponent in sight within 6 tiles; swing = hp gained on the opponent over the next {horizon} ticks");
     println!("{:<52} {:>6} {:>6} {:>5} {:>9} {:>6} {:>9} {:>10} {:>12}", "situation", "fired", "rate", "hit", "swing", "held", "swing", "fire-hold", "lead shots");
     for (k, c) in &table {

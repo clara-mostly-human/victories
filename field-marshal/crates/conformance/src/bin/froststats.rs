@@ -19,6 +19,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use victris_engine::events::Event;
 use victris_engine::geom::chebyshev;
+use victris_engine::observe::can_see;
 use victris_engine::replay::parse_replay;
 use victris_engine::rules::AttackKind;
 
@@ -83,6 +84,9 @@ fn main() {
     }
     let mut table: BTreeMap<String, Cell> = BTreeMap::new();
     let (mut games, mut fighter_games) = (0u32, 0u32);
+    // openings: stretches of ticks in which the target is in sight and in range and its
+    // dash stays away longer than a fuse. (count, with our burst ready at some tick, used)
+    let mut openings = [0u32; 3];
     for path in &files {
         let mut text = String::new();
         if std::fs::File::open(path).map(|f| GzDecoder::new(f).read_to_string(&mut text)).is_err() {
@@ -95,7 +99,9 @@ fn main() {
         }
         let Some(ranged) = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Projectile { .. })) else { continue };
         let Some(frost) = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Area { .. })) else { continue };
-        let AttackKind::Area { fuse, .. } = e.rules.attacks[frost].kind else { continue };
+        let AttackKind::Area { fuse, range, .. } = e.rules.attacks[frost].kind else { continue };
+        // per fighter: (inside an opening, burst was ready in it, burst was thrown in it)
+        let mut open = [(false, false, false); 2];
         let counted: Vec<bool> = (0..2).map(|i| bots.as_ref().map(|b| replay.bots.get(i).map(|n| b.contains(n)).unwrap_or(false)).unwrap_or(true)).collect();
         if !counted[0] && !counted[1] {
             continue;
@@ -113,6 +119,25 @@ fn main() {
             hp.push([s.fighters[0].hp, s.fighters[1].hp]);
             let before = s;
             e.step_events(&mut s, &t.turns, &mut events);
+            for x in 0..2 {
+                if !counted[x] || received {
+                    continue;
+                }
+                let (f, o) = (&before.fighters[x], &before.fighters[1 - x]);
+                let now = o.cd_dash > fuse && chebyshev(f.pos, o.pos) <= range && can_see(&e.rules, &e.map, f.pos, o.pos);
+                if now {
+                    if !open[x].0 {
+                        open[x] = (true, false, false);
+                    }
+                    open[x].1 |= f.cd_attack[frost] == 0;
+                    open[x].2 |= events.iter().any(|ev| matches!(ev, Event::AreaSpawn { owner, attack, .. } if *owner as usize == x + 1 && *attack as usize == frost));
+                } else if open[x].0 {
+                    openings[0] += 1;
+                    openings[1] += open[x].1 as u32;
+                    openings[2] += open[x].2 as u32;
+                    open[x].0 = false;
+                }
+            }
             // What this tick did for bursts already in the air (and a shot or two after).
             for l in launches.iter_mut() {
                 let o = 1 - l.x;
@@ -196,6 +221,15 @@ fn main() {
                 }
             }
         }
+    }
+    if !received {
+        let g = fighter_games.max(1) as f64;
+        println!(
+            "openings (target in sight and range, dash away for a whole fuse): {:.2} a game; burst ready in {:.2} a game; burst thrown in {:.2} a game",
+            openings[0] as f64 / g,
+            openings[1] as f64 / g,
+            openings[2] as f64 / g
+        );
     }
     println!("{games} games, {fighter_games} counted fighter-games; swing = hp gained on the opponent over the next {horizon} ticks");
     println!(
