@@ -1,0 +1,10 @@
+{
+  "name": "frost-and-shots",
+  "note": "The three single arms running since 04:29Z and 04:45Z (calibrated-shots, frost-timing, frost-escape) all lead control at 45 games each (60%, 64%, 61% against 52%), none separably. A change reaches field-marshal only as one build, so this arm runs the three together now, in parallel, to learn whether their effects add or interfere without waiting a further cycle. Predicts: at least as good as the best single arm; if it is worse than the singles the switches interfere and the flagship takes only the best one. No new code: needs a release at or after 1746fb6 (r11 or later). Every opponent, balanced by opponent, map and seat.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "frost-and-shots": { "dodge_prob": 0.25, "frost_combo": 8, "frost_wait_cost": 4, "dash_cost_frosted": 2 }
+  }
+}
