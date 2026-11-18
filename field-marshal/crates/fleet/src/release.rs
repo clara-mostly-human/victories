@@ -114,12 +114,22 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
     }
     copy_dir(&ws.join("playbooks"), &dir.join("playbooks")).map_err(|e| format!("cannot copy playbooks: {e}"))?;
     let rustc = sh(Command::new("rustc").arg("--version"), "rustc").unwrap_or_default();
+    // What the client in this build understands. 2: --prefer-address, --requeue-delay-ms and
+    // reconnecting when slow. 3: with --stdio --provisional it writes a quick fallback turn
+    // before each decision.
+    let main_rs = std::fs::read_to_string(ws.join("crates/bot/src/main.rs")).unwrap_or_default();
+    let client = if main_rs.contains("--provisional") {
+        3
+    } else if main_rs.contains("--requeue-delay-ms") {
+        2
+    } else {
+        1
+    };
     let meta = json!({
         "id": id, "git_sha": sha, "built_ms": now_ms(), "rustc": rustc, "tests_run": tests,
         // Older commits have a marshal that does not know the fleet flags.
         "fleet_hook": ws.join("crates/bot/src/fleet_hook.rs").is_file(),
-        // 2: the client takes --prefer-address and --requeue-delay-ms and reconnects when slow
-        "client": if std::fs::read_to_string(ws.join("crates/bot/src/main.rs")).map(|t| t.contains("--requeue-delay-ms")).unwrap_or(false) { 2 } else { 1 },
+        "client": client,
     });
     std::fs::write(dir.join("release.json"), serde_json::to_string_pretty(&meta).unwrap()).map_err(|e| e.to_string())?;
     if meta["fleet_hook"] == json!(true) {

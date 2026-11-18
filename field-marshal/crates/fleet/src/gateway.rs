@@ -210,7 +210,11 @@ impl Engine {
         let _ = std::fs::create_dir_all(&log_dir);
         let err = std::fs::OpenOptions::new().create(true).append(true).open(log_dir.join("run.log")).map_err(|e| e.to_string())?;
         let mut cmd = bot_command(root, cfg, bot, release, release_dir, version);
-        cmd.arg("--stdio").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(err));
+        cmd.arg("--stdio");
+        if crate::supervise::client_level(release_dir) >= 3 {
+            cmd.arg("--provisional");
+        }
+        cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::from(err));
         let mut child = cmd.spawn().map_err(|e| format!("cannot start {}: {e}", release_dir.join("marshal").display()))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
@@ -437,6 +441,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         if send(&mut ws, shared, queue_frame(&version)).is_err() {
             continue;
         }
+        // the engine's quick answer for the tick it is working on
+        let mut fallback: Option<(i64, String)> = None;
         // ticks of this match on which the override test sent an empty turn first
         let mut test_ticks: Vec<i64> = Vec::new();
         let mut requeue_at: Option<Instant> = None;
@@ -599,6 +605,19 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     }
                     _ => {}
                 }
+                // The engine's quick fallback for this tick: kept, not sent. The ladder takes
+                // the first answer for a tick as final (tested 2026-11-18), so it only goes
+                // out if the real turn has not come by the deadline.
+                if v.get("provisional").and_then(Value::as_bool) == Some(true) {
+                    if let Some(tick) = v.get("tick").and_then(Value::as_i64) {
+                        let mut f = v.clone();
+                        if let Some(o) = f.as_object_mut() {
+                            o.remove("provisional");
+                        }
+                        fallback = Some((tick, f.to_string()));
+                    }
+                    continue;
+                }
                 if let Some(tick) = v.get("tick").and_then(Value::as_i64) {
                     match pending {
                         Some((want, _)) if want == tick => pending = None,
@@ -672,14 +691,19 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
             // -- the clock ---------------------------------------------------------------------
             if let Some((tick, since)) = pending {
                 if since.elapsed() >= shared.opt.answer_deadline {
-                    // The engine is late. An idle turn keeps the bot in the match.
+                    // The engine is late. Its quick fallback for this tick goes out if it
+                    // gave one; an empty turn if not. Either keeps the bot in the match.
                     pending = None;
                     shared.idle_turns.fetch_add(1, Ordering::Relaxed);
-                    if let Err(why) = send(&mut ws, shared, json!({ "tick": tick }).to_string()) {
+                    let (frame, kind) = match fallback.take() {
+                        Some((t, f)) if t == tick => (f, "fallback_turn"),
+                        _ => (json!({ "tick": tick }).to_string(), "idle_turn"),
+                    };
+                    if let Err(why) = send(&mut ws, shared, frame) {
                         why_closed = why;
                         break 'conn;
                     }
-                    event(root, name, "idle_turn", json!({ "tick": tick, "waited_ms": since.elapsed().as_millis() as u64 }));
+                    event(root, name, kind, json!({ "tick": tick, "waited_ms": since.elapsed().as_millis() as u64 }));
                 }
             }
             if let Some(at) = requeue_at {

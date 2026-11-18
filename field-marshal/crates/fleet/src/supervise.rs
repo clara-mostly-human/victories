@@ -79,7 +79,7 @@ fn release_has_hook(dir: &Path) -> bool {
 }
 
 /// What the client in this release understands (see `release::build`); 1 for older builds.
-fn client_level(dir: &Path) -> i64 {
+pub(crate) fn client_level(dir: &Path) -> i64 {
     std::fs::read_to_string(dir.join("release.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())

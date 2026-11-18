@@ -173,6 +173,11 @@ pub struct Session {
     pub remote: Option<String>,
     /// reconnects in a row made because the connection was slow
     slow_streak: u32,
+    /// Where a quick fallback turn goes before the real decision is worked out (set when
+    /// the engine runs behind the gateway). The ladder takes the first answer for a tick
+    /// as final, so the fallback is not sent to it: the gateway holds it and uses it only
+    /// if the real turn has not come by its deadline.
+    pub early: Option<Box<dyn FnMut(String)>>,
     log: Option<std::fs::File>,
     log_day: String,
 }
@@ -244,7 +249,7 @@ fn diff_paths(a: &Value, b: &Value, path: &str, out: &mut Vec<String>) {
 
 impl Session {
     pub fn new(cfg: Config) -> Session {
-        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, refusals: 0, remote: None, slow_streak: 0, log: None, log_day: String::new() }
+        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, refusals: 0, remote: None, slow_streak: 0, early: None, log: None, log_day: String::new() }
     }
 
     pub fn queue_frame(&self) -> String {
@@ -447,11 +452,32 @@ impl Session {
         let prev = m.last_turn.filter(|(t, _)| *t + 1 == tick).map(|(_, turn)| turn);
         // A bug in the tracker or the policy must cost one idle tick, never the match.
         let playbook = m.playbook.clone();
+        let mut early = self.early.take();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let sync = tracker.observe(&view, events, prev);
+            if let Some(emit) = early.as_mut() {
+                // The quick answer: the plain heuristic, without the search. It costs a
+                // fraction of a millisecond and is what gets played if the search is late.
+                if playbook.search {
+                    let mut quick = playbook.clone();
+                    quick.search = false;
+                    let q = decide(tracker, &view, &quick);
+                    let mut frame = turn_json(tick, &q.turn, &tracker.engine);
+                    frame["provisional"] = json!(true);
+                    emit(frame.to_string());
+                    // Test hook: ARENA_TEST_LATE_MS makes every 25th decision this late, to
+                    // show the gateway playing the fallback. Never set on the ladder.
+                    if tick % 25 == 0 {
+                        if let Some(ms) = std::env::var("ARENA_TEST_LATE_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                            std::thread::sleep(std::time::Duration::from_millis(ms));
+                        }
+                    }
+                }
+            }
             let d = decide(tracker, &view, &playbook);
             (sync, d)
         }));
+        self.early = early;
         let (sync, decision) = match result {
             Ok(x) => x,
             Err(_) => {

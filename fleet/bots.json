@@ -31,8 +31,7 @@
       "note": "Scout, and the first bot behind the gateway (trial since 2026-11-18): the gateway holds its connection, its engine runs as a child.",
       "expect_online": true,
       "owner": "the fleet (infrastructure thread)",
-      "gateway": true,
-      "provisional_test_every": 20
+      "gateway": true
     },
     "spy-master": {
       "role": "scout",

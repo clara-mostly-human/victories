@@ -4,6 +4,8 @@
 //!           [--playbooks file.json] [--log-dir dir] [--token-file path] [--ladder id]
 //!           [--fleet-db file [--release id] [--experiments] [--ours name,name]]
 //!           [--prefer-address ip,ip] [--requeue-delay-ms N]
+//!   --stdio --provisional: before each decision, also write a quick fallback turn marked
+//!           "provisional": true (the gateway holds it in case the real one is late)
 //!   marshal --bot <name> --stdio      read server frames on stdin, write replies on stdout (tests)
 //!
 //! The token comes from ARENA_TOKEN, else from --token-file, else from <repo>/bots/<name>.
@@ -41,6 +43,7 @@ struct Args {
     ours: Vec<String>,
     prefer: Vec<std::net::IpAddr>,
     requeue_delay_ms: u64,
+    provisional: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -60,6 +63,7 @@ fn parse_args() -> Result<Args, String> {
         ours: Vec::new(),
         prefer: std::env::var("ARENA_PREFER_ADDRESS").map(|t| fleet::net::parse_addresses(&t)).unwrap_or_default(),
         requeue_delay_ms: 0,
+        provisional: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -77,6 +81,7 @@ fn parse_args() -> Result<Args, String> {
             "--fleet-db" => a.fleet_db = Some(val()?.into()),
             "--release" => a.release = Some(val()?),
             "--experiments" => a.experiments = true,
+            "--provisional" => a.provisional = true,
             "--prefer-address" => a.prefer = fleet::net::parse_addresses(&val()?),
             "--requeue-delay-ms" => a.requeue_delay_ms = val()?.parse().map_err(|_| "--requeue-delay-ms needs a number")?,
             "--ours" => a.ours = val()?.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
@@ -124,9 +129,17 @@ fn lock_bot(bot: &str) -> Result<std::fs::File, String> {
     }
 }
 
-fn run_stdio(mut session: Session) {
+fn run_stdio(mut session: Session, provisional: bool) {
     let stdin = std::io::stdin();
-    let mut out = std::io::stdout().lock();
+    if provisional {
+        session.early = Some(Box::new(|frame: String| {
+            let mut out = std::io::stdout().lock();
+            let _ = writeln!(out, "{frame}");
+            let _ = out.flush();
+        }));
+    }
+    // Not locked for the whole run: the fallback above writes in the middle of a decision.
+    let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -289,7 +302,7 @@ fn main() {
     };
     let mut session = Session::new(cfg);
     if args.stdio {
-        run_stdio(session);
+        run_stdio(session, args.provisional);
         return;
     }
     let token = match read_token(&args) {
