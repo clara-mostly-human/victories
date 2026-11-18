@@ -20,7 +20,8 @@ echo "$version" > "$rel/VERSION"
 echo "froze $rel"
 [ "$1" = "--no-switch" ] && exit 0
 ln -sfn "field-marshal-$version-$sha" ../data/releases/field-marshal-current
-pid="$(pgrep -f 'marshal --bot field-marshal' | head -1 || true)"
+# The bot itself, not caffeinate or any shell whose command line happens to mention it.
+pid="$(ps -axo pid=,args= | awk '$2 ~ /\/marshal$/ && / --bot field-marshal / {print $1; exit}')"
 if [ -n "$pid" ]; then
   kill -TERM "$pid"
   echo "live bot (pid $pid) asked to finish its match; launchd will start $version"
