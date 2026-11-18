@@ -277,7 +277,9 @@ impl Session {
         line["bot"] = json!(self.cfg.bot);
         line["version"] = json!(self.cfg.version);
         if let Some(f) = self.log.as_mut() {
-            let _ = writeln!(f, "{line}");
+            // One write call per line, so another writer appending to this file (the
+            // gateway notes dropped connections here) can never land inside a line.
+            let _ = f.write_all(format!("{line}\n").as_bytes());
         }
     }
 

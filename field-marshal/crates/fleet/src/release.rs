@@ -86,8 +86,15 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
     eprintln!("building");
     // Low priority and two jobs: a build must not take the fast cores from the live bots.
     let cargo = |args: &[&str]| {
+        // Under launchd the PATH has no ~/.cargo/bin, so cargo is named in full when it is there.
+        let home_cargo = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cargo").join("bin").join("cargo");
+        let cargo_bin = if home_cargo.is_file() { home_cargo.display().to_string() } else { "cargo".to_string() };
         let mut c = Command::new("/usr/bin/nice");
-        c.current_dir(&ws).env("CARGO_TARGET_DIR", &target).env("CARGO_BUILD_JOBS", "2").env("RUST_TEST_THREADS", "2").args(["-n", "15", "cargo"]).args(args);
+        c.current_dir(&ws).env("CARGO_TARGET_DIR", &target).env("CARGO_BUILD_JOBS", "2").env("RUST_TEST_THREADS", "2").args(["-n", "15", &cargo_bin]).args(args);
+        if let Some(dir) = Path::new(&cargo_bin).parent().filter(|d| d.is_dir()) {
+            // rustc and friends sit beside cargo.
+            c.env("PATH", format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default()));
+        }
         c
     };
     sh(&mut cargo(&["build", "--release", "-p", "marshal"]), "cargo build")?;
@@ -113,7 +120,7 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
         }
     }
     copy_dir(&ws.join("playbooks"), &dir.join("playbooks")).map_err(|e| format!("cannot copy playbooks: {e}"))?;
-    let rustc = sh(Command::new("rustc").arg("--version"), "rustc").unwrap_or_default();
+    let rustc = sh(&mut cargo(&["--version"]), "cargo --version").unwrap_or_default();
     // What the client in this build understands. 2: --prefer-address, --requeue-delay-ms and
     // reconnecting when slow. 3: with --stdio --provisional it writes a quick fallback turn
     // before each decision.

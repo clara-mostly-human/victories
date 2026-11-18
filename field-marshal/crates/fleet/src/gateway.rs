@@ -773,7 +773,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         let line = json!({ "t": "disconnected", "detail": { "why": why_closed, "in_match": in_match, "retry_in_s": backoff.as_secs(), "by": "gateway" }, "ts": now_ms(), "bot": name, "version": version });
         let day = crate::online::utc_stamp()[..10].to_string();
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(root.join("logs").join(name).join(format!("{name}-{day}.jsonl"))) {
-            let _ = writeln!(f, "{line}");
+            // One write call: the engine appends to the same file, and a line written in
+            // pieces could end up inside one of its lines.
+            let _ = f.write_all(format!("{line}\n").as_bytes());
         }
         event(root, name, "disconnected", json!({ "why": why_closed, "in_match": in_match, "retry_in_s": backoff.as_secs() }));
     }
