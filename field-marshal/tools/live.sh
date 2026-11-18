@@ -35,7 +35,7 @@ if [ -f data/releases/field-marshal-use-fleet ] && [ -x data/releases/live/marsh
   # search is late. To roll back: remove "gateway": true for field-marshal in
   # fleet/bots.json and run the marshal directly again with --token-file bots/field-marshal
   # in place of --stdio --provisional.
-  exec /usr/bin/caffeinate -i data/bin/fleet attach field-marshal -- "$rel/marshal" --bot field-marshal \
+  exec /usr/bin/caffeinate -i data/bin/fleet attach field-marshal --proto 2 -- "$rel/marshal" --bot field-marshal \
     --version "$version" --playbooks "$book" --log-dir logs/field-marshal \
     --fleet-db data/fleet.db --release "${RELEASE:-unknown}" --ours "$ours" --stdio --provisional
 fi
