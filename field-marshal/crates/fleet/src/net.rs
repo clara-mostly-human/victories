@@ -21,10 +21,12 @@ pub fn candidates(host: &str, port: u16, prefer: &[IpAddr], avoid: &[IpAddr]) ->
     if found.is_empty() {
         return Err(format!("{host} has no address"));
     }
-    // Stable sort: avoided last, then preferred in the order given, then as resolved.
+    // Stable sort: avoided last, then preferred in the order given, then IPv4 before IPv6
+    // (this machine has no IPv6 route, so an IPv6 address first costs a failed attempt at
+    // every start), then as resolved.
     found.sort_by_key(|a| {
         let ip = a.ip();
-        (avoid.contains(&ip), prefer.iter().position(|p| *p == ip).unwrap_or(usize::MAX))
+        (avoid.contains(&ip), prefer.iter().position(|p| *p == ip).unwrap_or(usize::MAX), ip.is_ipv6())
     });
     Ok(found)
 }
@@ -40,7 +42,11 @@ pub fn connect(url: &str, token: &str, prefer: &[IpAddr], avoid: &[IpAddr]) -> R
         let stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
             Ok(s) => s,
             Err(e) => {
-                last = format!("connect to {addr} failed: {e}");
+                // An address we cannot reach (no route) is not worth reporting if another
+                // one works; keep the first real failure for the message.
+                if last.is_empty() || !last.contains("No route") {
+                    last = format!("connect to {addr} failed: {e}");
+                }
                 continue;
             }
         };
@@ -77,5 +83,8 @@ mod tests {
         let got = candidates("127.0.0.1", 80, &[], &[ip("127.0.0.1")]).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(parse_addresses("104.21.89.84, nonsense,172.67.157.96"), vec![ip("104.21.89.84"), ip("172.67.157.96")]);
+        // localhost resolves to both families on a Mac: IPv4 comes first.
+        let got = candidates("localhost", 80, &[], &[]).unwrap();
+        assert!(got[0].is_ipv4(), "{got:?}");
     }
 }
