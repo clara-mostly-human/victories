@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use victris_engine::events::Event;
+use victris_engine::geom::chebyshev;
 use victris_engine::map::PadKind;
 use victris_engine::replay::parse_replay;
 
@@ -60,6 +61,14 @@ fn main() {
     let (mut mine, mut theirs, mut n) = ([0u32; 2], [0u32; 2], 0u32);
     let mut first_tick_sum = [0u64; 2];
     let mut first_count = [0u32; 2];
+    // the opening: distance to the nearest power pad at tick 19 (ours, theirs), and power
+    // pads taken in the first 40 ticks (ours, theirs)
+    let mut open_dist = [0u64; 2];
+    let mut open_taken = [0u32; 2];
+    let mut open_games = 0u32;
+    // how far from the nearest power pad we are at tick 19, as a histogram 0..=9+
+    let mut our_hist = [0u32; 10];
+    let mut their_hist = [0u32; 10];
     for path in &files {
         let mut text = String::new();
         if std::fs::File::open(path).map(|f| GzDecoder::new(f).read_to_string(&mut text)).is_err() {
@@ -85,12 +94,25 @@ fn main() {
         let mut first: [Option<(usize, usize)>; 2] = [None, None];
         let mut taken = [[0u32; 2]; 2];
         let mut ticks = 0usize;
+        let mut at19: Option<[i32; 2]> = None;
+        let mut early = [0u32; 2];
         for (ti, t) in replay.ticks.iter().enumerate() {
             if s.result.is_some() {
                 break;
             }
+            if ti == 19 {
+                let near = |f: usize| e.map.pads.iter().filter(|p| p.kind == PadKind::Power).map(|p| chebyshev(s.fighters[f].pos, p.pos)).min().unwrap_or(99);
+                at19 = Some([near(0), near(1)]);
+            }
             e.step_events(&mut s, &t.turns, &mut events);
             ticks = ti + 1;
+            if ti < 40 {
+                for ev in &events {
+                    if let Event::Pickup { fighter, kind: PadKind::Power, .. } = ev {
+                        early[*fighter as usize - 1] += 1;
+                    }
+                }
+            }
             for ev in &events {
                 if let Event::Pickup { fighter, kind, .. } = ev {
                     let k = if *kind == PadKind::Power { 0 } else { 1 };
@@ -106,6 +128,15 @@ fn main() {
                 continue;
             }
             n += 1;
+            if let Some(d) = at19 {
+                open_games += 1;
+                open_dist[0] += d[x] as u64;
+                open_dist[1] += d[1 - x] as u64;
+                open_taken[0] += early[x];
+                open_taken[1] += early[1 - x];
+                our_hist[(d[x] as usize).min(9)] += 1;
+                their_hist[(d[1 - x] as usize).min(9)] += 1;
+            }
             for k in 0..2 {
                 mine[k] += taken[x][k];
                 theirs[k] += taken[1 - x][k];
@@ -142,6 +173,16 @@ fn main() {
         first_tick_sum[0] as f64 / first_count[0].max(1) as f64,
         first_tick_sum[1] as f64 / first_count[1].max(1) as f64
     );
+    let og = open_games.max(1) as f64;
+    println!(
+        "the opening: at tick 19 we are {:.1} tiles from the nearest power pad, they {:.1}; power pads taken in the first 40 ticks: ours {:.2}, theirs {:.2} a game",
+        open_dist[0] as f64 / og,
+        open_dist[1] as f64 / og,
+        open_taken[0] as f64 / og,
+        open_taken[1] as f64 / og
+    );
+    println!("our distance at tick 19, games by tiles 0..9+: {:?}", our_hist);
+    println!("their distance at tick 19, games by tiles 0..9+: {:?}", their_hist);
     println!("{:<36} {:>6} {:>6} {:>10}", "", "games", "won", "avg ticks");
     for (k, c) in &table {
         println!("{:<36} {:>6} {:>5.0}% {:>10.0}", k, c.games, 100.0 * c.wins as f64 / c.games.max(1) as f64, c.ticks as f64 / c.games.max(1) as f64);
