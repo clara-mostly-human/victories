@@ -14,6 +14,7 @@
 //!   fleet ingest [bot ...]                        read marshal logs into the store
 //!
 //!   fleet plan list | show <name> | add <file.json> | pause <name> | resume <name> | stop <name>
+//!   fleet plan add-arm <name> <arm> '<settings json>'
 //!   fleet assign --bot b --opponent o --map m --seat n --match id     what the plan would hand out (writes the row)
 //!
 //!   fleet release list
@@ -29,6 +30,8 @@
 //!   fleet watch                                   one health pass (launchd runs this every 5 minutes)
 //!   fleet online [run]                            is each bot online on the ladder? `run` is the offline watchdog
 //!   fleet autopilot [run]                         one step of the automatic pipeline; `run` keeps going
+//!   fleet report                                  write the status page to data/status.html
+//!   fleet digest                                  the last 24 hours in a few lines (first line fits a notification)
 //!   fleet alerts [N]                              the last N lines of the alert log
 
 use fleet::collect::{self, Collector};
@@ -166,7 +169,7 @@ fn status(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
 }
 
 fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
-    match a.word(1, "a plan command (list, show, add, pause, resume, stop)")? {
+    match a.word(1, "a plan command (list, show, add, add-arm, pause, resume, stop)")? {
         "list" => {
             for x in store.experiments(false).map_err(e)? {
                 let done: i64 = store.conn.query_row("SELECT COUNT(*) FROM matches WHERE experiment_id = ?1 AND result IS NOT NULL AND voided = 0", [x.id], |r| r.get(0)).map_err(e)?;
@@ -235,6 +238,19 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
             let priority = v.get("priority").and_then(Value::as_i64).unwrap_or(0);
             let id = store.add_experiment(name, &opponents, list("bots").as_deref(), &arms, games, priority, v.get("note").and_then(Value::as_str)).map_err(|x| format!("cannot add {name}: {x}"))?;
             println!("experiment {name} added (id {id}): {} arms x {games} games against {}", arms.len(), opponents.join(", "));
+        }
+        "add-arm" => {
+            let name = a.word(2, "the experiment's name")?;
+            let arm = a.word(3, "the new arm's name")?;
+            let settings: Value = serde_json::from_str(a.word(4, "the arm's playbook settings as JSON, e.g. '{\"slam_risk\": 8}'")?).map_err(|x| format!("the settings are not JSON: {x}"))?;
+            if !settings.is_object() {
+                return Err("the settings must be a JSON object".into());
+            }
+            match store.add_arm(name, arm, &settings) {
+                Ok(1) => println!("arm {arm} added to {name}; it is handed out first until it has caught up"),
+                Ok(_) => return Err(format!("no experiment named {name}")),
+                Err(x) => return Err(format!("cannot add the arm: {x}")),
+            }
         }
         cmd @ ("pause" | "resume" | "stop") => {
             let name = a.word(2, "the experiment's name")?;
@@ -634,6 +650,7 @@ fn main_inner() -> Result<i32, String> {
         "watch" => {
             watch(&root, &store, &cfg)?;
             housekeeping(&root, &store, &cfg);
+            let _ = std::fs::write(data_dir(&root).join("status.html"), fleet::report::html(&fleet::report::snapshot(&root, &store, &cfg)));
         }
         "online" => {
             if a.words.get(1).map(String::as_str) == Some("run") {
@@ -681,6 +698,12 @@ fn main_inner() -> Result<i32, String> {
                 pilot.step(&root)?;
             }
         }
+        "report" => {
+            let path = data_dir(&root).join("status.html");
+            std::fs::write(&path, fleet::report::html(&fleet::report::snapshot(&root, &store, &cfg))).map_err(e)?;
+            println!("{}", path.display());
+        }
+        "digest" => print!("{}", fleet::report::digest(&fleet::report::snapshot(&root, &store, &cfg))),
         "alerts" => {
             let n: usize = a.words.get(1).and_then(|n| n.parse().ok()).unwrap_or(20);
             let text = std::fs::read_to_string(fleet::online::alert_log(&root)).unwrap_or_default();

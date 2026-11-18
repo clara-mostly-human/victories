@@ -11,8 +11,8 @@
 //! 5. The scouts are kept on a fleet build of the commit the flagship runs, so experiments
 //!    always stand on the proven base. They are not moved while an experiment is running.
 //!
-//! It never promotes and never touches the flagship: "live" is whatever the flagship's own
-//! thread ships (`release::sync_flagship`). Everything it does is one line in
+//! It never promotes and never touches the flagship: "live" is what `fleet release promote`
+//! last set, and the flagship's own thread decides when to restart onto it. Everything it does is one line in
 //! `logs/fleet-alerts.log` (kind PIPELINE) and an event in the store.
 
 use crate::config::Config;
@@ -160,10 +160,12 @@ impl Autopilot {
         if let Some(cand) = builds.first().filter(|c| c.status == "built" && c.gate.is_none()) {
             match (&live, &live_sha) {
                 (None, _) => self.say(root, "gate", format!("{} is waiting: no live release to gate against", cand.id)),
-                (Some(l), Some(sha)) if same_bot(root, sha, &cand.git_sha) == Some(true) => {
-                    let _ = store.set_release_json(&cand.id, "gate", &json!({ "verdict": "same", "against": l.id, "note": "same bot code as the live release; no gate needed" }));
+                (Some(l), Some(sha)) if release::same_search(root, sha, &cand.git_sha) == Some(true) => {
+                    // Same engine, tracker, policy and playbooks: the arena has no network and
+                    // no ladder, so it could not tell the two apart.
+                    let _ = store.set_release_json(&cand.id, "gate", &json!({ "verdict": "same", "against": l.id, "note": "same search as the live release; no gate needed" }));
                     let _ = store.set_release_status(&cand.id, "gated");
-                    log_line(root, "PIPELINE", &format!("{} has the same bot code as the live release {}: no gate needed", cand.id, l.id));
+                    log_line(root, "PIPELINE", &format!("{} has the same search as the live release {} (client changes only): no gate needed", cand.id, l.id));
                 }
                 (Some(_), _) => {
                     // A newer candidate replaces one still in the arena.
@@ -193,9 +195,16 @@ impl Autopilot {
 
         // 5. The newest release that passed goes to the canary.
         let builds = fleet_builds(&store);
-        if let Some(pass) = builds.iter().find(|r| r.status == "gated") {
-            let newest_on_ladder = builds.iter().filter(|r| ["canary", "proven"].contains(&r.status.as_str())).map(|r| r.seq).max().unwrap_or(0);
-            if pass.seq > newest_on_ladder {
+        // (A release promoted straight to live by the flagship's thread counts too: the
+        // canary always carries the newest search that is allowed on the ladder.)
+        if let Some(pass) = builds.iter().find(|r| r.status == "gated" || r.status == "live") {
+            let on_canary: Vec<i64> = cfg
+                .bots
+                .iter()
+                .filter(|b| b.managed && b.role == "canary")
+                .map(|b| store.bot_state(&b.name).ok().flatten().and_then(|s| s.release).and_then(|id| builds.iter().find(|r| r.id == id).map(|r| r.seq)).unwrap_or(0))
+                .collect();
+            if on_canary.iter().any(|seq| *seq < pass.seq) {
                 match release::canary(root, &store, &cfg, &pass.id, None) {
                     Ok(bots) => {
                         for (bot, v) in bots {

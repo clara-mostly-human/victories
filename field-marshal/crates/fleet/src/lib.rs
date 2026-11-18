@@ -2,6 +2,7 @@
 //!
 //! - `store`: the shared SQLite results store.
 //! - `plan`: the experiment plan and the arm a bot plays against a target opponent.
+//! - `report`: the status page and the daily digest.
 //! - `stats`: records, intervals and the tests the release pipeline uses.
 //! - `autopilot`: the pipeline run by itself: build, gate, canary, evidence, scouts' base.
 //! - `collect`: the replay collector and the corpus index.
@@ -21,6 +22,7 @@ pub mod ingest;
 pub mod online;
 pub mod plan;
 pub mod release;
+pub mod report;
 pub mod stats;
 pub mod store;
 pub mod supervise;

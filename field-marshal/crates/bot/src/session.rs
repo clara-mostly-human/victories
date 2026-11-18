@@ -142,6 +142,8 @@ struct Match {
 
 pub enum Out {
     Send(String),
+    /// the server would not queue us (a quota, most often); ask again after this many seconds
+    RequeueAfter(u64),
     /// the configured number of matches is done, or a stop was requested
     Done,
     Fatal(String),
@@ -156,6 +158,8 @@ pub struct Session {
     pub draws: u32,
     /// set from outside to stop after the current match
     pub stop_after_match: bool,
+    /// times in a row the server refused to queue us
+    refusals: u32,
     log: Option<std::fs::File>,
     log_day: String,
 }
@@ -227,7 +231,7 @@ fn diff_paths(a: &Value, b: &Value, path: &str, out: &mut Vec<String>) {
 
 impl Session {
     pub fn new(cfg: Config) -> Session {
-        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, log: None, log_day: String::new() }
+        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, refusals: 0, log: None, log_day: String::new() }
     }
 
     pub fn queue_frame(&self) -> String {
@@ -283,6 +287,14 @@ impl Session {
                 self.note("server_error", json!({ "code": code, "message": msg.get("message"), "retry_after_s": msg.get("retry_after_s") }));
                 if FATAL_CODES.contains(&code.as_str()) {
                     vec![Out::Fatal(code)]
+                } else if self.cur.is_none() {
+                    // Refused while waiting for a match: without another `queue` the bot would
+                    // sit unqueued until the connection is given up as dead. The usual cause
+                    // is `quota_exceeded` on concurrent matches, which clears when one of the
+                    // owner's matches ends, so ask again soon, a little later each time.
+                    self.refusals += 1;
+                    let wait = msg.get("retry_after_s").and_then(Value::as_u64).unwrap_or((2 + self.refusals as u64).min(15));
+                    vec![Out::RequeueAfter(wait.clamp(1, 120))]
                 } else {
                     vec![]
                 }
@@ -300,6 +312,7 @@ impl Session {
     }
 
     fn on_hello(&mut self, msg: &Value) -> Vec<Out> {
+        self.refusals = 0;
         let id = msg.get("match_id").and_then(Value::as_str).unwrap_or("?").to_string();
         // The same match again means a reconnect: keep what we know.
         if self.cur.as_ref().map(|m| m.id != id).unwrap_or(true) {

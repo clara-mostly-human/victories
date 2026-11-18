@@ -111,6 +111,15 @@ impl Store {
         Ok(id)
     }
 
+    /// Adds an arm to an experiment that is already running. The new arm has no games yet,
+    /// so it is handed out first in every cell until it has caught up with the others.
+    pub fn add_arm(&self, experiment: &str, arm: &str, playbook: &Value) -> rusqlite::Result<usize> {
+        self.conn.execute(
+            "INSERT INTO arms (experiment_id, name, playbook) SELECT id, ?2, ?3 FROM experiments WHERE name = ?1",
+            params![experiment, arm, playbook.to_string()],
+        )
+    }
+
     pub fn set_experiment_status(&self, name: &str, status: &str) -> rusqlite::Result<usize> {
         self.conn.execute("UPDATE experiments SET status = ?2 WHERE name = ?1", params![name, status])
     }

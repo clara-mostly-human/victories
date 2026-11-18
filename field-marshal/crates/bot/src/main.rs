@@ -132,6 +132,7 @@ fn run_stdio(mut session: Session) {
                     let _ = writeln!(out, "{s}");
                     let _ = out.flush();
                 }
+                Out::RequeueAfter(_) => {} // the test harness decides when to queue
                 Out::Done | Out::Fatal(_) => return,
             }
         }
@@ -173,13 +174,25 @@ fn run_connection(session: &mut Session, url: &str, token: &str, stop: &AtomicBo
         Ok(x) => x,
         Err(e) => return Closed::Dropped(format!("connect failed: {e}")),
     };
-    set_timeouts(&mut ws, Duration::from_secs(2));
+    set_timeouts(&mut ws, Duration::from_secs(1));
     if let Err(e) = ws.send(Message::Text(session.queue_frame())) {
         return Closed::Dropped(format!("send failed: {e}"));
     }
     let mut last_heard = Instant::now();
     let mut last_ping = Instant::now();
+    // when to send `queue` again after the server refused it
+    let mut requeue_at: Option<Instant> = None;
     loop {
+        if let Some(at) = requeue_at {
+            if session.in_match() {
+                requeue_at = None;
+            } else if Instant::now() >= at && !stop.load(Ordering::Relaxed) {
+                requeue_at = None;
+                if let Err(e) = ws.send(Message::Text(session.queue_frame())) {
+                    return Closed::Dropped(format!("send failed: {e}"));
+                }
+            }
+        }
         if stop.load(Ordering::Relaxed) {
             session.stop_after_match = true;
             if !session.in_match() {
@@ -198,6 +211,7 @@ fn run_connection(session: &mut Session, url: &str, token: &str, stop: &AtomicBo
                                 return Closed::Dropped(format!("send failed: {e}"));
                             }
                         }
+                        Out::RequeueAfter(secs) => requeue_at = Some(Instant::now() + Duration::from_secs(secs)),
                         Out::Done => {
                             let _ = ws.close(None);
                             return Closed::Done;
@@ -283,9 +297,11 @@ fn main() {
         let _ = ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed));
     }
     eprintln!("[{}] starting as {} on {}", args.bot, args.version, args.url);
-    // Reconnect with backoff (1 s, doubling to 30 s) and queue again; the ladder resumes a
-    // match in progress by sending hello and the current observation.
-    let mut delay = Duration::from_secs(1);
+    // Reconnect and queue again; the ladder resumes a match in progress by sending hello and
+    // the current observation. A connection that had been working is replaced at once: a
+    // match keeps running at about 13 ticks a second while we are away, so every second of
+    // waiting is a dozen turns not played. Repeated failures back off (1 s, doubling to 30 s).
+    let mut delay = Duration::ZERO;
     loop {
         let started = Instant::now();
         match run_connection(&mut session, &args.url, &token, &stop) {
@@ -302,11 +318,11 @@ fn main() {
                     return;
                 }
                 if started.elapsed() > Duration::from_secs(30) {
-                    delay = Duration::from_secs(1); // it was a working connection
+                    delay = Duration::ZERO; // it was a working connection
                 }
-                session.note("disconnected", serde_json::json!({ "why": why, "retry_in_s": delay.as_secs() }));
+                session.note("disconnected", serde_json::json!({ "why": why, "retry_in_s": delay.as_secs(), "in_match": session.in_match() }));
                 std::thread::sleep(delay);
-                delay = (delay * 2).min(Duration::from_secs(30));
+                delay = (delay * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
             }
         }
     }

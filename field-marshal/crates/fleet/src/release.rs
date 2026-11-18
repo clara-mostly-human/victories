@@ -110,6 +110,10 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
         "fleet_hook": ws.join("crates/bot/src/fleet_hook.rs").is_file(),
     });
     std::fs::write(dir.join("release.json"), serde_json::to_string_pretty(&meta).unwrap()).map_err(|e| e.to_string())?;
+    if meta["fleet_hook"] == json!(true) {
+        // The flagship's wrapper (field-marshal/tools/live.sh) looks for this marker.
+        let _ = std::fs::write(dir.join("fleet"), "");
+    }
     store.add_release(&id, seq, &sha, &dir.display().to_string(), note).map_err(|e| e.to_string())?;
     store.event(None, "release_built", &meta);
     let _ = std::fs::remove_dir_all(&src);
@@ -139,12 +143,42 @@ pub fn same_bot(root: &Path, a: &str, b: &str) -> Option<bool> {
     }
 }
 
+/// Files in `BOT_PATHS` that are the client (connection, protocol, reporting) and not the
+/// search. A commit that only changes these plays the same game.
+pub const CLIENT_FILES: [&str; 4] = [
+    "field-marshal/crates/bot/src/session.rs",
+    "field-marshal/crates/bot/src/main.rs",
+    "field-marshal/crates/bot/src/fleet_hook.rs",
+    "field-marshal/crates/bot/src/lib.rs",
+];
+
+/// Do two commits hold the same search (engine, tracker, policy, playbooks), whatever the
+/// client around it does? The arena cannot tell such builds apart, so they need no gate.
+pub fn same_search(root: &Path, a: &str, b: &str) -> Option<bool> {
+    let st = Command::new("git")
+        .current_dir(root)
+        .args(["diff", "--quiet", a, b, "--"])
+        .args(BOT_PATHS)
+        .args(CLIENT_FILES.iter().map(|f| format!(":(exclude){f}")))
+        .status()
+        .ok()?;
+    match st.code() {
+        Some(0) => Some(true),
+        Some(1) => Some(false),
+        _ => None,
+    }
+}
+
 /// The flagship is run by its own thread, which freezes its builds under
 /// `data/releases/<bot>-current -> <bot>-<version>-<sha>`. Whatever that points at is the
 /// live release: it is brought into the store here so the gate and the ladder evidence
 /// compare against the build the flagship really runs. Returns the live release id.
 pub fn sync_flagship(root: &Path, store: &Store, cfg: &Config) -> Result<Option<String>, String> {
     let dir = data_dir(root).join("releases");
+    // Once the flagship follows the fleet's own pointer, `promote` is the only source.
+    if dir.join("live").exists() {
+        return Ok(store.live_release().map_err(|e| e.to_string())?.map(|r| r.id));
+    }
     for b in cfg.bots.iter().filter(|b| b.role == "flagship" && !b.managed) {
         let Ok(target) = std::fs::read_link(dir.join(format!("{}-current", b.name))) else { continue };
         let Some(id) = target.file_name().map(|n| n.to_string_lossy().to_string()) else { continue };
@@ -405,6 +439,25 @@ pub fn evidence(store: &Store, id: &str, o: &EvidenceOptions) -> Result<Value, S
     Ok(report)
 }
 
+/// The pointer the flagship's own wrapper follows: `data/releases/live` is a link to the
+/// live release's folder and `data/releases/live.env` holds `RELEASE=<id>`. Only `promote`
+/// moves it. The flagship's thread restarts its bot itself.
+pub fn set_live_pointer(root: &Path, r: &Release) -> Result<(), String> {
+    let dir = data_dir(root).join("releases");
+    let name = Path::new(&r.path).file_name().ok_or("release path has no folder name")?.to_owned();
+    // Link and file are written beside the old ones and renamed, so a bot starting at this
+    // moment sees either the old release or the new one, never half of each.
+    let tmp = dir.join("live.new");
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(&name, &tmp).map_err(|e| format!("cannot link {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, dir.join("live")).map_err(|e| e.to_string())?;
+    let env = dir.join("live.env.new");
+    std::fs::write(&env, format!("RELEASE={}
+", r.id)).map_err(|e| e.to_string())?;
+    std::fs::rename(&env, dir.join("live.env")).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Makes a proven release the live one and deploys it to every managed flagship.
 pub fn promote(root: &Path, store: &Store, cfg: &Config, id: &str, force: Option<&str>) -> Result<Vec<(String, String)>, String> {
     let r = get(store, id)?;
@@ -421,13 +474,14 @@ pub fn promote(root: &Path, store: &Store, cfg: &Config, id: &str, force: Option
         }
     }
     store.set_release_status(id, "live").map_err(|e| e.to_string())?;
+    set_live_pointer(root, &r)?;
     store.event(None, "release_promoted", &json!({ "release": id, "previous": previous.as_ref().map(|p| p.id.clone()), "forced": force }));
     let mut out = Vec::new();
     for b in cfg.bots.iter().filter(|b| b.role == "flagship") {
         if b.managed {
             out.push((b.name.clone(), deploy(root, store, cfg, &b.name, id, None, force.or(Some("promote")))?));
         } else {
-            eprintln!("{} is a flagship the fleet does not manage: its owner deploys {} by hand", b.name, PathBuf::from(&r.path).join("marshal").display());
+            eprintln!("{} follows data/releases/live, which now points at {}; its own thread restarts it", b.name, PathBuf::from(&r.path).display());
         }
     }
     Ok(out)
