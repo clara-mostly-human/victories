@@ -165,6 +165,8 @@ pub fn group_column(by: &str) -> Option<&'static str> {
         "seat" => "'seat ' || COALESCE(seat, '?')",
         "bot" => "bot",
         "cell" => "opponent || ' / ' || map || ' / seat ' || COALESCE(seat, '?')",
+        // Arm by strength of the opponent: its highest rating seen in any of our games.
+        "arm-tier" => "COALESCE(arm, '(no experiment)') || CASE WHEN (SELECT MAX(o.opponent_rating) FROM matches o WHERE o.opponent = matches.opponent) >= 2500 THEN ' vs 2500 and up' WHEN (SELECT MAX(o.opponent_rating) FROM matches o WHERE o.opponent = matches.opponent) IS NULL THEN ' vs unrated here' ELSE ' vs under 2500' END",
         "all" => "'all'",
         _ => return None,
     })

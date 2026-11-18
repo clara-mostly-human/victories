@@ -226,7 +226,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         // Columns added after the first version of the store.
-        for (table, column, kind) in [("matches", "opponent_rating", "REAL"), ("matches", "rating_before", "REAL")] {
+        for (table, column, kind) in [("matches", "opponent_rating", "REAL"), ("matches", "rating_before", "REAL"), ("arms", "stopped", "TEXT")] {
             let has: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), [column], |r| r.get(0))?;
             if has == 0 {
                 // Another process may add it at the same moment; that is fine.

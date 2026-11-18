@@ -38,11 +38,13 @@ pub struct Config {
     pub guard_load: f64,
     /// ... or when a live bot's think time (99th percentile over the last 90 s) is above this
     pub guard_think_p99_ms: f64,
+    /// the strong bots each new build is compared with by the habits yardstick
+    pub habits_bots: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0 }
+        Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0, habits_bots: vec!["StuartSutcliffe".into(), "Shelbot4".into()] }
     }
 }
 
@@ -75,7 +77,8 @@ impl Config {
         }
         let d = Config::default();
         let guard = |k: &str, dflt: f64| v.get("guard").and_then(|g| g.get(k)).and_then(Value::as_f64).unwrap_or(dflt);
-        Config { bots, guard_load: guard("load", d.guard_load), guard_think_p99_ms: guard("think_p99_ms", d.guard_think_p99_ms) }
+        let habits_bots = v.get("habits_bots").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or(d.habits_bots);
+        Config { bots, guard_load: guard("load", d.guard_load), guard_think_p99_ms: guard("think_p99_ms", d.guard_think_p99_ms), habits_bots }
     }
 
     pub fn bot(&self, name: &str) -> Option<&BotConfig> {

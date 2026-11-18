@@ -7,7 +7,7 @@
 //!   fleet stop <bot> | resume <bot> | restart <bot>
 //!   fleet deploy <bot> <release> [--version vN] [--force "<reason>"]
 //!
-//!   fleet stats [--by opponent|version|release|playbook|arm|map|seat|bot|cell] [--bot b]
+//!   fleet stats [--by opponent|version|release|playbook|arm|arm-tier|map|seat|bot|cell] [--bot b]
 //!               [--opponent o] [--version v] [--release r] [--experiment e] [--since 24h]
 //!               [--min-opp-rating 2400] [--all]
 //!   fleet compare <candidate> <baseline>          two sets of ladder games, each a release id or bot:version
@@ -197,6 +197,10 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
             }
             let f = Filter { experiment: Some(name.to_string()), ..Filter::default() };
             print!("\n{}", table("arm", &store.records("arm", &f).map_err(e)?));
+            for (arm, why) in &x.stopped {
+                println!("  arm {arm} was stopped: {why}");
+            }
+            print!("\n{}", table("arm by opponent strength", &store.records("arm-tier", &f).map_err(e)?));
             print!("\n{}", table("opponent", &store.records("opponent", &f).map_err(e)?));
             // Balance: games each arm has played in every cell it has met.
             let mut q = store
@@ -572,7 +576,7 @@ fn main_inner() -> Result<i32, String> {
             };
             let by = a.get("--by").unwrap_or("version");
             if fleet::stats::group_column(by).is_none() {
-                return Err(format!("--by takes opponent, version, release, playbook, arm, map, seat, bot, cell or all; got '{by}'"));
+                return Err(format!("--by takes opponent, version, release, playbook, arm, arm-tier, map, seat, bot, cell or all; got '{by}'"));
             }
             print!("{}", table(by, &store.records(by, &f).map_err(e)?));
         }

@@ -91,6 +91,11 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
         c
     };
     sh(&mut cargo(&["build", "--release", "-p", "marshal"]), "cargo build")?;
+    // The habits yardstick, where the commit has it (older ones do not).
+    let has_habits = ws.join("crates/conformance/src/bin/habits.rs").is_file();
+    if has_habits {
+        sh(&mut cargo(&["build", "--release", "-p", "conformance", "--bin", "habits"]), "cargo build habits")?;
+    }
     if tests {
         eprintln!("running the tests");
         sh(&mut cargo(&["test", "--release", "--workspace"]), "cargo test")?;
@@ -99,7 +104,7 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
     let id = format!("r{seq}-{short}");
     let dir = data_dir(root).join("releases").join(&id);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    for bin in ["marshal", "arena"] {
+    for bin in ["marshal", "arena", "habits"] {
         let from = target.join("release").join(bin);
         if from.is_file() {
             std::fs::copy(&from, dir.join(bin)).map_err(|e| format!("cannot copy {bin}: {e}"))?;

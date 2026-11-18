@@ -7,11 +7,14 @@
 //!    priority, under the load guard). A candidate with the same bot code as the live
 //!    release skips the gate.
 //! 3. A candidate that passes goes on the ladder with the canary bot.
+//!    Before the gate, the habits yardstick runs on each new build (our policy in the top
+//!    bots' positions), and the result is left in the release folder as `habits.txt`.
 //! 4. Its ladder evidence against the live release is worked out every ten minutes.
 //! 5. The scouts are kept on a fleet build of the commit the flagship runs, so experiments
 //!    always stand on the proven base. They are not moved while an experiment is running.
 //!
-//! It never promotes and never touches the flagship: "live" is what `fleet release promote`
+//! It also stops an experiment arm that is two standard errors behind `control` after 100
+//! games. It never promotes and never touches the flagship: "live" is what `fleet release promote`
 //! last set, and the flagship's own thread decides when to restart onto it. Everything it does is one line in
 //! `logs/fleet-alerts.log` (kind PIPELINE) and an event in the store.
 
@@ -28,6 +31,8 @@ use std::time::{Duration, Instant};
 #[derive(Default)]
 pub struct Autopilot {
     gate: Option<(String, Child)>,
+    /// the habits yardstick running for a release
+    habits: Option<(String, Child)>,
     /// commits whose build failed, so a broken commit is tried once
     failed_builds: HashSet<String>,
     said: HashMap<String, String>,
@@ -111,6 +116,55 @@ impl Autopilot {
             }
         }
 
+        // The habits child, if one is running.
+        if let Some((id, child)) = self.habits.as_mut() {
+            if let Ok(Some(_)) = child.try_wait() {
+                let id = id.clone();
+                self.habits = None;
+                let path = data_dir(root).join("releases").join(&id).join("habits.txt");
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let heads: Vec<&str> = text.lines().filter(|l| l.contains(" decisions with the opponent in sight")).collect();
+                if heads.is_empty() {
+                    // Leave a file behind so a broken run is not started again every minute.
+                    let _ = std::fs::write(&path, format!("{text}\n(the habits run produced no result)\n"));
+                    log_line(root, "PIPELINE", &format!("habits for {id} produced no result; see {}", path.display()));
+                } else {
+                    log_line(root, "PIPELINE", &format!("habits for {id} are in {}: {}", path.display(), heads.join("; ")));
+                }
+            }
+        }
+
+        // Early stopping: an arm that is two standard errors behind control after 100 games
+        // has had its chance, and its games go to the arms still in the running.
+        for e in store.experiments(true).map_err(|e| e.to_string())? {
+            let rows = store.records("arm", &crate::stats::Filter { experiment: Some(e.name.clone()), ..Default::default() }).map_err(|e| e.to_string())?;
+            let Some(control) = rows.iter().find(|r| r.key == "control").map(|r| r.record) else { continue };
+            if control.games() < 50 {
+                continue;
+            }
+            for (arm, _) in e.arms.iter().filter(|(a, _)| a != "control") {
+                let Some(r) = rows.iter().find(|r| r.key == *arm).map(|r| r.record) else { continue };
+                if r.games() < 100 {
+                    continue;
+                }
+                let se = (r.variance() / r.games() as f64 + control.variance() / control.games() as f64).sqrt();
+                let behind = (control.score() - r.score()) / se.max(1e-9);
+                if behind >= 2.0 {
+                    let why = format!(
+                        "{:.0}% over {} games against control's {:.0}% over {}, {behind:.1} standard errors behind",
+                        100.0 * r.score(),
+                        r.games(),
+                        100.0 * control.score(),
+                        control.games()
+                    );
+                    if store.stop_arm(e.id, arm, &why).unwrap_or(0) > 0 {
+                        log_line(root, "PIPELINE", &format!("experiment {}: arm {arm} stopped early: {why}", e.name));
+                        store.event(None, "arm_stopped", &json!({ "experiment": e.name, "arm": arm, "why": why }));
+                    }
+                }
+            }
+        }
+
         // 2. A commit that changes the bot becomes a candidate, once it has sat for two minutes.
         let head = git(root, &["rev-parse", "HEAD"]).ok_or("git rev-parse failed")?;
         let builds = fleet_builds(&store);
@@ -161,6 +215,34 @@ impl Autopilot {
             }
         }
 
+        // The habits yardstick for the newest build that has the tool and no result yet:
+        // our policy in the top bots' positions. It runs before the gate, never beside it.
+        let builds = fleet_builds(&store);
+        if let Some(b) = builds.first() {
+            let dir = std::path::PathBuf::from(&b.path);
+            let out = dir.join("habits.txt");
+            let paused = crate::online::pause_file(root).exists();
+            if dir.join("habits").is_file() && !out.exists() && self.habits.is_none() && self.gate.is_none() && !paused && !cfg.habits_bots.is_empty() {
+                let script = r#"out="$1"; bin="$2"; corpus="$3"; shift 3; for b in "$@"; do /usr/bin/nice -n 15 "$bin" --bot "$b" --limit 60 --threads 2 "$corpus"; echo; done > "$out.part" 2>&1; mv "$out.part" "$out""#;
+                let child = Command::new("/bin/sh")
+                    .current_dir(root)
+                    .args(["-c", script, "habits"])
+                    .arg(&out)
+                    .arg(dir.join("habits"))
+                    .arg(root.join("replays").join("corpus"))
+                    .args(&cfg.habits_bots)
+                    .stdin(Stdio::null())
+                    .spawn();
+                match child {
+                    Ok(c) => {
+                        log_line(root, "PIPELINE", &format!("habits started for {} against {}", b.id, cfg.habits_bots.join(", ")));
+                        self.habits = Some((b.id.clone(), c));
+                    }
+                    Err(e) => self.say(root, "habits", format!("cannot start habits for {}: {e}", b.id)),
+                }
+            }
+        }
+
         // 4. The newest candidate meets the live release in the arena.
         let builds = fleet_builds(&store);
         if let Some(cand) = builds.first().filter(|c| c.status == "built" && c.gate.is_none()) {
@@ -182,7 +264,7 @@ impl Autopilot {
                         log_line(root, "PIPELINE", &format!("arena gate of {old} stopped: {} is newer", cand.id));
                         self.gate = None;
                     }
-                    if self.gate.is_none() {
+                    if self.gate.is_none() && self.habits.is_none() {
                         let log = std::fs::File::create(data_dir(root).join(format!("gate-{}.log", cand.id))).map_err(|e| e.to_string())?;
                         let err = log.try_clone().map_err(|e| e.to_string())?;
                         let child = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)
@@ -260,7 +342,7 @@ impl Autopilot {
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
-        if let Some((_, child)) = self.gate.as_mut() {
+        for (_, child) in self.gate.iter_mut().chain(self.habits.iter_mut()) {
             let _ = child.kill();
             let _ = child.wait();
         }

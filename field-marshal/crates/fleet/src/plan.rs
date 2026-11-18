@@ -40,7 +40,10 @@ pub struct Experiment {
     pub games_per_arm: i64,
     pub priority: i64,
     pub note: Option<String>,
+    /// arms still being handed out
     pub arms: Vec<(String, Value)>,
+    /// arms stopped early, with the reason
+    pub stopped: Vec<(String, String)>,
 }
 
 fn names(text: &str) -> Vec<String> {
@@ -79,15 +82,19 @@ impl Store {
                     priority: r.get(6)?,
                     note: r.get(7)?,
                     arms: Vec::new(),
+                    stopped: Vec::new(),
                 })
             })?
             .collect::<rusqlite::Result<_>>()?;
-        let mut q = self.conn.prepare("SELECT name, playbook FROM arms WHERE experiment_id = ?1 ORDER BY rowid")?;
+        let mut q = self.conn.prepare("SELECT name, playbook, stopped FROM arms WHERE experiment_id = ?1 ORDER BY rowid")?;
         for e in &mut out {
-            e.arms = q
-                .query_map([e.id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
-                .map(|a| a.map(|(n, p)| (n, serde_json::from_str(&p).unwrap_or(json!({})))))
-                .collect::<rusqlite::Result<_>>()?;
+            let rows: Vec<(String, String, Option<String>)> = q.query_map([e.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?.collect::<rusqlite::Result<_>>()?;
+            for (name, playbook, stopped) in rows {
+                match stopped {
+                    Some(why) => e.stopped.push((name, why)),
+                    None => e.arms.push((name, serde_json::from_str(&playbook).unwrap_or(json!({})))),
+                }
+            }
         }
         Ok(out)
     }
@@ -118,6 +125,11 @@ impl Store {
             "INSERT INTO arms (experiment_id, name, playbook) SELECT id, ?2, ?3 FROM experiments WHERE name = ?1",
             params![experiment, arm, playbook.to_string()],
         )
+    }
+
+    /// Stops handing out one arm; its games stay in the record.
+    pub fn stop_arm(&self, experiment_id: i64, arm: &str, why: &str) -> rusqlite::Result<usize> {
+        self.conn.execute("UPDATE arms SET stopped = ?3 WHERE experiment_id = ?1 AND name = ?2 AND stopped IS NULL", params![experiment_id, arm, why])
     }
 
     pub fn set_experiment_status(&self, name: &str, status: &str) -> rusqlite::Result<usize> {
@@ -154,11 +166,12 @@ impl Store {
             .optional()?;
         if let Some((exp, arm)) = known {
             let (Some(exp), Some(arm)) = (exp, arm) else { return Ok(None) };
-            let found = self.experiments(false)?.into_iter().find(|e| e.id == exp);
-            return Ok(found.and_then(|e| {
-                let settings = e.arms.iter().find(|(n, _)| *n == arm).map(|(_, s)| s.clone())?;
-                Some(Assignment { experiment_id: e.id, experiment: e.name, arm, settings })
-            }));
+            // Straight from the table: the arm may have been stopped since the match began.
+            let found: Option<(String, String)> = self
+                .conn
+                .query_row("SELECT e.name, a.playbook FROM arms a JOIN experiments e ON e.id = a.experiment_id WHERE a.experiment_id = ?1 AND a.name = ?2", params![exp, arm], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            return Ok(found.map(|(experiment, playbook)| Assignment { experiment_id: exp, experiment, arm, settings: serde_json::from_str(&playbook).unwrap_or(json!({})) }));
         }
 
         self.assign_locked(m, base_playbook, experiments && !ours, ours, now)
