@@ -37,13 +37,15 @@ pub struct Config {
     pub buff_value: f64,
     /// share of the prior that is spread evenly over all turns
     pub even: f32,
-    /// nodes at most this many ticks below the root order forcing turns first
+    /// nodes fewer than this many ticks below the root order forcing turns first
+    /// (0 = off: at 150 ms a move it scored 8 of 18 against 10 of 18 without, so it is
+    /// off until it earns its place)
     pub forcing_depth: u32,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, forcing_depth: 2 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, forcing_depth: 0 }
     }
 }
 
@@ -314,7 +316,7 @@ impl<'a> Search<'a> {
                     for x in 0..2 {
                         self.nodes[node].acts[x] = match (depth, fixed[x]) {
                             (0, Some(t)) => vec![Act { turn: t, prior: 1.0, n: 0, w: 0.0 }],
-                            _ => actions(self.e, &s, x, self.cfg.even, depth <= self.cfg.forcing_depth),
+                            _ => actions(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth),
                         };
                     }
                     if depth > 0 {
