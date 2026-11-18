@@ -17,6 +17,7 @@ mkdir -p "$rel/playbooks"
 cp target/release/marshal "$rel/marshal"
 cp playbooks/default.json "$rel/playbooks/default.json"
 echo "$version" > "$rel/VERSION"
+touch "$rel/fleet"   # this build accepts the fleet reporting flags (see tools/live.sh)
 echo "froze $rel"
 [ "$1" = "--no-switch" ] && exit 0
 ln -sfn "field-marshal-$version-$sha" ../data/releases/field-marshal-current
