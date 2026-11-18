@@ -8,6 +8,9 @@
     <string>/Users/clara/Projects/victris/field-marshal/tools/live.sh</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/clara/Projects/victris</string>
+  <!-- Interactive: without this launchd runs the bot at background priority, and every
+       reply reaches the ladder 130 to 180 ms late (measured 2026-11-18). -->
+  <key>ProcessType</key><string>Interactive</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ThrottleInterval</key><integer>30</integer>

@@ -118,6 +118,10 @@ pub struct Playbook {
     /// highly (`dash_cost`), but the ladder's best spend theirs freely to dash in and
     /// fire, so their price can be set lower.
     pub their_dash_cost: f64,
+    /// how often the opponent's reactive dodge of a shot already in the air succeeds, in
+    /// rollouts and plans. 1 = always (the old assumption). Replays of the top twelve put
+    /// it near 0.2 for a target whose step was spent when the shot left.
+    pub dodge_prob: f64,
     /// plan search: ticks looked ahead along our own plans against the opponent model
     /// (0 or 1 = off)
     pub plan_depth: u32,
@@ -187,6 +191,7 @@ impl Default for Playbook {
             think_ms: 0,
             threads: 1,
             hard_ms: 250,
+            dodge_prob: 1.0,
             plan_depth: 0,
             plan_width: 12,
             plan_margin: 2.0,
@@ -238,6 +243,7 @@ impl Playbook {
         f("press_bonus", &mut p.press_bonus);
         f("prior_weight", &mut p.prior_weight);
         f("their_dash_cost", &mut p.their_dash_cost);
+        f("dodge_prob", &mut p.dodge_prob);
         f("plan_margin", &mut p.plan_margin);
         f("plan_solve_weight", &mut p.plan_solve_weight);
         f("plan_fire_cost", &mut p.plan_fire_cost);
@@ -448,6 +454,12 @@ fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
             }
         }
         if any {
+            // A reactive dodge is not certain. Replays show a target whose step was spent
+            // when the shot left still gets hit about four times in five, so the damage
+            // the opponent side-stepped here is credited at the rate it really lands.
+            if dodge[1 - me].mv != plan[1 - me].mv {
+                v += (1.0 - pb.dodge_prob) * sum.hp_lost[1 - me] as f64;
+            }
             s = base;
             e.step(&mut s, &dodge);
             *sims += 1;
@@ -531,7 +543,8 @@ fn quick_turn(e: &Engine, s: &State, x: usize) -> RawTurn {
 /// out of our frostburst while it can, steps out of anything else about to hit it, and
 /// otherwise keeps its step in hand. Simple on purpose; the plan search is only trusted
 /// among turns the game solve already rates as safe.
-fn model_turn(e: &Engine, s: &State, x: usize, sims: &mut u32) -> RawTurn {
+fn model_turn(e: &Engine, s: &State, x: usize, avoided: &mut i32, sims: &mut u32) -> RawTurn {
+    *avoided = 0;
     let mut t = quick_turn(e, s, x);
     let f = &s.fighters[x];
     if f.state != FState::Idle || f.cd_move != 0 || t.mv != victris_engine::turn::DirIn::None {
@@ -562,7 +575,8 @@ fn model_turn(e: &Engine, s: &State, x: usize, sims: &mut u32) -> RawTurn {
     // About to be hit by something in flight: step aside if a step avoids it.
     let turns = |mine: RawTurn| if x == 0 { [mine, RawTurn::IDLE] } else { [RawTurn::IDLE, mine] };
     let mut probe = *s;
-    let hit = e.step(&mut probe, &turns(t)).hp_lost[x] > 0;
+    let would_lose = e.step(&mut probe, &turns(t)).hp_lost[x];
+    let hit = would_lose > 0;
     *sims += 1;
     if hit {
         for d in 0..8u8 {
@@ -575,6 +589,7 @@ fn model_turn(e: &Engine, s: &State, x: usize, sims: &mut u32) -> RawTurn {
             let lost = e.step(&mut trial, &turns(alt)).hp_lost[x];
             *sims += 1;
             if lost == 0 {
+                *avoided = would_lose;
                 return alt;
             }
         }
@@ -650,10 +665,13 @@ fn plan_value(e: &Engine, s: &State, me: usize, first: RawTurn, pb: &Playbook, k
         v
     };
     let mut first_state = *s;
-    let reply = model_turn(e, s, 1 - me, sims);
+    let mut avoided = 0;
+    let reply = model_turn(e, s, 1 - me, &mut avoided, sims);
     e.step(&mut first_state, &turns(first, reply));
     *sims += 1;
-    let mut beam: Vec<(f64, f64, State)> = vec![(score(&first_state, 0.0), 0.0, first_state)]; // (score, cost so far, state)
+    // Damage the modelled opponent side-stepped counts at the rate such dodges fail (a negative cost).
+    let credit = -(1.0 - pb.dodge_prob) * avoided as f64;
+    let mut beam: Vec<(f64, f64, State)> = vec![(score(&first_state, credit), credit, first_state)]; // (score, cost so far, state)
     let mut best = beam[0].0;
     let mut options: Vec<(RawTurn, f64)> = Vec::with_capacity(32);
     let mut next: Vec<(f64, f64, State)> = Vec::with_capacity(512);
@@ -664,13 +682,15 @@ fn plan_value(e: &Engine, s: &State, me: usize, first: RawTurn, pb: &Playbook, k
                 next.push((score(st, *cost), *cost, *st));
                 continue;
             }
-            let reply = model_turn(e, st, 1 - me, sims);
+            let mut avoided = 0;
+            let reply = model_turn(e, st, 1 - me, &mut avoided, sims);
+            let credit = -(1.0 - pb.dodge_prob) * avoided as f64;
             plan_options(e, st, me, k, pb, &mut options);
             for (mine, c) in &options {
                 let mut child = *st;
                 e.step(&mut child, &turns(*mine, reply));
                 *sims += 1;
-                let total = cost + c;
+                let total = cost + c + credit;
                 next.push((score(&child, total), total, child));
             }
         }

@@ -1,0 +1,10 @@
+{
+  "name": "calibrated-shots",
+  "note": "Workstream 1 of the field-marshal plan. shotstats over 1,602 replays: the top twelve fire at a target whose step is spent (or that cannot act) at 3 to 6 tiles on 36-52% of such ticks, hit 53-86% of the time and come out 1.3 to 5.8 hp ahead of holding; field-marshal fires on only 14-36% of them. The search holds fire because it assumes a shot already in the air is always side-stepped; in the replays that dodge succeeds about one time in five. This arm credits dodged damage at the rate it really lands (dodge_prob 0.25 instead of 1). In habits it takes most of the top bots' shots at stuck targets at 3-6 tiles (70% agreement at 3-4, 62-66% at 5+) and it went 11W 1L in the local gauntlet with the slowest reply at 204 ms. Needs a release at or after the commit that adds dodge_prob. Every opponent, balanced by opponent, map and seat.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "calibrated-shots": { "dodge_prob": 0.25 }
+  }
+}
