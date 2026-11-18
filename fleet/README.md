@@ -188,6 +188,11 @@ after 100 games (control's games over the arm's own time), or three standard err
 the baseline that `plan show` prints after 30 games, provided it is also behind control. A
 stopped arm keeps its games, and the remaining arms share evenly from then on.
 
+A game in which our bot lost five or more turns to the connection (the server charged the
+full 1000 ms) is left out of `plan show`, of `fleet stats --experiment`, and of the early
+stop: it tests the connection, not the playbook. `plan show` prints how many were left out
+per arm; `--with-lost` puts them back. The quota still counts every game.
+
 `plan show` reads each arm against a baseline over the arm's own time: the control arm, plus
 games of our bots outside any experiment that played the default playbook. The default file
 can play more than one named playbook (matrix-5, and matrix-6 against bots rated 2250 and

@@ -15,7 +15,7 @@
 //!   fleet ingest [bot ...]                        read marshal logs into the store
 //!
 //!   fleet plan list | show <name> | add <file.json> | pause <name> | resume <name> | stop <name>
-//!   fleet plan show <name> [--since 90m|04:45|<epoch>] [--baseline-playbook matrix-5,matrix-6] [--control-only]
+//!   fleet plan show <name> [--since 90m|04:45|<epoch>] [--baseline-playbook matrix-5,matrix-6] [--control-only] [--with-lost]
 //!                                                 arms, and each arm against the default playbook over the arm's own time, by opponent rating
 //!   fleet plan add-arm <name> <arm> '<settings json>' | stop-arm <name> <arm> [--reason text] | resume-arm <name> <arm> | rebalance <name> | quota <name> <games>
 //!   fleet epoch add <name> <time> [--note text] | list        named moments, usable wherever --since is
@@ -59,7 +59,7 @@ struct Args {
 }
 
 /// Flags that take no value.
-const SWITCHES: [&str; 9] = ["--all", "--no-tests", "--ours", "--not-ours", "--count", "--experiments", "--json", "--rebuild", "--control-only"];
+const SWITCHES: [&str; 10] = ["--all", "--no-tests", "--ours", "--not-ours", "--count", "--experiments", "--json", "--rebuild", "--control-only", "--with-lost"];
 
 impl Args {
     fn parse(raw: &[String]) -> Args {
@@ -243,7 +243,25 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
             if let Some(t) = from {
                 println!("counting games started {} or later", ago(Some(t)));
             }
-            let f = Filter { experiment: Some(name.to_string()), since_ms: from, ..Filter::default() };
+            // Games played on a broken connection (five or more of our turns charged the
+            // full second) are left out of every table below; `--with-lost` puts them back.
+            let clean = !a.has("--with-lost");
+            let lost_sql = if clean { format!(" AND {}", fleet::stats::CLEAN_SQL) } else { String::new() };
+            let f = Filter { experiment: Some(name.to_string()), since_ms: from, clean, ..Filter::default() };
+            if clean {
+                let mut q = store
+                    .conn
+                    .prepare("SELECT arm, COUNT(*), SUM(result = 'loss') FROM matches WHERE experiment_id = ?1 AND result IS NOT NULL AND voided = 0 AND started_ms >= ?2 AND COALESCE(lost_turns, 0) >= ?3 GROUP BY arm ORDER BY arm")
+                    .map_err(e)?;
+                let out: Vec<String> = q
+                    .query_map(rusqlite::params![x.id, from.unwrap_or(0), fleet::stats::LOST_TURNS_LINE], |r| Ok(format!("{} {} ({} lost)", r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
+                    .map_err(e)?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                if !out.is_empty() {
+                    println!("\nleft out, games where we lost {} or more turns to the connection (--with-lost counts them): {}", fleet::stats::LOST_TURNS_LINE, out.join(", "));
+                }
+            }
             print!("\n{}", table("arm", &store.records("arm", &f).map_err(e)?));
             // Each arm against the default playbook's games from that arm's own first game on,
             // so an arm that joined late is not compared with games played in other times.
@@ -269,7 +287,7 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                     .conn
                     .prepare(&format!(
                         "SELECT {BAND}, SUM(result = 'win'), SUM(result = 'loss'), SUM(result NOT IN ('win', 'loss')), COALESCE(AVG(final_tick), 0)
-                         FROM matches WHERE result IS NOT NULL AND voided = 0 AND {clause} GROUP BY 1"
+                         FROM matches WHERE result IS NOT NULL AND voided = 0{lost_sql} AND {clause} GROUP BY 1"
                     ))
                     .map_err(e)?;
                 let rows = q
@@ -366,7 +384,7 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                         "SELECT arm, {BAND}, COUNT(*),
                                 SUM(COALESCE(json_extract(detail, '$.damage.\"pickup:mine:power\"'), 0)), SUM(COALESCE(json_extract(detail, '$.damage.\"pickup:theirs:power\"'), 0)),
                                 SUM(COALESCE(json_extract(detail, '$.damage.\"pickup:mine:health\"'), 0)), SUM(COALESCE(json_extract(detail, '$.damage.\"pickup:theirs:health\"'), 0))
-                         FROM matches WHERE experiment_id = ?1 AND result IS NOT NULL AND voided = 0 AND detail IS NOT NULL AND started_ms >= ?2 GROUP BY 1, 2 ORDER BY 1"
+                         FROM matches WHERE experiment_id = ?1 AND result IS NOT NULL AND voided = 0 AND detail IS NOT NULL AND started_ms >= ?2{lost_sql} GROUP BY 1, 2 ORDER BY 1"
                     ))
                     .map_err(e)?;
                 let rows: Vec<(String, String, i64, [f64; 4])> = q
@@ -853,7 +871,12 @@ fn main_inner() -> Result<i32, String> {
                 since_ms: a.get("--since").or(a.get("--epoch")).map(|t| when(&store, t)).transpose()?,
                 no_ours: !a.has("--all"),
                 min_opponent_rating: a.num("--min-opp-rating")?,
+                // An experiment's games are read the way `plan show` reads them.
+                clean: a.get("--experiment").is_some() && !a.has("--with-lost"),
             };
+            if f.clean {
+                println!("games where we lost {} or more turns to the connection are left out (--with-lost counts them)", fleet::stats::LOST_TURNS_LINE);
+            }
             let by = a.get("--by").unwrap_or("version");
             if fleet::stats::group_column(by).is_none() {
                 return Err(format!("--by takes opponent, version, release, playbook, arm, arm-tier, arm-remote, remote, connection, map, seat, bot, cell or all; got '{by}'"));

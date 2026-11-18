@@ -160,7 +160,7 @@ impl Autopilot {
                     .query_row("SELECT MIN(started_ms) FROM matches WHERE experiment_id = ?1 AND arm = ?2 AND result IS NOT NULL", rusqlite::params![e.id, arm], |r| r.get(0))
                     .map_err(|e| e.to_string())?;
                 let Some(t0) = first else { continue };
-                let rows = store.records("arm", &crate::stats::Filter { experiment: Some(e.name.clone()), since_ms: Some(t0), ..Default::default() }).map_err(|e| e.to_string())?;
+                let rows = store.records("arm", &crate::stats::Filter { experiment: Some(e.name.clone()), since_ms: Some(t0), clean: true, ..Default::default() }).map_err(|e| e.to_string())?;
                 let rec = |n: &str| rows.iter().find(|r| r.key == n).map(|r| r.record).unwrap_or_default();
                 let (r, control) = (rec(arm), rec("control"));
                 // The fast rule: an arm that is three standard errors behind the baseline
@@ -175,7 +175,7 @@ impl Autopilot {
                         .conn
                         .query_row(
                             "SELECT COALESCE(SUM(result = 'win'), 0), COALESCE(SUM(result = 'loss'), 0), COALESCE(SUM(result NOT IN ('win', 'loss')), 0) FROM matches
-                             WHERE result IS NOT NULL AND voided = 0 AND started_ms >= ?3
+                             WHERE result IS NOT NULL AND voided = 0 AND started_ms >= ?3 AND COALESCE(lost_turns, 0) < 5
                                AND ((experiment_id = ?1 AND arm = 'control') OR (experiment_id IS NULL AND playbook IN (SELECT value FROM json_each(?2)) AND opponent_ours = 0
                                     AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(?4) WHERE matches.opponent GLOB value))))",
                             rusqlite::params![e.id, names, t0, crate::plan::opponents_filter(&e.opponents)],

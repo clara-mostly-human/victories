@@ -103,7 +103,16 @@ pub struct Filter {
     pub no_ours: bool,
     /// only opponents rated at least this (games whose opponent rating is unknown are left out)
     pub min_opponent_rating: Option<f64>,
+    /// leave out games in which our bot lost `LOST_TURNS_LINE` or more turns to the
+    /// connection: they test the connection, not the playbook
+    pub clean: bool,
 }
+
+/// A game where the server charged the full 1000 ms for this many of our turns was played
+/// on a broken connection and is left out of experiment readings (`Filter::clean`).
+pub const LOST_TURNS_LINE: i64 = 5;
+/// The same rule as a piece of SQL for hand-written queries on `matches`.
+pub const CLEAN_SQL: &str = "COALESCE(lost_turns, 0) < 5";
 
 impl Filter {
     fn sql(&self) -> (String, Vec<Sql>) {
@@ -138,6 +147,10 @@ impl Filter {
         }
         if self.no_ours {
             w.push_str(" AND opponent_ours = 0");
+        }
+        if self.clean {
+            w.push_str(" AND ");
+            w.push_str(CLEAN_SQL);
         }
         (w, p)
     }
