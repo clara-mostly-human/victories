@@ -1,0 +1,10 @@
+{
+  "name": "rush-mbot",
+  "note": "Workstream 4 of the field-marshal plan, first per-opponent playbook. house-mbot (rated about 2440) has beaten the scouts 13 times out of 13 since the connection fix and field-marshal in all 7 corpus games. In the replay corpus it loses 9 of 15 to the im-lost-explorer family (rated about 2100) and 0 of 4 to sir-robin in games of 57 to 70 ticks: first hit at tick 13, about 34 wall-slam damage and 2.4 stuns in under 60 ticks, an immediate rush to close range. Our losses to it last 205 ticks; it dashes 11 times to our 5 and fires 20 shots to our 12. Hypothesis: against house-mbot, closing to slam range at once beats standing off. The arm moves our preferred range from 3.5 to 1.5 tiles and doubles its weight, prices our dash at 4 instead of 10, halves the fear of being slammed, and rewards closing while its shot is spent. Restricted to house-mbot, so it only uses the games the scouts are given against it; the baseline there is 0 wins, so even a few wins in 15 games is a clear answer. Predicts: at least 4 wins in 15. If it stays at 0 the style is not the reason.",
+  "opponents": ["house-mbot"],
+  "games_per_arm": 20,
+  "arms": {
+    "control": {},
+    "rush": { "preferred_distance": 1.5, "distance_weight": 0.8, "dash_cost": 4, "slam_risk": 2.5, "press_bonus": 2 }
+  }
+}
