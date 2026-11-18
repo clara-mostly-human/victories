@@ -47,7 +47,7 @@ impl Playbooks {
     pub fn from_json(v: &Value) -> Playbooks {
         let mut p = Playbooks::default();
         if let Some(d) = v.get("default") {
-            p.default = Playbook::from_json(d.get("name").and_then(Value::as_str).unwrap_or("safe-2"), d);
+            p.default = Playbook::from_json(d.get("name").and_then(Value::as_str).unwrap_or("matrix-1"), d);
         }
         if let Some(o) = v.get("opponents").and_then(Value::as_object) {
             for (opponent, settings) in o {

@@ -117,11 +117,13 @@ independently of the transport, so the path tested locally is the path used on t
   opponent's shot flying into view, and pads that were out of sight. Hidden even in view are the
   opponent's step and weapon cooldowns; the tracker infers them from what it saw. Out of view,
   it keeps the set of tiles the opponent could have reached.
-- Safe heuristic (`policy.rs`, default playbook safe-2). Plays every turn it could take against every reply the opponent
-  could make, one tick deep on the exact engine, and keeps the best worst case. It fires only
-  shots that land whatever the opponent does (or nearly), plans its way out of anything already
-  in the air over a frostburst's whole fuse, and stays clear of walls when a repulsor could
-  reach. About 0.1 ms a tick. It is a placeholder for the search.
+- Policy (`policy.rs`, default playbook matrix-1). A heuristic gives every turn its own merits:
+  staying in the zone, getting out of what is already in the air (planned over a frostburst's
+  whole fuse), keeping off walls a repulsor could reach, taking cheap pickups. With the opponent
+  in view the exchange is then solved as a matrix game: each of our turns against each movement
+  the opponent could make, played on the exact engine and four ticks on, solved by regret
+  matching. Out of view it takes the turn with the best worst case (the heuristic alone is
+  playbook safe-2). About 0.2 ms a tick, so nearly the whole clock is still unused.
 - Playbooks. Every number in the heuristic is a field of `Playbook`. `playbooks/default.json`
   names a default and per-opponent overrides; the playbook is chosen from the opponent's name in
   `hello` and written to the log with every match.
@@ -138,15 +140,15 @@ independently of the transport, so the path tested locally is the path used on t
 The gauntlet runs the real binary over a real WebSocket, with the official simulator's match
 core as the server, and can attach the true state to every observation (`--truth`).
 
-| Opponent | First settings (safe-1), 30 games each | Tuned settings (safe-2), 20 games each |
-| --- | --- | --- |
-| random (house) | 30 won, 0 lost | 20 won, 0 lost |
-| ts-starter (house) | 28 won, 2 lost | 20 won, 0 lost |
-| foot-soldier v1 | 28 won, 2 lost | 19 won, 1 lost |
-| foot-soldier v2 (ranked 67th on the ladder) | 16 won, 13 lost, 1 drawn | 14 won, 5 lost, 1 drawn |
+| Opponent | safe-1 (first heuristic), 30 games each | safe-2 (tuned), 20 each | matrix-1 (search), 20 each |
+| --- | --- | --- | --- |
+| random (house) | 30 won, 0 lost | 20 won, 0 lost | 20 won, 0 lost |
+| ts-starter (house) | 28 won, 2 lost | 20 won, 0 lost | 20 won, 0 lost |
+| foot-soldier v1 | 28 won, 2 lost | 19 won, 1 lost | 20 won, 0 lost |
+| foot-soldier v2 (ranked 67th on the ladder) | 16 won, 13 lost, 1 drawn | 14 won, 5 lost, 1 drawn | 17 won, 3 lost |
 
 No timeouts, no refused frames, no rejected turn parts, no panics in any run. Decision time:
-median 0.1 ms, worst 1.0 ms.
+median 0.1 to 0.2 ms, worst 6 ms.
 
 Tracking over the 120 safe-1 games: 37,082 ticks, zero prediction mismatches. The tracker's
 own fighter always equalled the truth. With the opponent in view the whole state equalled the
@@ -166,6 +168,12 @@ rounds of combining the winners produced safe-2, which beats safe-1 92% to 8% in
 carried over to the local opponents above. The biggest gains were dashing far less and not
 discounting a turn for what the opponent might do if it guessed our tile. Self-play can
 mislead, so every arena gain is confirmed against other bots before it ships.
+
+The first search, matrix-1, beats safe-2 92% to 8% over 600 arena games. Two results from
+building it need revisiting against stronger opponents: giving the opponent its attacks as
+options made the search far too timid (39% against safe-2 instead of 90%), and sampling from
+the mixed strategy did a little worse than always playing its most likely turn (84% against
+90%). Both are playbook switches (`model_attacks`, `sample`).
 
 ```sh
 target/release/arena --pairs 300 --seed 1 --a candidate.json        # 1,800 games against the default
@@ -201,7 +209,8 @@ Registering, enrolling or retiring bots changes the ladder account and needs Mik
    5,000 has to be a slow trickle (`tools/grow-corpus.py`), not a sweep.
 2. Client, state tracker and a safe heuristic. Built and tested locally. Left: 50 ladder games
    with no timeouts and no prediction mismatches, which needs a registered bot.
-3. Matrix search, time manager and self-play arena. The arena exists; the search and the time
-   manager are next.
+3. Matrix search, time manager and self-play arena. The arena and a first one-tick search exist.
+   Next: use the clock (the search takes 0.2 ms of a 600 ms allowance), which means deeper
+   lookahead and a time manager, and an opponent model that makes modelling attacks pay.
 4. Simultaneous-move MCTS, parallel search and tuned evaluation.
 5. Opponent models and the five-bot matchup-testing loop.

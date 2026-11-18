@@ -1,14 +1,18 @@
-//! The safe heuristic: the step-2 policy, a placeholder for the search.
+//! The policy: a one-tick matrix search over a safe heuristic.
 //!
-//! It plays every turn it could take against every reply the opponent could make, one
-//! tick deep, on the exact engine, and keeps the turn with the best worst case. Around
-//! that it follows the pattern the ladder's leaders show: hold fire unless the shot is
-//! sure to land, keep the step in hand near the opponent, stay off walls when a repulsor
-//! could reach, stay inside the zone, and take pickups when they are cheap.
+//! Every turn we could take is given its own merits by the heuristic: staying inside the
+//! zone, getting out of what is already in the air (planned over a frostburst's whole
+//! fuse), keeping off walls a repulsor could slam us into, taking pickups when they are
+//! cheap. With the opponent in view the exchange itself is then solved as a matrix game:
+//! each of our turns against each movement the opponent could make, played on the exact
+//! engine and a few ticks on, solved by regret matching (playbook "matrix-1"). Out of
+//! view, or with `search` off, the turn with the best worst case is taken ("safe-2").
 //!
 //! All numbers live in [`Playbook`], so a playbook for a named opponent can change them.
-//! The defaults ("safe-2") were tuned in the arena: against the first hand-set values
-//! they score 92% over 1,800 games, and locally they beat foot-soldier v2 14 to 5.
+//! They were tuned in the arena and then confirmed against other bots. Two findings are
+//! built into the defaults and deserve suspicion later, against stronger opponents: the
+//! search does not model the opponent's attacks (doing so made it far too timid against
+//! everything tried so far), and it plays its most likely turn instead of sampling.
 
 use crate::tracker::Tracker;
 use serde_json::Value;
@@ -51,12 +55,23 @@ pub struct Playbook {
     pub incoming_weight: f64,
     /// cost of stepping within four tiles of an opponent whose shot is ready
     pub step_cost_under_fire: f64,
+    /// choose turns by solving the tick as a matrix game (our turns against theirs)
+    /// instead of taking the best worst case; only used while the opponent is in view
+    pub search: bool,
+    /// ticks each cell of the matrix is played forward, both sides only dodging
+    pub rollout_ticks: i32,
+    /// search: include the opponent's attacks among its options
+    pub model_attacks: bool,
+    /// search: play from the mixed strategy (true) or always its most likely turn (false)
+    pub sample: bool,
+    /// search: consider shots aimed where the opponent could step
+    pub lead_shots: bool,
 }
 
 impl Default for Playbook {
     fn default() -> Self {
         Playbook {
-            name: "safe-2".into(),
+            name: "matrix-1".into(),
             fire_cost: 3.0,
             repulsor_cost: 1.0,
             frost_cost: 0.5,
@@ -72,6 +87,11 @@ impl Default for Playbook {
             health_pad_missing_hp: 10,
             incoming_weight: 1.0,
             step_cost_under_fire: 0.3,
+            search: true,
+            rollout_ticks: 4,
+            model_attacks: false,
+            sample: false,
+            lead_shots: true,
         }
     }
 }
@@ -101,6 +121,17 @@ impl Playbook {
         f("step_cost_under_fire", &mut p.step_cost_under_fire);
         if let Some(x) = v.get("health_pad_missing_hp").and_then(Value::as_i64) {
             p.health_pad_missing_hp = x as i32;
+        }
+        if let Some(x) = v.get("search").and_then(Value::as_bool) {
+            p.search = x;
+        }
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots)] {
+            if let Some(x) = v.get(key).and_then(Value::as_bool) {
+                *slot = x;
+            }
+        }
+        if let Some(x) = v.get("rollout_ticks").and_then(Value::as_i64) {
+            p.rollout_ticks = x as i32;
         }
         p
     }
@@ -194,6 +225,130 @@ fn outcome(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Pla
         k += 1;
     }
     v
+}
+
+/// One cell of the matrix game: both turns played on the exact engine, then a few ticks
+/// in which each side only steps out of what would hit it. The value is hp taken from
+/// the opponent minus hp lost, with a bonus for stuns and a large one for a kill.
+fn cell_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Playbook, sims: &mut u32) -> f64 {
+    let mut s = *before;
+    e.step(&mut s, turns);
+    *sims += 1;
+    let (my0, en0) = (before.fighters[me], before.fighters[1 - me]);
+    let mut v = 0.0;
+    if s.fighters[1 - me].state == FState::Stunned && en0.state != FState::Stunned {
+        v += pb.stun_bonus;
+    }
+    if s.fighters[me].state == FState::Stunned && my0.state != FState::Stunned {
+        v -= pb.stun_bonus;
+    }
+    for _ in 0..pb.rollout_ticks {
+        if s.result.is_some() {
+            break;
+        }
+        let base = s;
+        let sum = e.step(&mut s, &[RawTurn::IDLE, RawTurn::IDLE]);
+        *sims += 1;
+        if sum.hp_lost == [0, 0] {
+            continue;
+        }
+        // Someone would be hit standing still: let whoever can step look for a way out.
+        let mut dodge = [RawTurn::IDLE, RawTurn::IDLE];
+        let mut any = false;
+        for x in 0..2 {
+            let f = &base.fighters[x];
+            if sum.hp_lost[x] == 0 || f.state != FState::Idle || f.cd_move != 0 {
+                continue;
+            }
+            for d in 0..8u8 {
+                if e.map.step_blocked(f.pos, d) {
+                    continue;
+                }
+                let mut trial = base;
+                let mut t2 = dodge;
+                t2[x] = RawTurn::step(d);
+                let r = e.step(&mut trial, &t2);
+                *sims += 1;
+                if r.hp_lost[x] == 0 {
+                    dodge[x] = RawTurn::step(d);
+                    any = true;
+                    break;
+                }
+            }
+        }
+        if any {
+            s = base;
+            e.step(&mut s, &dodge);
+            *sims += 1;
+        }
+    }
+    v += (en0.hp - s.fighters[1 - me].hp) as f64 - (my0.hp - s.fighters[me].hp) as f64;
+    if !s.fighters[1 - me].alive {
+        v += 1000.0;
+    }
+    if !s.fighters[me].alive {
+        v -= 1000.0;
+    }
+    v
+}
+
+/// Solves a zero-sum matrix game by regret matching. `a[m * cols + e]` is the row
+/// player's payoff. Returns the row player's average strategy and the game's value.
+fn solve_matrix(a: &[f64], rows: usize, cols: usize, iters: usize) -> (Vec<f64>, f64) {
+    let mut rr = vec![0.0f64; rows];
+    let mut rc = vec![0.0f64; cols];
+    let mut avg_r = vec![0.0f64; rows];
+    let mut avg_c = vec![0.0f64; cols];
+    let mut sr = vec![0.0f64; rows];
+    let mut sc = vec![0.0f64; cols];
+    let mut ur = vec![0.0f64; rows];
+    let mut uc = vec![0.0f64; cols];
+    let strategy = |regret: &[f64], out: &mut [f64]| {
+        let total: f64 = regret.iter().sum();
+        if total > 0.0 {
+            for (o, r) in out.iter_mut().zip(regret) {
+                *o = r / total;
+            }
+        } else {
+            out.fill(1.0 / regret.len() as f64);
+        }
+    };
+    for it in 0..iters {
+        strategy(&rr, &mut sr);
+        strategy(&rc, &mut sc);
+        ur.fill(0.0);
+        uc.fill(0.0);
+        for m in 0..rows {
+            let row = &a[m * cols..(m + 1) * cols];
+            let mut u = 0.0;
+            for e in 0..cols {
+                u += sc[e] * row[e];
+                uc[e] += sr[m] * row[e];
+            }
+            ur[m] = u;
+        }
+        let v: f64 = sr.iter().zip(&ur).map(|(p, u)| p * u).sum();
+        let w = (it + 1) as f64; // later iterations count for more
+        for m in 0..rows {
+            rr[m] = (rr[m] + ur[m] - v).max(0.0);
+            avg_r[m] += w * sr[m];
+        }
+        for e in 0..cols {
+            rc[e] = (rc[e] + v - uc[e]).max(0.0);
+            avg_c[e] += w * sc[e];
+        }
+    }
+    let tr: f64 = avg_r.iter().sum();
+    let tc: f64 = avg_c.iter().sum();
+    avg_r.iter_mut().for_each(|x| *x /= tr);
+    avg_c.iter_mut().for_each(|x| *x /= tc);
+    let mut value = 0.0;
+    for m in 0..rows {
+        for e in 0..cols {
+            value += avg_r[m] * avg_c[e] * a[m * cols + e];
+        }
+    }
+    (avg_r, value)
 }
 
 pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
@@ -336,6 +491,10 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
         (noise_state % 1000) as f64 / 1000.0 * 0.05
     };
     let turns = |mine: RawTurn, theirs: RawTurn| if me == 0 { [mine, theirs] } else { [theirs, mine] };
+    // With the search on and the opponent in view, turns are collected here and chosen
+    // together as a matrix game: (turn, its own merits apart from the exchange, label).
+    let matrix = pb.search && visible;
+    let mut cands: Vec<(RawTurn, f64, &'static str)> = Vec::new();
 
     for (mv, dest, kind) in &moves {
         // Static terms for the tile we would end on.
@@ -439,6 +598,21 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
                 Atk::Repulsor => (mv.with_burst(k.repulsor.unwrap()), pb.repulsor_cost, 0.0, "repulsor"),
                 Atk::Frost => (mv.with_attack(k.frost.unwrap().0, en.pos), pb.frost_cost, pb.frost_value, "frostburst"),
             };
+            if matrix {
+                cands.push((mine, place - cost + bonus, note));
+                // Standing still, a shot can also lead the opponent: aim where it could step.
+                if pb.lead_shots && *atk == Atk::Ranged && *kind == 0 && en.state == FState::Idle && en.cd_move == 0 {
+                    for d in 0..8u8 {
+                        if !e.map.step_blocked(en.pos, d) {
+                            let aim = add(en.pos, DIR_VEC[d as usize]);
+                            if aim != *dest {
+                                cands.push((mv.with_attack(k.ranged.unwrap(), aim), place - cost, "lead shot"));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             // Worst and average over the opponent's movements, with it not attacking.
             let (mut worst, mut sum) = (f64::MAX, 0.0);
             for r in &replies {
@@ -466,6 +640,62 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
                 best = Some((score, mine, note));
             }
         }
+    }
+    if matrix && !cands.is_empty() {
+        // The opponent's options: every movement we believe it has, alone or with an
+        // attack; and, standing still, a shot at each tile we could end on.
+        let mut theirs: Vec<(RawTurn, f64)> = Vec::new(); // (turn, what it costs them)
+        let en_frost = k.frost.filter(|(a, range)| en.state == FState::Idle && en.cd_attack[*a as usize] == 0 && dist_now <= *range);
+        for r in &replies {
+            let moved = if matches!(r.dash, victris_engine::turn::DirIn::Dir(_)) { pb.dash_cost } else { 0.0 };
+            theirs.push((*r, moved));
+            if en_ranged && pb.model_attacks {
+                theirs.push((r.with_attack(k.ranged.unwrap(), my.pos), moved + pb.fire_cost));
+            }
+            if en_repulsor && pb.model_attacks && dist_now <= 3 {
+                theirs.push((r.with_burst(k.repulsor.unwrap()), moved + pb.repulsor_cost));
+            }
+        }
+        if en_ranged && pb.model_attacks {
+            for (_, dest, kind) in &moves {
+                if *kind == 1 {
+                    theirs.push((RawTurn::IDLE.with_attack(k.ranged.unwrap(), *dest), pb.fire_cost));
+                }
+            }
+        }
+        if let Some((a, _)) = en_frost.filter(|_| pb.model_attacks) {
+            theirs.push((RawTurn::IDLE.with_attack(a, my.pos), pb.frost_cost - pb.frost_value));
+        }
+        let (rows, cols) = (cands.len(), theirs.len());
+        let mut payoff = vec![0.0f64; rows * cols];
+        for (m, (mine, merit, _)) in cands.iter().enumerate() {
+            for (c, (reply, their_cost)) in theirs.iter().enumerate() {
+                payoff[m * cols + c] = cell_value(e, &s, me, &turns(*mine, *reply), pb, &mut sims) + merit + their_cost;
+            }
+        }
+        let (mut mix, value) = solve_matrix(&payoff, rows, cols, 300);
+        // Play from the mixed strategy, ignoring the tail regret matching leaves behind.
+        let top = mix.iter().cloned().fold(0.0, f64::max);
+        mix.iter_mut().for_each(|p| {
+            if *p < 0.05_f64.min(top) {
+                *p = 0.0
+            }
+        });
+        let total: f64 = mix.iter().sum();
+        let mut roll = noise() / 0.05 * total;
+        let mut pick = rows - 1;
+        if pb.sample {
+            for (m, p) in mix.iter().enumerate() {
+                if roll < *p {
+                    pick = m;
+                    break;
+                }
+                roll -= p;
+            }
+        } else {
+            pick = (0..rows).max_by(|a, b| mix[*a].partial_cmp(&mix[*b]).unwrap()).unwrap_or(0);
+        }
+        return Decision { turn: cands[pick].0, sims, score: value, note: cands[pick].2 };
     }
     match best {
         Some((score, turn, note)) => Decision { turn, sims, score, note },
