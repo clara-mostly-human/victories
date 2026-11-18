@@ -385,9 +385,9 @@ impl Shared {
         if q.first().map(|w| w.bot != bot).unwrap_or(true) {
             return None;
         }
-        if self.recent_resets() >= 2 {
-            return None;
-        }
+        // (Rotation does not wait for a quiet spell any more: on 2026-11-18 the ladder reset
+        // a socket about every 40 seconds, so the bots never rotated and stayed on slow
+        // sockets, which lost three times as many turns. The cap and the gap keep it polite.)
         if let Some(until) = *self.replace_suspended.lock().unwrap_or_else(|p| p.into_inner()) {
             if Instant::now() < until {
                 return None;
@@ -430,22 +430,9 @@ impl Shared {
             }
         }
         let resets = self.recent_resets();
-        if resets >= 2 {
-            // Until the last two resets are more than two minutes old.
-            let r = self.resets.lock().unwrap_or_else(|p| p.into_inner());
-            let second_last = r.iter().rev().nth(1).copied();
-            drop(r);
-            if let Some(t) = second_last {
-                let until = t + Duration::from_secs(120);
-                if until > open {
-                    open = until;
-                }
-            }
-            waiting_for = "a quiet spell: the ladder is resetting our connections, and each reconnect is already a new socket";
-        }
         let eta = open.max(now) + self.opt.replace_gap * pos as u32;
         json!({
-            "scheduled": true, "position": pos + 1, "queue_length": q.len(), "reason": w.reason, "since_ms": w.since_ms,
+            "scheduled": true, "position": pos + 1, "queue_length": q.len(), "reason": w.reason, "since_ms": w.since_ms, "resets_last_2_min": resets,
             "waiting_s": w.since.elapsed().as_secs(), "waiting_for": waiting_for,
             "eta_ms": now_ms() + eta.saturating_duration_since(now).as_millis() as i64,
         })
