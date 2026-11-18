@@ -7,6 +7,7 @@
 //!   fleet uninstall <bot> | watch | collector | online | autopilot | status | gateway
 //!   fleet stop <bot> | resume <bot> | restart <bot>
 //!   fleet deploy <bot> <release> [--version vN] [--force "<reason>"]
+//!   fleet label <bot> <vN> [--release r]          the version label the gateway queues a bot under
 //!
 //!   fleet stats [--by opponent|version|release|playbook|arm|arm-tier|arm-remote|remote|connection|map|seat|bot|cell] [--bot b]
 //!               [--opponent o] [--version v] [--release r] [--experiment e] [--since 24h]
@@ -980,6 +981,23 @@ fn main_inner() -> Result<i32, String> {
             let id = a.word(2, "the release id")?;
             let version = release::deploy(&root, &store, &cfg, bot, id, a.get("--version"), a.get("--force"))?;
             println!("{bot} is set to run {id} as {version}");
+        }
+        "label" => {
+            // The gateway owns every bot's version label on the ladder and takes it from the
+            // store. For a bot the fleet deploys, `deploy` writes it. For one its own thread
+            // runs (the flagship), that thread says so here: `fleet label field-marshal v8`.
+            // The gateway picks it up within a second, between matches, and queues under it.
+            let bot = a.word(1, "the bot's name")?;
+            known(bot)?;
+            let version = a.word(2, "the version label, like v8")?;
+            if !version.starts_with('v') || version[1..].parse::<u32>().is_err() {
+                return Err(format!("a version label is v and a number, like v8; got '{version}'"));
+            }
+            let current = store.bot_state(bot).map_err(e)?;
+            let release = a.get("--release").map(str::to_string).or_else(|| current.as_ref().and_then(|c| c.release.clone())).unwrap_or_else(|| "unmanaged".into());
+            store.set_deployment(bot, &release, version, "label set by the bot's owner").map_err(e)?;
+            store.event(Some(bot), "label", &json!({ "version": version, "release": release }));
+            println!("{bot} queues as {version} (release {release}) from its next match on");
         }
         "stats" => {
             let f = Filter {
