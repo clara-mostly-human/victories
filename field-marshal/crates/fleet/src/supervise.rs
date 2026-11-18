@@ -397,7 +397,12 @@ pub fn plist(label: &str, root: &Path, args: &[String], log: &Path, interval: Op
         Some(s) => format!("  <key>StartInterval</key><integer>{s}</integer>\n  <key>RunAtLoad</key><true/>\n{low}"),
         None if batch => format!("  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ThrottleInterval</key><integer>30</integer>\n{low}"),
         // ExitTimeOut: launchd waits this long after SIGTERM, so a stop lets the match finish.
-        None => "  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ThrottleInterval</key><integer>10</integer>\n  <key>ExitTimeOut</key><integer>960</integer>\n  <key>ProcessType</key><string>Interactive</string>\n".to_string(),
+        // The gateway holds every bot's connection: if it ever dies, launchd must bring it
+        // back at once (a match forgives ten seconds without us, not more).
+        None => format!(
+            "  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n  <key>ThrottleInterval</key><integer>{}</integer>\n  <key>ExitTimeOut</key><integer>960</integer>\n  <key>ProcessType</key><string>Interactive</string>\n",
+            if label.ends_with("fleet-gateway") { 1 } else { 10 }
+        ),
     };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
