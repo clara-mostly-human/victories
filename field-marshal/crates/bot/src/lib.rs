@@ -4,6 +4,7 @@
 //! log and playbook choices; they share this code and the engine.
 
 pub mod arena;
+pub mod fleet_hook;
 pub mod policy;
 pub mod session;
 pub mod tracker;

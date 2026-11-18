@@ -2,10 +2,17 @@
 //!
 //!   marshal --bot <name> [--version v1] [--url wss://victrisarena.com/bot] [--matches N]
 //!           [--playbooks file.json] [--log-dir dir] [--token-file path] [--ladder id]
+//!           [--fleet-db file [--release id] [--experiments] [--ours name,name]]
 //!   marshal --bot <name> --stdio      read server frames on stdin, write replies on stdout (tests)
 //!
 //! The token comes from ARENA_TOKEN, else from --token-file, else from <repo>/bots/<name>.
 //! It is never printed or logged. SIGTERM or Ctrl-C finishes the current match, then exits.
+//!
+//! With --fleet-db every match is written to the fleet's shared results store, and with
+//! --experiments the playbook for a target opponent comes from the fleet's experiment plan.
+//!
+//! Exit codes: 0 done or stopped, 1 a ladder error that reconnecting cannot fix, 2 bad
+//! arguments or no token, 3 another process is already running this bot.
 
 use marshal::session::{Config, Out, Playbooks, Session};
 use std::io::{BufRead, Write};
@@ -28,6 +35,10 @@ struct Args {
     log_dir: Option<PathBuf>,
     token_file: Option<PathBuf>,
     ladder: Option<String>,
+    fleet_db: Option<PathBuf>,
+    release: Option<String>,
+    experiments: bool,
+    ours: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -41,6 +52,10 @@ fn parse_args() -> Result<Args, String> {
         log_dir: None,
         token_file: None,
         ladder: std::env::var("ARENA_LADDER").ok(),
+        fleet_db: None,
+        release: None,
+        experiments: false,
+        ours: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -55,6 +70,10 @@ fn parse_args() -> Result<Args, String> {
             "--token-file" => a.token_file = Some(val()?.into()),
             "--ladder" => a.ladder = Some(val()?),
             "--stdio" => a.stdio = true,
+            "--fleet-db" => a.fleet_db = Some(val()?.into()),
+            "--release" => a.release = Some(val()?),
+            "--experiments" => a.experiments = true,
+            "--ours" => a.ours = val()?.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
             other => return Err(format!("unknown option {other}")),
         }
     }
@@ -84,6 +103,19 @@ fn read_token(a: &Args) -> Result<String, String> {
     std::fs::read_to_string(&path)
         .map(|s| s.split_whitespace().collect::<String>())
         .map_err(|e| format!("no token: set ARENA_TOKEN or put it in {} ({e})", path.display()))
+}
+
+/// One process per bot: a second connection with the same token throws the first one off
+/// the ladder ("replaced"), so a bot name is held with a file lock for as long as we run.
+fn lock_bot(bot: &str) -> Result<std::fs::File, String> {
+    let dir = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(".victris").join("run");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join(format!("{bot}.lock"));
+    let file = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(_) => Err(format!("{bot} is already running (lock {})", path.display())),
+    }
 }
 
 fn run_stdio(mut session: Session) {
@@ -221,6 +253,10 @@ fn main() {
         playbooks,
         log_dir: args.log_dir.clone(),
         max_matches: args.matches,
+        strategist: args.fleet_db.as_ref().map(|db| {
+            Box::new(marshal::fleet_hook::FleetHook::new(db.clone(), &args.bot, &args.version, args.release.clone(), args.experiments, args.ours.clone()))
+                as Box<dyn marshal::session::Strategist>
+        }),
     };
     let mut session = Session::new(cfg);
     if args.stdio {
@@ -232,6 +268,13 @@ fn main() {
         Err(e) => {
             eprintln!("marshal: {e}");
             std::process::exit(2);
+        }
+    };
+    let _lock = match lock_bot(&args.bot) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("marshal: {e}");
+            std::process::exit(3);
         }
     };
     let stop = Arc::new(AtomicBool::new(false));

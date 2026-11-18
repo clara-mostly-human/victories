@@ -40,6 +40,9 @@ pub const FATAL_CODES: [&str; 15] = [
 pub struct Playbooks {
     pub default: Playbook,
     pub by_opponent: HashMap<String, Playbook>,
+    /// the settings as written in the file, kept so a strategist's settings can be laid over them
+    raw_default: Value,
+    raw_by_opponent: HashMap<String, Value>,
 }
 
 impl Playbooks {
@@ -47,12 +50,14 @@ impl Playbooks {
     pub fn from_json(v: &Value) -> Playbooks {
         let mut p = Playbooks::default();
         if let Some(d) = v.get("default") {
-            p.default = Playbook::from_json(d.get("name").and_then(Value::as_str).unwrap_or("matrix-4"), d);
+            p.default = Playbook::from_json(d.get("name").and_then(Value::as_str).unwrap_or(&Playbook::default().name), d);
+            p.raw_default = d.clone();
         }
         if let Some(o) = v.get("opponents").and_then(Value::as_object) {
             for (opponent, settings) in o {
                 let name = settings.get("name").and_then(Value::as_str).map(str::to_string).unwrap_or_else(|| format!("vs-{opponent}"));
                 p.by_opponent.insert(opponent.clone(), Playbook::from_json(&name, settings));
+                p.raw_by_opponent.insert(opponent.clone(), settings.clone());
             }
         }
         p
@@ -60,6 +65,44 @@ impl Playbooks {
     pub fn pick(&self, opponent: &str) -> &Playbook {
         self.by_opponent.get(opponent).unwrap_or(&self.default)
     }
+    /// The playbook for `opponent` with `settings` laid over it, under a new name.
+    pub fn pick_with(&self, opponent: &str, name: &str, settings: &Value) -> Playbook {
+        let mut merged = match self.raw_by_opponent.get(opponent).unwrap_or(&self.raw_default) {
+            Value::Object(o) => o.clone(),
+            _ => serde_json::Map::new(),
+        };
+        if let Some(over) = settings.as_object() {
+            for (k, v) in over {
+                merged.insert(k.clone(), v.clone());
+            }
+        }
+        Playbook::from_json(name, &Value::Object(merged))
+    }
+}
+
+/// What is known about a match when it starts.
+#[derive(Clone, Debug, Default)]
+pub struct MatchInfo {
+    pub match_id: String,
+    pub opponent: String,
+    pub map: String,
+    /// our fighter id (1 or 2)
+    pub seat: Option<i64>,
+    pub seed: Option<i64>,
+}
+
+/// The strategy hook. A strategist is asked once per match, at `hello`, and told the result
+/// at `end`. It is how the fleet's experiment plan reaches the bot: the search and the
+/// policy know nothing about it, they only see the playbook it picked.
+///
+/// Both calls happen outside the tick loop. An implementation must return quickly and must
+/// not panic; the session treats `None` as "play what the playbooks file says".
+pub trait Strategist {
+    /// Playbook name and settings for this match. The settings are laid over the playbook
+    /// the file gives for this opponent. `base` is the name of that playbook.
+    fn assign(&mut self, m: &MatchInfo, base: &str) -> Option<(String, Value)>;
+    /// `line` is the match line as written to the log (result, reason, timings, damage).
+    fn finish(&mut self, m: &MatchInfo, line: &Value);
 }
 
 pub struct Config {
@@ -70,12 +113,15 @@ pub struct Config {
     pub log_dir: Option<PathBuf>,
     /// stop after this many matches
     pub max_matches: Option<u32>,
+    /// picks the playbook per match and hears the result; `None` plays the playbooks file
+    pub strategist: Option<Box<dyn Strategist>>,
 }
 
 struct Match {
     id: String,
     opponent: String,
     map: String,
+    info: MatchInfo,
     playbook: Playbook,
     /// `None` when the match's rules or map could not be loaded: we play idle turns
     tracker: Option<Tracker>,
@@ -258,7 +304,20 @@ impl Session {
         // The same match again means a reconnect: keep what we know.
         if self.cur.as_ref().map(|m| m.id != id).unwrap_or(true) {
             let opponent = msg.get("opponent").and_then(|o| o.get("name")).and_then(Value::as_str).unwrap_or("?").to_string();
-            let playbook = self.cfg.playbooks.pick(&opponent).clone();
+            let map = msg.get("map_name").and_then(Value::as_str).unwrap_or("?").to_string();
+            let info = MatchInfo {
+                match_id: id.clone(),
+                opponent: opponent.clone(),
+                map: map.clone(),
+                seat: msg.get("bot_id").and_then(Value::as_i64),
+                seed: msg.get("seed_public").and_then(Value::as_i64),
+            };
+            let base = self.cfg.playbooks.pick(&opponent).clone();
+            let assigned = self.cfg.strategist.as_mut().and_then(|s| s.assign(&info, &base.name));
+            let playbook = match assigned {
+                Some((name, settings)) => self.cfg.playbooks.pick_with(&opponent, &name, &settings),
+                None => base,
+            };
             let tracker = match Tracker::new(msg) {
                 Ok(t) => Some(t),
                 Err(e) => {
@@ -267,7 +326,6 @@ impl Session {
                     None
                 }
             };
-            let map = msg.get("map_name").and_then(Value::as_str).unwrap_or("?").to_string();
             self.log(json!({
                 "t": "hello", "match": id, "opponent": opponent, "playbook": playbook.name, "map": map,
                 "seat": msg.get("bot_id"), "seed": msg.get("seed_public"),
@@ -278,6 +336,7 @@ impl Session {
                 id,
                 opponent,
                 map,
+                info,
                 playbook,
                 tracker,
                 last_turn: None,
@@ -471,6 +530,9 @@ impl Session {
                 msg.get("final_tick").and_then(Value::as_i64).unwrap_or(-1),
                 m.playbook.name
             );
+            if let Some(st) = self.cfg.strategist.as_mut() {
+                st.finish(&m.info, &line);
+            }
             self.log(line);
         }
         if self.stop_after_match || self.cfg.max_matches.map(|n| self.played >= n).unwrap_or(false) {

@@ -1,0 +1,22 @@
+{
+  "bots": {
+    "field-marshal": {
+      "role": "flagship",
+      "managed": false,
+      "experiments": false,
+      "note": "Run by the search thread from its own launchd agent. The fleet only reads its logs."
+    },
+    "foot-soldier": {
+      "role": "legacy",
+      "managed": false,
+      "experiments": false,
+      "note": "TypeScript bot under its own launchd agent (deploy/). The fleet does not run it."
+    },
+    "fleet-canary": {
+      "role": "canary",
+      "managed": true,
+      "experiments": true,
+      "note": "Test bot for the fleet itself: gated releases meet the ladder here first."
+    }
+  }
+}
