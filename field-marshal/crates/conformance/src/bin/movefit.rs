@@ -1,7 +1,7 @@
 //! movefit: fits a model of how named bots move (hold, toward, away, sideways, dash) from
 //! ladder replays, and says how well it predicts their moves in games it has not seen.
 //!
-//!   movefit --bots A,B,C [--target move|spent|shot|frost|burst] [--epochs 8] [--emit] <replay dir or files>...
+//!   movefit --bots A,B,C [--target move|spent|shot|frost|burst] [--epochs 8] [--emit] [--dump file] <replay dir or files>...
 //!
 //! One example per tick on which a named bot could act, had its step ready and saw its
 //! opponent. Features come from `victris_engine::movefeat`. The model is a multinomial
@@ -18,13 +18,8 @@
 use flate2::read::GzDecoder;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use victris_engine::movefeat::{features, move_class, table_cell, CLASSES, CLASS_NAMES, N};
-use victris_engine::geom::chebyshev;
-use victris_engine::observe::can_see;
+use victris_engine::movefeat::{features, labels, table_cell, CLASSES, CLASS_NAMES, N, TARGETS};
 use victris_engine::replay::parse_replay;
-use victris_engine::rules::AttackKind;
-use victris_engine::state::FState;
-use victris_engine::turn::{AttackIn, DirIn};
 
 fn collect(path: &Path, out: &mut Vec<PathBuf>) {
     if path.is_dir() {
@@ -69,7 +64,7 @@ fn main() {
             skip = false;
             continue;
         }
-        if a == "--bots" || a == "--epochs" || a == "--target" {
+        if a == "--bots" || a == "--epochs" || a == "--target" || a == "--dump" {
             skip = true;
             continue;
         }
@@ -102,38 +97,36 @@ fn main() {
                 if !counted[x] {
                     continue;
                 }
-                let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
-                if f.state != FState::Idle || !can_see(&e.rules, &e.map, f.pos, o.pos) {
-                    continue;
-                }
-                let d = chebyshev(f.pos, o.pos);
-                // which attack of this kind is ready, if any
-                let ready = |want: u8| {
-                    e.rules.attacks.iter().enumerate().find(|(i, a)| {
-                        f.cd_attack[*i] == 0
-                            && match (&a.kind, want) {
-                                (AttackKind::Projectile { .. }, 0) => true,
-                                (AttackKind::Area { range, .. }, 1) => d <= *range,
-                                (AttackKind::Burst { .. }, 2) => d <= 2,
-                                _ => false,
-                            }
-                    }).map(|(i, _)| i)
-                };
-                let used = |i: usize| matches!(t.turns[x].attack, AttackIn::Named { attack, .. } if attack as usize == i) as usize;
-                let label = match target.as_str() {
-                    "move" if f.cd_move == 0 => Some(move_class(&s, x, &t.turns[x])),
-                    "spent" if f.cd_move != 0 && f.cd_dash == 0 => Some(matches!(t.turns[x].dash, DirIn::Dir(_)) as usize),
-                    "shot" => ready(0).map(used),
-                    "frost" => ready(1).map(used),
-                    "burst" => ready(2).map(used),
-                    _ => None,
-                };
+                let which = TARGETS.iter().position(|n| *n == target.as_str());
+                let label = which.and_then(|k| labels(e, &s, x, &t.turns[x])[k]);
                 let Some(label) = label else { continue };
                 let row = (features(e, &s, x), label);
                 if held_out { test.push(row) } else { train.push(row) }
             }
             e.step(&mut s, &t.turns);
         }
+    }
+    // --dump file: lines written by `ARENA_PRIORS=file arena ...` (decision, choice, the
+    // features) from the search's own games; every fifth block of 400 lines is held out.
+    if let Some(path) = opt("--dump") {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+        let mut k = 0usize;
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            if parts.next() != Some(target.as_str()) {
+                continue;
+            }
+            let Some(label) = parts.next().and_then(|v| v.parse::<usize>().ok()) else { continue };
+            let v: Vec<f32> = parts.filter_map(|v| v.parse().ok()).collect();
+            if v.len() != N || label >= CLASSES {
+                continue;
+            }
+            let mut f = [0.0f32; N];
+            f.copy_from_slice(&v);
+            if (k / 400) % 5 == 4 { test.push((f, label)) } else { train.push((f, label)) }
+            k += 1;
+        }
+        games += k / 400;
     }
     // Baselines from the training games.
     let mut overall = [0u32; CLASSES];

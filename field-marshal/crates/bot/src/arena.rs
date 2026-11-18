@@ -79,6 +79,27 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
                 );
             }
             out.sims += d.sims as u64;
+            // ARENA_PRIORS=file: every turn the tree search chose, as a line per open
+            // decision (which of the five, what it chose, the 52 move features), for
+            // fitting the search's move ordering on its own choices (`movefit --dump`).
+            if d.note == "tree" {
+                if let Some(path) = std::env::var_os("ARENA_PRIORS") {
+                    let labels = victris_engine::movefeat::labels(engine, &s, i, &d.turn);
+                    if labels.iter().any(|l| l.is_some()) {
+                        let feat = victris_engine::movefeat::features(engine, &s, i);
+                        let tail: String = feat.iter().map(|v| format!(" {v:.3}")).collect();
+                        let mut lines = String::new();
+                        for (k, l) in labels.iter().enumerate() {
+                            if let Some(l) = l {
+                                lines.push_str(&format!("{} {}{}\n", victris_engine::movefeat::TARGETS[k], l, tail));
+                            }
+                        }
+                        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                            let _ = std::io::Write::write_all(&mut file, lines.as_bytes());
+                        }
+                    }
+                }
+            }
             turns[i] = d.turn;
             prev[i] = Some(d.turn);
         }

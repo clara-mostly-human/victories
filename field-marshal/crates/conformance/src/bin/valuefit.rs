@@ -7,7 +7,8 @@
 //! followed by the discounted hp fighter 0 went on to gain or lose from there. The fit is
 //! a ridge regression with no intercept (the judgment must be zero for mirrored
 //! positions). Every fifth line is held out; the tool reports how much of the outcome the
-//! judgment explains on those lines, and with --emit prints the weights as a Rust constant.
+//! judgment explains on those lines, and with --emit prints the weights as a row for
+//! `VALUE_GENS` in the engine's `models.rs`.
 
 use victris_engine::valuefeat::NV;
 
@@ -82,7 +83,7 @@ fn main() {
     let w: Vec<f64> = (0..NV).map(|r| a[r][NV]).collect();
     if emit {
         println!("// Fitted by `valuefit` on {} recorded ticks of the search's own games.", rows.len());
-        println!("pub const VALUE_WEIGHTS: [f32; crate::valuefeat::NV] = [{}];", w.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(", "));
+        println!("    [{}],", w.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(", "));
         return;
     }
     let (mut sse, mut sst, mut n) = (0.0, 0.0, 0usize);

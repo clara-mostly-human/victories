@@ -66,5 +66,21 @@ pub fn move_probs_for(e: &Engine, s: &State, x: usize) -> [f32; CLASSES] {
 
 
 /// The judgment of positions (`valuefeat`), fitted by `valuefit` on the search's own
-/// games. All zeros until the first fit.
-pub const VALUE_WEIGHTS: [f32; crate::valuefeat::NV] = [0.0; crate::valuefeat::NV];
+/// games, one row per generation. A generation is kept only when the search using it beats
+/// the search using the one before, head to head at equal thinking time.
+///   1: 60 games of the plain search against itself at 60 ms a move (7,713 recorded
+///      ticks); explains 21% of the outcome on held-out ticks; beat the plain search
+///      26-3-1 and the matrix search 23-7 at 100 ms a move.
+pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 3] = [
+    [68.107, 8.515, 0.214, -0.175, 0.018, -2.188, 1.827, 0.474, 0.275, -1.223, -1.617, -3.328, 0.397, 4.701, -3.262, 3.726, 66.527, -1.036, 4.400, -1.397, 1.688, 2.439, -47.270],
+    // candidate 2: generation 0 and generation 1 self-play together (18,686 ticks; 23% held out)
+    [97.288, 8.504, 0.080, -0.270, -0.897, -2.520, 0.848, 0.840, 0.046, -2.435, -2.950, -3.410, 0.407, 4.994, -4.795, 5.348, 67.236, -2.006, 5.476, -1.142, 1.334, 3.055, -70.162],
+    // candidate 3: both self-play sets and 48 games of generation 1 against the matrix
+    // search (24,405 ticks; 22% held out)
+    [94.744, 8.624, -0.460, -0.819, -0.874, -3.256, 1.830, 0.855, 0.034, -1.848, -2.937, -3.787, 0.244, 5.477, -6.521, 5.484, 60.476, -2.517, 5.526, -1.171, 1.392, 3.227, -67.231],
+];
+
+/// The weights of generation `gen` (1 is the first); 0 or a number past the end gives the latest.
+pub fn value_weights(gen: usize) -> &'static [f32; crate::valuefeat::NV] {
+    if gen >= 1 && gen <= VALUE_GENS.len() { &VALUE_GENS[gen - 1] } else { &VALUE_GENS[VALUE_GENS.len() - 1] }
+}

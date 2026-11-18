@@ -138,6 +138,15 @@ pub struct Playbook {
     /// weight of the fitted judgment of positions at the tree's leaves (0 = off; with it
     /// on, the fixed value per buff tick is dropped, since the judgment covers it)
     pub tree_value: f64,
+    /// the tree search also runs with the opponent out of sight, on the tracker's best guess
+    /// of where it is, for this many ticks after it was last seen (0 = only in view)
+    pub tree_fog: i32,
+    /// which generation of the judgment the tree search uses (0 = the latest)
+    pub tree_gen: u32,
+    /// the tree search may lead its shots (aim where the opponent could step) when standing still
+    pub tree_lead: bool,
+    /// the tree search's play-out at a leaf also plays a wall slam that is there for the taking
+    pub tree_slam: bool,
     /// weight (hp per unit of log probability) of the learned movement prior: how likely
     /// a strong bot is to hold, step toward, away, sideways or dash in our situation
     /// (`movemodel`, fitted on 922 replay games; it predicts 50% of their moves in unseen
@@ -274,6 +283,10 @@ impl Default for Playbook {
             tree_ms: 0,
             tree_depth: 12,
             tree_value: 0.0,
+            tree_fog: 0,
+            tree_gen: 0,
+            tree_lead: false,
+            tree_slam: false,
             move_prior_weight: 0.0,
             attack_prior_weight: 0.0,
             rollout_punish: false,
@@ -371,13 +384,19 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
         }
         if let Some(x) = v.get("tree_ms").and_then(Value::as_u64) {
             p.tree_ms = x;
+        }
+        if let Some(x) = v.get("tree_fog").and_then(Value::as_i64) {
+            p.tree_fog = x as i32;
+        }
+        if let Some(x) = v.get("tree_gen").and_then(Value::as_u64) {
+            p.tree_gen = x as u32;
         }
         if let Some(x) = v.get("tree_depth").and_then(Value::as_u64) {
             p.tree_depth = x as u32;
@@ -1178,9 +1197,11 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     let k = kit(e);
     let visible = view.enemy.is_some();
     // The tree search as the whole brain: both sides search for their best move on the
-    // exact engine for `tree_ms`, and we play our most visited turn.
-    if pb.tree_ms > 0 && visible {
-        let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, ..Default::default() };
+    // exact engine for `tree_ms`, and we play our most visited turn. Only with `search` on:
+    // the gateway's quick fallback calls us with `search` off and wants the plain heuristic.
+    let guessed = pb.tree_fog > 0 && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_fog).unwrap_or(s.tick <= pb.tree_fog);
+    if pb.tree_ms > 0 && pb.search && (visible || guessed) {
+        let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, ..Default::default() };
         if pb.tree_value != 0.0 {
             cfg.buff_value = 0.0;
         }

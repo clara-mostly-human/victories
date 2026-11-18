@@ -14,7 +14,7 @@
 //! The priors only order the search: with enough iterations a turn the models think
 //! unlikely is still found if it is good.
 
-use crate::geom::{add, chebyshev, DIR_VEC};
+use crate::geom::{add, chebyshev, DIR_VEC, P};
 use crate::models::{move_probs, yes_prob, BURST_WEIGHTS, FROST_WEIGHTS, SHOT_WEIGHTS, SPENT_WEIGHTS};
 use crate::movefeat::features;
 use crate::observe::can_see;
@@ -37,8 +37,14 @@ pub struct Config {
     pub buff_value: f64,
     /// share of the prior that is spread evenly over all turns
     pub even: f32,
-    /// weight of the fitted judgment of positions at a leaf (`models::VALUE_WEIGHTS`)
+    /// weight of the fitted judgment of positions at a leaf (`models::VALUE_GENS`)
     pub value_weight: f64,
+    /// which generation of the judgment (1 is the first; 0 = the latest)
+    pub value_gen: usize,
+    /// a fighter standing still may aim its shot at a tile the opponent could step to
+    pub lead: bool,
+    /// the quiet play-out at a leaf also plays a wall slam that is there for the taking
+    pub quiet_slam: bool,
     /// nodes fewer than this many ticks below the root order forcing turns first
     /// (0 = off: at 150 ms a move it scored 8 of 18 against 10 of 18 without, so it is
     /// off until it earns its place)
@@ -47,7 +53,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, lead: false, quiet_slam: false, forcing_depth: 0 }
     }
 }
 
@@ -73,7 +79,7 @@ struct Node {
 /// hurt or stun the opponent at once if it stands still are tried first, the way a chess
 /// engine tries captures and checks first; this costs one engine step per turn, so it is
 /// used only near the root.
-pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool) -> Vec<Act> {
+pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: bool) -> Vec<Act> {
     let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
     let idle = vec![Act { turn: RawTurn::IDLE, prior: 1.0, n: 0, w: 0.0 }];
     if f.state != FState::Idle || !f.alive || !o.alive {
@@ -133,7 +139,22 @@ pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool) -> Vec
         let pm = class_p[*c] / count[*c].max(1) as f32;
         out.push(Act { turn: *mv, prior: pm * attack_p[0], n: 0, w: 0.0 });
         if let Some(a) = shot {
-            out.push(Act { turn: mv.with_attack(a, o.pos), prior: pm * attack_p[1], n: 0, w: 0.0 });
+            // Standing still, the shot can also lead an opponent that is free to step: aim
+            // at a tile it could step to. Half the shot's prior goes to those aims.
+            let mut leads: Vec<P> = Vec::new();
+            if lead && *mv == RawTurn::IDLE && o.state == FState::Idle && o.cd_move == 0 {
+                for dir in 0..8u8 {
+                    let aim = add(o.pos, DIR_VEC[dir as usize]);
+                    if !e.map.step_blocked(o.pos, dir) && aim != f.pos {
+                        leads.push(aim);
+                    }
+                }
+            }
+            let direct = if leads.is_empty() { 1.0 } else { 0.5 };
+            out.push(Act { turn: mv.with_attack(a, o.pos), prior: pm * attack_p[1] * direct, n: 0, w: 0.0 });
+            for aim in &leads {
+                out.push(Act { turn: mv.with_attack(a, *aim), prior: pm * attack_p[1] * 0.5 / leads.len() as f32, n: 0, w: 0.0 });
+            }
         }
         if let Some(a) = burst {
             out.push(Act { turn: mv.with_burst(a), prior: pm * attack_p[2], n: 0, w: 0.0 });
@@ -169,13 +190,25 @@ pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool) -> Vec
 }
 
 /// What a fighter does in the quiet play-out: the shot that cannot miss, and a step or a
-/// dash out of a hit that is about to land. Nothing else.
-pub fn quiet_turn(e: &Engine, s: &State, x: usize) -> RawTurn {
+/// dash out of a hit that is about to land. With `slam`, also the repulsor when it would
+/// throw the opponent against a wall now. Nothing else.
+pub fn quiet_turn(e: &Engine, s: &State, x: usize, slam: bool) -> RawTurn {
     let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
     if f.state != FState::Idle || !o.alive {
         return RawTurn::IDLE;
     }
     let mut turn = RawTurn::IDLE;
+    if slam && o.state != FState::Stunned && chebyshev(f.pos, o.pos) <= 2 {
+        let burst = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Burst { .. })).filter(|i| f.cd_attack[*i] == 0);
+        if let Some(a) = burst {
+            let mine = RawTurn::IDLE.with_burst(a as u8);
+            let mut probe = *s;
+            e.step(&mut probe, &if x == 0 { [mine, RawTurn::IDLE] } else { [RawTurn::IDLE, mine] });
+            if probe.fighters[1 - x].state == FState::Stunned {
+                return mine;
+            }
+        }
+    }
     if can_see(&e.rules, &e.map, f.pos, o.pos) {
         let shot = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Projectile { .. })).filter(|i| f.cd_attack[*i] == 0);
         if let Some(a) = shot {
@@ -238,7 +271,7 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config) -> f64 {
         if st.result.is_some() {
             break;
         }
-        let turns = [quiet_turn(e, &st, 0), quiet_turn(e, &st, 1)];
+        let turns = [quiet_turn(e, &st, 0, cfg.quiet_slam), quiet_turn(e, &st, 1, cfg.quiet_slam)];
         let before = (st.fighters[0].hp, st.fighters[1].hp);
         e.step(&mut st, &turns);
         v += reward(&st, before);
@@ -246,7 +279,7 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config) -> f64 {
     let buff = |i: usize| if st.fighters[i].power_until == NO_BUFF { 0 } else { (st.fighters[i].power_until - st.tick).max(0) };
     v += cfg.buff_value * (buff(0) - buff(1)) as f64;
     if cfg.value_weight != 0.0 && st.result.is_none() {
-        v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, &crate::models::VALUE_WEIGHTS) as f64;
+        v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, crate::models::value_weights(cfg.value_gen)) as f64;
     }
     v
 }
@@ -322,7 +355,7 @@ impl<'a> Search<'a> {
                     for x in 0..2 {
                         self.nodes[node].acts[x] = match (depth, fixed[x]) {
                             (0, Some(t)) => vec![Act { turn: t, prior: 1.0, n: 0, w: 0.0 }],
-                            _ => actions(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth),
+                            _ => actions(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead),
                         };
                     }
                     if depth > 0 {

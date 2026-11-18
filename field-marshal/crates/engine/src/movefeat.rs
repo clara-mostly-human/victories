@@ -9,7 +9,7 @@ use crate::geom::{add, chebyshev, octant, DIR_VEC, P};
 use crate::observe::can_see;
 use crate::rules::AttackKind;
 use crate::state::{FState, State, NO_BUFF};
-use crate::turn::{DirIn, RawTurn};
+use crate::turn::{AttackIn, DirIn, RawTurn};
 use crate::Engine;
 
 pub const N: usize = 52;
@@ -28,6 +28,41 @@ pub fn move_class(s: &State, x: usize, turn: &RawTurn) -> usize {
         return if after < d { 1 } else if after > d { 2 } else { 3 };
     }
     0
+}
+
+/// The five decisions the fitted models predict, in the order `labels` returns them.
+pub const TARGETS: [&str; 5] = ["move", "spent", "shot", "frost", "burst"];
+
+/// What `turn` says about each of the five decisions for fighter `x` in state `s`, or
+/// `None` where that decision was not open: the move class when its step is ready, whether
+/// it dashes when the step is spent, and whether it uses the shot, the frostburst (within
+/// range) and the repulsor (within 2 tiles) when ready. All `None` unless it can act and
+/// sees its opponent. Used to fit the models on replays and on the search's own games.
+pub fn labels(e: &Engine, s: &State, x: usize, turn: &RawTurn) -> [Option<usize>; 5] {
+    let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
+    if f.state != FState::Idle || !can_see(&e.rules, &e.map, f.pos, o.pos) {
+        return [None; 5];
+    }
+    let d = chebyshev(f.pos, o.pos);
+    let ready = |want: u8| {
+        e.rules.attacks.iter().enumerate().find(|(i, a)| {
+            f.cd_attack[*i] == 0
+                && match (&a.kind, want) {
+                    (AttackKind::Projectile { .. }, 0) => true,
+                    (AttackKind::Area { range, .. }, 1) => d <= *range,
+                    (AttackKind::Burst { .. }, 2) => d <= 2,
+                    _ => false,
+                }
+        }).map(|(i, _)| i)
+    };
+    let used = |i: usize| matches!(turn.attack, AttackIn::Named { attack, .. } if attack as usize == i) as usize;
+    [
+        if f.cd_move == 0 { Some(move_class(s, x, turn)) } else { None },
+        if f.cd_move != 0 && f.cd_dash == 0 { Some(matches!(turn.dash, DirIn::Dir(_)) as usize) } else { None },
+        ready(0).map(used),
+        ready(1).map(used),
+        ready(2).map(used),
+    ]
 }
 
 /// Is there a wall (or the map edge) within `reach` tiles of `from`, going straight away from `threat`?
