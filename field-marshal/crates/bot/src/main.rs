@@ -3,6 +3,7 @@
 //!   marshal --bot <name> [--version v1] [--url wss://victrisarena.com/bot] [--matches N]
 //!           [--playbooks file.json] [--log-dir dir] [--token-file path] [--ladder id]
 //!           [--fleet-db file [--release id] [--experiments] [--ours name,name]]
+//!           [--prefer-address ip,ip] [--requeue-delay-ms N]
 //!   marshal --bot <name> --stdio      read server frames on stdin, write replies on stdout (tests)
 //!
 //! The token comes from ARENA_TOKEN, else from --token-file, else from <repo>/bots/<name>.
@@ -21,7 +22,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
@@ -39,6 +39,8 @@ struct Args {
     release: Option<String>,
     experiments: bool,
     ours: Vec<String>,
+    prefer: Vec<std::net::IpAddr>,
+    requeue_delay_ms: u64,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -56,6 +58,8 @@ fn parse_args() -> Result<Args, String> {
         release: None,
         experiments: false,
         ours: Vec::new(),
+        prefer: std::env::var("ARENA_PREFER_ADDRESS").map(|t| fleet::net::parse_addresses(&t)).unwrap_or_default(),
+        requeue_delay_ms: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -73,6 +77,8 @@ fn parse_args() -> Result<Args, String> {
             "--fleet-db" => a.fleet_db = Some(val()?.into()),
             "--release" => a.release = Some(val()?),
             "--experiments" => a.experiments = true,
+            "--prefer-address" => a.prefer = fleet::net::parse_addresses(&val()?),
+            "--requeue-delay-ms" => a.requeue_delay_ms = val()?.parse().map_err(|_| "--requeue-delay-ms needs a number")?,
             "--ours" => a.ours = val()?.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect(),
             other => return Err(format!("unknown option {other}")),
         }
@@ -132,7 +138,15 @@ fn run_stdio(mut session: Session) {
                     let _ = writeln!(out, "{s}");
                     let _ = out.flush();
                 }
-                Out::RequeueAfter(_) => {} // the test harness decides when to queue
+                Out::RequeueAfter(_) => {
+                    // Behind a pipe the other side owns the connection: say what we would do.
+                    let _ = writeln!(out, "{}", session.queue_frame());
+                    let _ = out.flush();
+                }
+                Out::Reconnect => {
+                    let _ = writeln!(out, r#"{{"type":"reconnect"}}"#);
+                    let _ = out.flush();
+                }
                 Out::Done | Out::Fatal(_) => return,
             }
         }
@@ -156,24 +170,19 @@ enum Closed {
     Done,
     Fatal(String),
     Dropped(String),
+    /// closed by us after a slow match, to try another address
+    Slow(Option<std::net::IpAddr>),
 }
 
 /// One connection: queue, then answer frames until the socket closes or we are done.
-fn run_connection(session: &mut Session, url: &str, token: &str, stop: &AtomicBool) -> Closed {
-    let mut req = match url.into_client_request() {
-        Ok(r) => r,
-        Err(e) => return Closed::Fatal(format!("bad url: {e}")),
-    };
-    match format!("Bearer {token}").parse() {
-        Ok(h) => {
-            req.headers_mut().insert("Authorization", h);
-        }
-        Err(_) => return Closed::Fatal("token has characters a header cannot carry".into()),
-    }
-    let (mut ws, _) = match tungstenite::connect(req) {
+fn run_connection(session: &mut Session, url: &str, token: &str, stop: &AtomicBool, prefer: &[std::net::IpAddr], avoid: &[std::net::IpAddr]) -> Closed {
+    // The address is ours to choose: the ladder's edge addresses are not equally fast.
+    let (mut ws, remote) = match fleet::net::connect(url, token, prefer, avoid) {
         Ok(x) => x,
-        Err(e) => return Closed::Dropped(format!("connect failed: {e}")),
+        Err(e) if e.starts_with("bad url") || e.starts_with("token has") => return Closed::Fatal(e),
+        Err(e) => return Closed::Dropped(e),
     };
+    session.remote = Some(remote.to_string());
     set_timeouts(&mut ws, Duration::from_secs(1));
     if let Err(e) = ws.send(Message::Text(session.queue_frame())) {
         return Closed::Dropped(format!("send failed: {e}"));
@@ -211,7 +220,12 @@ fn run_connection(session: &mut Session, url: &str, token: &str, stop: &AtomicBo
                                 return Closed::Dropped(format!("send failed: {e}"));
                             }
                         }
-                        Out::RequeueAfter(secs) => requeue_at = Some(Instant::now() + Duration::from_secs(secs)),
+                        Out::RequeueAfter(wait) => requeue_at = Some(Instant::now() + wait),
+                        Out::Reconnect => {
+                            let _ = ws.send(Message::Text(r#"{"type":"leave"}"#.into()));
+                            let _ = ws.close(None);
+                            return Closed::Slow(Some(remote));
+                        }
                         Out::Done => {
                             let _ = ws.close(None);
                             return Closed::Done;
@@ -267,6 +281,7 @@ fn main() {
         playbooks,
         log_dir: args.log_dir.clone(),
         max_matches: args.matches,
+        requeue_delay: Duration::from_millis(args.requeue_delay_ms),
         strategist: args.fleet_db.as_ref().map(|db| {
             Box::new(marshal::fleet_hook::FleetHook::new(db.clone(), &args.bot, &args.version, args.release.clone(), args.experiments, args.ours.clone()))
                 as Box<dyn marshal::session::Strategist>
@@ -302,9 +317,23 @@ fn main() {
     // match keeps running at about 13 ticks a second while we are away, so every second of
     // waiting is a dozen turns not played. Repeated failures back off (1 s, doubling to 30 s).
     let mut delay = Duration::ZERO;
+    // addresses that were slow for us, tried last from now on
+    let mut avoid: Vec<std::net::IpAddr> = Vec::new();
     loop {
         let started = Instant::now();
-        match run_connection(&mut session, &args.url, &token, &stop) {
+        match run_connection(&mut session, &args.url, &token, &stop, &args.prefer, &avoid) {
+            Closed::Slow(remote) => {
+                if let Some(ip) = remote {
+                    if !avoid.contains(&ip) {
+                        avoid.push(ip);
+                    }
+                    // Every address has been slow once: start over and judge them afresh.
+                    if avoid.len() >= 4 {
+                        avoid.clear();
+                    }
+                }
+                continue;
+            }
             Closed::Done => {
                 eprintln!("[{}] done: {} played, {}W {}L {}D", args.bot, session.played, session.wins, session.losses, session.draws);
                 return;

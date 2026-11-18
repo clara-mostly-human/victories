@@ -29,6 +29,8 @@ pub struct BotConfig {
     pub expect_online: bool,
     /// who brings it back, named in the alert
     pub owner: Option<String>,
+    /// the gateway holds this bot's connection and runs its engine behind it
+    pub gateway: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -42,11 +44,16 @@ pub struct Config {
     pub habits_bots: Vec<String>,
     /// pull replays from the repository's `corpus` branch (filled by the GitHub workflow)
     pub corpus_branch: bool,
+    /// ladder addresses to try first (`"prefer_addresses": ["104.21.89.84"]`)
+    pub prefer_addresses: Vec<String>,
+    /// how long a bot that is not the flagship waits after a match before queueing again,
+    /// so the flagship gets the freed match slot first
+    pub queue_gap_ms: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0, habits_bots: vec!["StuartSutcliffe".into(), "Shelbot4".into()], corpus_branch: false }
+        Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0, habits_bots: vec!["StuartSutcliffe".into(), "Shelbot4".into()], corpus_branch: false, prefer_addresses: Vec::new(), queue_gap_ms: 1000 }
     }
 }
 
@@ -74,13 +81,17 @@ impl Config {
                     note: text("note"),
                     expect_online: flag("expect_online"),
                     owner: text("owner"),
+                    gateway: flag("gateway"),
                 });
             }
         }
         let d = Config::default();
         let guard = |k: &str, dflt: f64| v.get("guard").and_then(|g| g.get(k)).and_then(Value::as_f64).unwrap_or(dflt);
         let habits_bots = v.get("habits_bots").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or(d.habits_bots);
-        Config { bots, guard_load: guard("load", d.guard_load), guard_think_p99_ms: guard("think_p99_ms", d.guard_think_p99_ms), habits_bots, corpus_branch: v.get("corpus_branch").and_then(Value::as_bool).unwrap_or(false) }
+        Config { bots, guard_load: guard("load", d.guard_load), guard_think_p99_ms: guard("think_p99_ms", d.guard_think_p99_ms), habits_bots, corpus_branch: v.get("corpus_branch").and_then(Value::as_bool).unwrap_or(false),
+            prefer_addresses: v.get("prefer_addresses").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+            queue_gap_ms: v.get("queue_gap_ms").and_then(Value::as_u64).unwrap_or(d.queue_gap_ms),
+        }
     }
 
     pub fn bot(&self, name: &str) -> Option<&BotConfig> {

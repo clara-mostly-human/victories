@@ -44,5 +44,9 @@
   "guard": {
     "load": 8,
     "think_p99_ms": 300
-  }
+  },
+  "prefer_addresses": [
+    "104.21.89.84"
+  ],
+  "queue_gap_ms": 1000
 }

@@ -164,6 +164,10 @@ pub fn group_column(by: &str) -> Option<&'static str> {
         "map" => "map",
         "seat" => "'seat ' || COALESCE(seat, '?')",
         "bot" => "bot",
+        // the ladder address the connection was on, and whether it lost turns to the limit
+        "remote" => "COALESCE(remote, '(not recorded)')",
+        "arm-remote" => "COALESCE(arm, '(no experiment)') || ' on ' || COALESCE(remote, '(not recorded)')",
+        "connection" => "bot || CASE WHEN lost_turns IS NULL THEN ' (not recorded)' WHEN lost_turns > 0 OR charge_p50_ms > 180 THEN ' on a slow connection' ELSE ' on a good connection' END",
         "cell" => "opponent || ' / ' || map || ' / seat ' || COALESCE(seat, '?')",
         // Arm by strength of the opponent: its highest rating seen in any of our games.
         "arm-tier" => "COALESCE(arm, '(no experiment)') || CASE WHEN (SELECT MAX(o.opponent_rating) FROM matches o WHERE o.opponent = matches.opponent) >= 2500 THEN ' vs 2500 and up' WHEN (SELECT MAX(o.opponent_rating) FROM matches o WHERE o.opponent = matches.opponent) IS NULL THEN ' vs unrated here' ELSE ' vs under 2500' END",

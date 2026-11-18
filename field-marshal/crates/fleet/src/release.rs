@@ -118,6 +118,8 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
         "id": id, "git_sha": sha, "built_ms": now_ms(), "rustc": rustc, "tests_run": tests,
         // Older commits have a marshal that does not know the fleet flags.
         "fleet_hook": ws.join("crates/bot/src/fleet_hook.rs").is_file(),
+        // 2: the client takes --prefer-address and --requeue-delay-ms and reconnects when slow
+        "client": if std::fs::read_to_string(ws.join("crates/bot/src/main.rs")).map(|t| t.contains("--requeue-delay-ms")).unwrap_or(false) { 2 } else { 1 },
     });
     std::fs::write(dir.join("release.json"), serde_json::to_string_pretty(&meta).unwrap()).map_err(|e| e.to_string())?;
     if meta["fleet_hook"] == json!(true) {
@@ -356,7 +358,11 @@ pub fn deploy(root: &Path, store: &Store, cfg: &Config, bot: &str, id: &str, ver
     };
     store.set_deployment(bot, id, &version, force.unwrap_or("deploy")).map_err(|e| e.to_string())?;
     store.event(Some(bot), "deploy", &json!({ "release": id, "version": version, "forced": force }));
-    if let Some(pid) = restart_bot(root, bot) {
+    if b.gateway {
+        // The gateway changes engines between two matches and keeps the connection; a
+        // signal here would only kill the engine in the middle of its match.
+        eprintln!("{bot}: the gateway swaps its engine to {id} as {version} after the current match");
+    } else if let Some(pid) = restart_bot(root, bot) {
         eprintln!("{bot}: told pid {pid} to finish its match; the supervisor starts {id} as {version} next");
     } else {
         eprintln!("{bot}: not running now; it starts {id} as {version} when its supervisor runs");

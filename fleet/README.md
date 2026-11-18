@@ -64,6 +64,37 @@ paused. Anything else long-running on this machine should check the same file.
 
 `fleet status` shows all of it on one screen. `fleet alerts` prints the alert log.
 
+## The network: what we learned and what the client does about it
+
+- **One address for everything.** The bots share this network's single public address with
+  every browser and script on it, and the ladder's edge judges them together. A Victris page
+  open in a browser at home, or replays downloaded from this Mac, came with bursts in which
+  every bot's connection was dropped at once (2026-11-18). So: nothing on the home network
+  loads the Victris site or its replays while the bots play; the fleet itself sends the
+  ladder nothing but the bots' own frames.
+- **Edge addresses differ.** A connection keeps the edge address it landed on for life, and
+  one address was fast (about 100 ms charged per turn) while another lost turns to the
+  one-second limit. The client resolves the host itself, tries `prefer_addresses` from
+  `fleet/bots.json` first and addresses that were just slow last, records the address and
+  what the ladder charged per turn in every match row (`fleet stats --by remote`,
+  `--by connection`, `--by arm-remote`), and after a match on a slow connection (charge p50
+  over 180 ms with a fast engine, or any turn charged a full second) it reconnects before it
+  queues again, up to four times in a row.
+- **Five bots, five match slots.** The account may play five matches at once. Every bot but
+  the flagship waits `queue_gap_ms` (one second) after a match before queueing, so the
+  flagship gets a freed slot first, and a refused queue is retried after a few seconds.
+
+## The gateway (built and tested on the mock ladder, not yet carrying a live bot)
+
+`fleet gateway` is one process that holds the ladder connection of every bot whose entry has
+`"gateway": true`; each bot's engine runs behind it as a `marshal --stdio` child from that
+bot's release. It paces connects and queue requests across the fleet, shares what it learns
+about slow addresses between bots, sends an idle turn for an engine that has not answered
+within 800 ms (a stalled or crashed engine costs turns, never a disqualification) and
+restarts it, and swaps an engine to a new release between two matches without dropping the
+connection. `fleet install gateway` loads it; a bot's own supervisor stands down while
+`gateway` is true for it.
+
 ## The autopilot
 
 `com.victris.fleet-autopilot` runs the pipeline by itself, one step a minute, and writes a

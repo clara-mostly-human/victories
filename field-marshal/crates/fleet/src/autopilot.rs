@@ -264,7 +264,10 @@ impl Autopilot {
                         log_line(root, "PIPELINE", &format!("arena gate of {old} stopped: {} is newer", cand.id));
                         self.gate = None;
                     }
-                    if self.gate.is_none() && self.habits.is_none() {
+                    // The habits yardstick goes first where the build has it.
+                    let dir = std::path::PathBuf::from(&cand.path);
+                    let habits_due = dir.join("habits").is_file() && !dir.join("habits.txt").exists() && !cfg.habits_bots.is_empty();
+                    if self.gate.is_none() && self.habits.is_none() && !habits_due {
                         let log = std::fs::File::create(data_dir(root).join(format!("gate-{}.log", cand.id))).map_err(|e| e.to_string())?;
                         let err = log.try_clone().map_err(|e| e.to_string())?;
                         let child = Command::new(std::env::current_exe().map_err(|e| e.to_string())?)

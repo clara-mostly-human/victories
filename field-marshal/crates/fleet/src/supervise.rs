@@ -78,6 +78,15 @@ fn release_has_hook(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// What the client in this release understands (see `release::build`); 1 for older builds.
+fn client_level(dir: &Path) -> i64 {
+    std::fs::read_to_string(dir.join("release.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("client").and_then(|c| c.as_i64()))
+        .unwrap_or(1)
+}
+
 /// The command line for one bot, from its configuration and deployed release.
 pub fn bot_command(root: &Path, cfg: &Config, bot: &BotConfig, release: &str, release_dir: &Path, version: &str) -> Command {
     let mut c = Command::new(release_dir.join("marshal"));
@@ -87,6 +96,14 @@ pub fn bot_command(root: &Path, cfg: &Config, bot: &BotConfig, release: &str, re
     c.arg("--token-file").arg(root.join("bots").join(&bot.name));
     if let Some(url) = &bot.url {
         c.arg("--url").arg(url);
+    }
+    if client_level(release_dir) >= 2 {
+        if !cfg.prefer_addresses.is_empty() {
+            c.arg("--prefer-address").arg(cfg.prefer_addresses.join(","));
+        }
+        if bot.role != "flagship" && cfg.queue_gap_ms > 0 {
+            c.arg("--requeue-delay-ms").arg(cfg.queue_gap_ms.to_string());
+        }
     }
     if release_has_hook(release_dir) {
         c.arg("--fleet-db").arg(default_db(root)).arg("--release").arg(release);
@@ -181,6 +198,8 @@ pub fn run(root: &Path, name: &str) -> i32 {
         let deployed = state.as_ref().and_then(|s| Some((s.release.clone()?, s.version.clone()?)));
         let problem = if !bot.managed {
             Some("managed is false in fleet/bots.json".to_string())
+        } else if bot.gateway {
+            Some("run by the gateway (gateway is true in fleet/bots.json)".to_string())
         } else if let Some(h) = halted {
             Some(format!("halted ({h}); `fleet resume {name}` starts it again"))
         } else if deployed.is_none() {

@@ -115,6 +115,8 @@ pub struct Config {
     pub max_matches: Option<u32>,
     /// picks the playbook per match and hears the result; `None` plays the playbooks file
     pub strategist: Option<Box<dyn Strategist>>,
+    /// wait this long after a match before queueing again (0: at once)
+    pub requeue_delay: std::time::Duration,
 }
 
 struct Match {
@@ -136,14 +138,21 @@ struct Match {
     truth_exact: u32,
     truth_diffs: HashMap<String, u32>,
     min_budget_ms: i64,
+    /// what the server charged us for each turn, in ms: the drop in `budget_ms_left`
+    /// between observations. It is our think time plus the trip there and back.
+    charges: Vec<u32>,
+    last_budget: Option<i64>,
     /// damage by source ("taken:ranged", "dealt:wall_slam", ...) and pickups, from events
     damage: std::collections::BTreeMap<String, i64>,
 }
 
 pub enum Out {
     Send(String),
-    /// the server would not queue us (a quota, most often); ask again after this many seconds
-    RequeueAfter(u64),
+    /// send `queue` after this long: the server refused us (a quota, most often), or this
+    /// bot leaves the freed match slot to the flagship for a moment
+    RequeueAfter(std::time::Duration),
+    /// this connection is slow: open a new one, then queue
+    Reconnect,
     /// the configured number of matches is done, or a stop was requested
     Done,
     Fatal(String),
@@ -160,6 +169,10 @@ pub struct Session {
     pub stop_after_match: bool,
     /// times in a row the server refused to queue us
     refusals: u32,
+    /// the ladder address this connection is on, when known
+    pub remote: Option<String>,
+    /// reconnects in a row made because the connection was slow
+    slow_streak: u32,
     log: Option<std::fs::File>,
     log_day: String,
 }
@@ -231,7 +244,7 @@ fn diff_paths(a: &Value, b: &Value, path: &str, out: &mut Vec<String>) {
 
 impl Session {
     pub fn new(cfg: Config) -> Session {
-        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, refusals: 0, log: None, log_day: String::new() }
+        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, refusals: 0, remote: None, slow_streak: 0, log: None, log_day: String::new() }
     }
 
     pub fn queue_frame(&self) -> String {
@@ -294,7 +307,7 @@ impl Session {
                     // owner's matches ends, so ask again soon, a little later each time.
                     self.refusals += 1;
                     let wait = msg.get("retry_after_s").and_then(Value::as_u64).unwrap_or((2 + self.refusals as u64).min(15));
-                    vec![Out::RequeueAfter(wait.clamp(1, 120))]
+                    vec![Out::RequeueAfter(std::time::Duration::from_secs(wait.clamp(1, 120)))]
                 } else {
                     vec![]
                 }
@@ -313,6 +326,10 @@ impl Session {
 
     fn on_hello(&mut self, msg: &Value) -> Vec<Out> {
         self.refusals = 0;
+        // Behind the gateway the engine cannot see the socket; the gateway says where it is.
+        if let Some(r) = msg.get("_remote").and_then(Value::as_str) {
+            self.remote = Some(r.to_string());
+        }
         let id = msg.get("match_id").and_then(Value::as_str).unwrap_or("?").to_string();
         // The same match again means a reconnect: keep what we know.
         if self.cur.as_ref().map(|m| m.id != id).unwrap_or(true) {
@@ -362,6 +379,8 @@ impl Session {
                 truth_exact: 0,
                 truth_diffs: HashMap::new(),
                 min_budget_ms: i64::MAX,
+                charges: Vec::new(),
+                last_budget: None,
                 damage: Default::default(),
             });
         }
@@ -411,6 +430,10 @@ impl Session {
         }
         if let Some(b) = msg.get("self").and_then(|s| s.get("budget_ms_left")).and_then(Value::as_i64) {
             m.min_budget_ms = m.min_budget_ms.min(b);
+            if let Some(prev) = m.last_budget {
+                m.charges.push((prev - b).clamp(0, 60_000) as u32);
+            }
+            m.last_budget = Some(b);
         }
         let Some(tracker) = m.tracker.as_mut() else { return vec![Out::Send(idle)] };
 
@@ -513,9 +536,19 @@ impl Session {
             "loss" => self.losses += 1,
             _ => self.draws += 1,
         }
+        let mut slow = false;
         if let Some(mut m) = self.cur.take() {
             m.think_us.sort_unstable();
             let pct = |p: f64| m.think_us.get(((m.think_us.len() as f64 - 1.0) * p).max(0.0) as usize).copied().unwrap_or(0);
+            m.charges.sort_unstable();
+            let charge = |p: f64| m.charges.get(((m.charges.len() as f64 - 1.0) * p).max(0.0) as usize).copied().unwrap_or(0);
+            // Turns charged a full second were lost to the limit, whatever we sent.
+            let lost = m.charges.iter().filter(|c| **c >= 1000).count();
+            // A connection is slow when the trip, not the thinking, eats the turn: the
+            // ladder's edge addresses differ, and a connection keeps its address for life.
+            // (ARENA_SLOW_P50_MS moves the 180 ms line; the local tests set it to 0.)
+            let line = std::env::var("ARENA_SLOW_P50_MS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(180);
+            slow = m.charges.len() >= 20 && ((charge(0.5) > line && pct(0.5) < 50_000) || lost > 0);
             let mut diffs: Vec<(&String, &u32)> = m.truth_diffs.iter().collect();
             diffs.sort_by(|a, b| b.1.cmp(a.1));
             let line = json!({
@@ -526,6 +559,9 @@ impl Session {
                 "think_us": { "p50": pct(0.5), "p99": pct(0.99), "max": m.think_us.last() },
                 "sims": m.sims, "rejected_parts": m.rejected, "server_refusals": m.server_refusals, "panics": m.panics,
                 "min_budget_ms": if m.min_budget_ms == i64::MAX { Value::Null } else { json!(m.min_budget_ms) },
+                "charge_ms": if m.charges.is_empty() { Value::Null } else { json!({ "p50": charge(0.5), "p99": charge(0.99), "lost_turns": lost }) },
+                "remote": self.remote,
+                "slow_connection": slow,
                 "tracking": m.tracker.as_ref().map(|t| t.stats.to_json()),
                 "damage": m.damage,
                 "truth": if m.truth_checked > 0 {
@@ -550,8 +586,21 @@ impl Session {
         }
         if self.stop_after_match || self.cfg.max_matches.map(|n| self.played >= n).unwrap_or(false) {
             vec![Out::Done]
+        } else if slow && self.slow_streak < 4 {
+            // Try another connection before the next match; give up after four in a row
+            // so a ladder that is slow everywhere does not keep us reconnecting.
+            self.slow_streak += 1;
+            self.note("slow_connection", json!({ "remote": self.remote, "try": self.slow_streak }));
+            vec![Out::Reconnect]
         } else {
-            vec![Out::Send(self.queue_frame())]
+            if !slow {
+                self.slow_streak = 0;
+            }
+            if self.cfg.requeue_delay.is_zero() {
+                vec![Out::Send(self.queue_frame())]
+            } else {
+                vec![Out::RequeueAfter(self.cfg.requeue_delay)]
+            }
         }
     }
 }

@@ -2,19 +2,20 @@
 //!
 //!   fleet status                                  every bot: running? which release? today's record
 //!   fleet run <bot>                               the supervisor (launchd runs this)
-//!   fleet install <bot> | watch | collector | online | autopilot | status      install a launchd agent
-//!   fleet uninstall <bot> | watch | collector | online | autopilot | status
+//!   fleet gateway                                 one process holding the ladder connections of every bot with "gateway": true
+//!   fleet install <bot> | watch | collector | online | autopilot | status | gateway      install a launchd agent
+//!   fleet uninstall <bot> | watch | collector | online | autopilot | status | gateway
 //!   fleet stop <bot> | resume <bot> | restart <bot>
 //!   fleet deploy <bot> <release> [--version vN] [--force "<reason>"]
 //!
-//!   fleet stats [--by opponent|version|release|playbook|arm|arm-tier|map|seat|bot|cell] [--bot b]
+//!   fleet stats [--by opponent|version|release|playbook|arm|arm-tier|arm-remote|remote|connection|map|seat|bot|cell] [--bot b]
 //!               [--opponent o] [--version v] [--release r] [--experiment e] [--since 24h]
 //!               [--min-opp-rating 2400] [--all]
 //!   fleet compare <candidate> <baseline>          two sets of ladder games, each a release id or bot:version
 //!   fleet ingest [bot ...]                        read marshal logs into the store
 //!
 //!   fleet plan list | show <name> | add <file.json> | pause <name> | resume <name> | stop <name>
-//!   fleet plan add-arm <name> <arm> '<settings json>'
+//!   fleet plan add-arm <name> <arm> '<settings json>' | stop-arm <name> <arm> [--reason text]
 //!   fleet assign --bot b --opponent o --map m --seat n --match id     what the plan would hand out (writes the row)
 //!
 //!   fleet release list
@@ -258,6 +259,17 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                 Err(x) => return Err(format!("cannot add the arm: {x}")),
             }
         }
+        "stop-arm" => {
+            let name = a.word(2, "the experiment's name")?;
+            let arm = a.word(3, "the arm's name")?;
+            let x = store.experiment(name).map_err(e)?.ok_or_else(|| format!("no experiment named {name}"))?;
+            let why = a.get("--reason").unwrap_or("stopped by hand");
+            if store.stop_arm(x.id, arm, why).map_err(e)? == 0 {
+                return Err(format!("{name} has no running arm named {arm}"));
+            }
+            store.event(None, "arm_stopped", &json!({ "experiment": name, "arm": arm, "why": why }));
+            println!("arm {arm} of {name} is stopped ({why}); its games stay in the record");
+        }
         cmd @ ("pause" | "resume" | "stop") => {
             let name = a.word(2, "the experiment's name")?;
             let status = match cmd {
@@ -423,7 +435,7 @@ fn watch(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
 }
 
 /// Agents that are not bots.
-const SERVICES: [&str; 5] = ["watch", "collector", "online", "autopilot", "status"];
+const SERVICES: [&str; 6] = ["watch", "collector", "online", "autopilot", "status", "gateway"];
 
 /// Once a day: a snapshot of the store, and old tick logs of the bots we run compressed.
 /// Nothing is deleted except our own snapshots beyond the newest seven.
@@ -474,6 +486,7 @@ fn agent_spec(root: &Path, what: &str) -> (String, Vec<String>, std::path::PathB
         "watch" => ("com.victris.fleet-watch".into(), vec![bin, "watch".into()], root.join("logs").join("fleet-watch.log"), Some(300)),
         "collector" => ("com.victris.fleet-collector".into(), vec![bin, "collect".into(), "run".into()], root.join("logs").join("fleet-collector.log"), None),
         "autopilot" => ("com.victris.fleet-autopilot".into(), vec![bin, "autopilot".into(), "run".into()], root.join("logs").join("fleet-autopilot.log"), None),
+        "gateway" => ("com.victris.fleet-gateway".into(), vec![bin, "gateway".into()], root.join("logs").join("fleet-gateway.log"), None),
         "status" => ("com.victris.fleet-status".into(), vec![bin, "serve".into()], root.join("logs").join("fleet-status.log"), None),
         "online" => ("com.victris.fleet-online".into(), vec![bin, "online".into(), "run".into()], root.join("logs").join("fleet-online.log"), None),
         bot => (label(bot), vec![bin, "run".into(), bot.to_string()], root.join("logs").join(bot).join("run.log"), None),
@@ -542,6 +555,10 @@ fn main_inner() -> Result<i32, String> {
             let bot = a.word(1, "the bot's name")?;
             known(bot)?;
             store.set_halted(bot, Some(a.get("--reason").unwrap_or("stopped by hand"))).map_err(e)?;
+            if cfg.bot(bot).map(|b| b.gateway).unwrap_or(false) {
+                println!("{bot}: the gateway takes it off the ladder after its current match; it stays down until `fleet resume {bot}`");
+                return Ok(0);
+            }
             match supervise::restart_bot(&root, bot) {
                 Some(pid) => println!("{bot}: pid {pid} will finish its match and stay down until `fleet resume {bot}`"),
                 None => println!("{bot}: was not running; it stays down until `fleet resume {bot}`"),
@@ -555,6 +572,9 @@ fn main_inner() -> Result<i32, String> {
         }
         "restart" => {
             let bot = a.word(1, "the bot's name")?;
+            if cfg.bot(bot).map(|b| b.gateway).unwrap_or(false) {
+                return Err(format!("{bot} runs behind the gateway, which restarts its engine by itself; use `fleet deploy` to change what it runs"));
+            }
             match supervise::restart_bot(&root, bot) {
                 Some(pid) => println!("{bot}: pid {pid} will finish its match, then its supervisor starts it again"),
                 None => println!("{bot}: not running"),
@@ -579,7 +599,7 @@ fn main_inner() -> Result<i32, String> {
             };
             let by = a.get("--by").unwrap_or("version");
             if fleet::stats::group_column(by).is_none() {
-                return Err(format!("--by takes opponent, version, release, playbook, arm, arm-tier, map, seat, bot, cell or all; got '{by}'"));
+                return Err(format!("--by takes opponent, version, release, playbook, arm, arm-tier, arm-remote, remote, connection, map, seat, bot, cell or all; got '{by}'"));
             }
             print!("{}", table(by, &store.records(by, &f).map_err(e)?));
         }
@@ -725,6 +745,14 @@ fn main_inner() -> Result<i32, String> {
             fleet::report::write_csv(&snap, &dir).map_err(e)?;
             std::fs::write(dir.join("state.json"), fleet::report::state_json(&snap).to_string()).map_err(e)?;
             println!("{}", dir.display());
+        }
+        "gateway" => {
+            unsafe {
+                libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+                libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+            }
+            drop(store);
+            fleet::gateway::run(&root, std::sync::Arc::new(|| STOP.load(Ordering::Relaxed)));
         }
         "serve" => {
             unsafe {

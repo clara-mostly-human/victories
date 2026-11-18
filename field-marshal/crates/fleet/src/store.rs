@@ -226,7 +226,7 @@ impl Store {
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         // Columns added after the first version of the store.
-        for (table, column, kind) in [("matches", "opponent_rating", "REAL"), ("matches", "rating_before", "REAL"), ("arms", "stopped", "TEXT")] {
+        for (table, column, kind) in [("matches", "opponent_rating", "REAL"), ("matches", "rating_before", "REAL"), ("arms", "stopped", "TEXT"), ("matches", "remote", "TEXT"), ("matches", "charge_p50_ms", "INTEGER"), ("matches", "charge_p99_ms", "INTEGER"), ("matches", "lost_turns", "INTEGER")] {
             let has: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = ?1"), [column], |r| r.get(0))?;
             if has == 0 {
                 // Another process may add it at the same moment; that is fine.
@@ -268,7 +268,8 @@ impl Store {
         self.conn.execute(
             "UPDATE matches SET ended_ms = ?3, result = ?4, reason = ?5, final_tick = ?6, rating_change = ?7, voided = ?8,
                replay_url = ?9, opponent_version = ?10, think_p50_us = ?11, think_p99_us = ?12, think_max_us = ?13,
-               mismatches = ?14, panics = ?15, refusals = ?16, min_budget_ms = ?17, detail = ?18
+               mismatches = ?14, panics = ?15, refusals = ?16, min_budget_ms = ?17, detail = ?18,
+               remote = ?19, charge_p50_ms = ?20, charge_p99_ms = ?21, lost_turns = ?22
              WHERE match_id = ?1 AND bot = ?2",
             params![
                 id,
@@ -289,6 +290,10 @@ impl Store {
                 i(line, "server_refusals"),
                 i(line, "min_budget_ms"),
                 detail.to_string(),
+                s(line, "remote"),
+                line.get("charge_ms").and_then(|c| i(c, "p50")),
+                line.get("charge_ms").and_then(|c| i(c, "p99")),
+                line.get("charge_ms").and_then(|c| i(c, "lost_turns")),
             ],
         )
     }
