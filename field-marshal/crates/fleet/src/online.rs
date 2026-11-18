@@ -191,6 +191,24 @@ pub fn recent_think_p99_ms(root: &Path, bot: &str) -> Option<f64> {
     Some(us[(us.len() - 1) * 99 / 100] as f64 / 1000.0)
 }
 
+/// Seconds since the bot last answered a turn, from the end of its log. This is what says
+/// whether a bot is playing right now: a process can be up, connected and queued, and
+/// still be given no match.
+pub fn last_turn_age_s(root: &Path, bot: &str) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let dir = root.join("logs").join(bot);
+    let newest = std::fs::read_dir(&dir).ok()?.filter_map(|f| f.ok()).map(|f| f.path()).filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false)).max()?;
+    let mut f = std::fs::File::open(newest).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(60_000))).ok()?;
+    let mut bytes = Vec::new();
+    f.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    let ts = text.lines().rev().filter(|l| l.contains("\"t\":\"tick\"")).find_map(|l| serde_json::from_str::<Value>(l).ok()?.get("ts")?.as_i64())?;
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_millis() as i64;
+    Some((now - ts).max(0) as f64 / 1000.0)
+}
+
 /// Connections the ladder dropped on our bots in the last `window_ms`, counted from the
 /// ends of their logs (`disconnected` lines whose reason is a reset or a closed socket).
 pub fn recent_resets(root: &Path, bots: &[String], window_ms: i64) -> usize {
@@ -241,6 +259,141 @@ pub fn log_line(root: &Path, kind: &str, text: &str) {
     eprintln!("{line}");
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(alert_log(root)) {
         let _ = writeln!(f, "{line}");
+    }
+}
+
+// ---- stall check ----------------------------------------------------------------------------
+//
+// "Online" is not "playing". On 2026-11-18 the ladder gave none of our five bots a match
+// for four minutes (each was refused with the owner's match limit right after its game),
+// every process was up and connected, and a person looking at the status page saw it
+// first. A bot that has answered no turn for two minutes is stalled: say so, say why as
+// far as its log tells, restart it when that can help, and say when it is over.
+
+/// A bot is stalled when it has answered no turn for this long.
+pub const STALL_AFTER_S: f64 = 120.0;
+
+/// Why a bot has answered no turn lately, read from the end of its log: what happened
+/// after its last turn. Plain words for the alert log and the status page.
+pub fn stall_cause(root: &Path, bot: &str) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let dir = root.join("logs").join(bot);
+    let Some(newest) = std::fs::read_dir(&dir).ok().and_then(|d| d.filter_map(|f| f.ok()).map(|f| f.path()).filter(|p| p.extension().map(|x| x == "jsonl").unwrap_or(false)).max()) else {
+        return "it has no log".into();
+    };
+    let Ok(mut f) = std::fs::File::open(newest) else { return "its log cannot be read".into() };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    let _ = f.seek(SeekFrom::Start(len.saturating_sub(60_000)));
+    let mut bytes = Vec::new();
+    let _ = f.read_to_end(&mut bytes);
+    let text = String::from_utf8_lossy(&bytes);
+    let lines: Vec<&str> = text.lines().collect();
+    let after = lines.iter().rposition(|l| l.contains("\"t\":\"tick\"")).map(|k| k + 1).unwrap_or(0);
+    let mut refused: Option<String> = None;
+    let mut drops = 0;
+    let mut started = false;
+    for v in lines[after..].iter().filter_map(|l| serde_json::from_str::<Value>(l).ok()) {
+        match v.get("t").and_then(Value::as_str) {
+            Some("server_error") => {
+                let d = v.get("detail");
+                let code = d.and_then(|d| d.get("code")).and_then(Value::as_str).unwrap_or("?");
+                let msg = d.and_then(|d| d.get("message")).and_then(Value::as_str).unwrap_or("");
+                refused = Some(if msg.is_empty() { code.to_string() } else { format!("{code}: {msg}") });
+            }
+            Some("disconnected") => drops += 1,
+            Some("hello") => started = true,
+            _ => {}
+        }
+    }
+    let mut parts = Vec::new();
+    if let Some(r) = refused {
+        parts.push(format!("the ladder refused to queue it ({r})"));
+    }
+    if drops > 0 {
+        parts.push(format!("its connection was dropped {drops} time{} since", if drops == 1 { "" } else { "s" }));
+    }
+    if started {
+        parts.push("a match was started but no turn has been answered".to_string());
+    }
+    if parts.is_empty() {
+        "it is connected and queued, and the ladder has given it no match".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
+/// The bots that are stalled right now, each with how long and why. For the status page.
+pub fn stalls(root: &Path, cfg: &Config) -> Vec<(String, f64, String)> {
+    cfg.bots
+        .iter()
+        .filter(|b| b.expect_online)
+        .filter_map(|b| {
+            let age = last_turn_age_s(root, &b.name)?;
+            (age >= STALL_AFTER_S).then(|| (b.name.clone(), age, stall_cause(root, &b.name)))
+        })
+        .collect()
+}
+
+#[derive(Default)]
+struct Stalls {
+    /// when each stalled bot was first reported
+    since: HashMap<String, Instant>,
+    /// when each bot was last restarted for a stall
+    acted: HashMap<String, Instant>,
+    last_action: Option<Instant>,
+    fleet_wide: bool,
+}
+
+impl Stalls {
+    fn check(&mut self, root: &Path, cfg: &Config) {
+        let now = stalls(root, cfg);
+        let watched = cfg.bots.iter().filter(|b| b.expect_online).count();
+        let store = Store::open(&default_db(root), Duration::from_secs(2)).ok();
+        // Over: a bot that was reported answers turns again.
+        let over: Vec<String> = self.since.keys().filter(|b| !now.iter().any(|(n, _, _)| n == *b)).cloned().collect();
+        for bot in over {
+            let took = self.since.remove(&bot).map(|t| t.elapsed().as_secs()).unwrap_or(0);
+            log_line(root, "STALL", &format!("over: {bot} answers turns again, about {} s after it was reported", took));
+            if let Some(s) = &store {
+                s.event(Some(&bot), "stall_over", &json!({ "after_report_s": took }));
+            }
+        }
+        // Most of the fleet at once is not a bot's fault: restarting them all would only
+        // open a row of new connections, which the ladder throttles.
+        let wide = watched >= 3 && now.len() * 3 >= watched * 2;
+        if wide && !self.fleet_wide {
+            log_line(root, "STALL", &format!("{} of {watched} bots have no match at once: this is on the ladder's side or the owner's match limit, not one bot. No bot is restarted for it.", now.len()));
+        }
+        self.fleet_wide = wide;
+        for (bot, age, cause) in &now {
+            if !self.since.contains_key(bot) {
+                self.since.insert(bot.clone(), Instant::now());
+                log_line(root, "STALL", &format!("{bot} has answered no turn for {age:.0} s: {cause}"));
+                if let Some(s) = &store {
+                    s.event(Some(bot), "stall", &json!({ "no_turn_s": age.round(), "cause": cause }));
+                }
+            }
+            // What can be fixed from here: a bot of ours that alone sits without a match gets
+            // a fresh process, connection and queue request. One bot at a time, each at most
+            // once in ten minutes. Never the flagship (its own thread runs it), never a bot
+            // behind the gateway (the gateway holds its connection).
+            let Some(b) = cfg.bot(bot) else { continue };
+            let may = cfg.stall_restarts && b.managed && !b.gateway && b.role != "flagship" && !wide;
+            let rested = self.acted.get(bot).map(|t| t.elapsed() >= Duration::from_secs(600)).unwrap_or(true);
+            let spaced = self.last_action.map(|t| t.elapsed() >= Duration::from_secs(60)).unwrap_or(true);
+            if may && rested && spaced && *age >= STALL_AFTER_S + 30.0 {
+                if let Some(pid) = crate::supervise::bot_pid(root, bot) {
+                    if crate::supervise::signal(pid, libc::SIGTERM) {
+                        self.acted.insert(bot.clone(), Instant::now());
+                        self.last_action = Some(Instant::now());
+                        log_line(root, "STALL", &format!("{bot}: restarted (pid {pid}) for a fresh connection and a new queue request"));
+                        if let Some(s) = &store {
+                            s.event(Some(bot), "stall_restart", &json!({ "pid": pid, "no_turn_s": age.round() }));
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -326,6 +479,7 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
     let mut api_down_since: Option<Instant> = None;
     let mut api_alerted = false;
     let mut guard = Guard { paused: false, calm: 0, resetting: false, reset_calm: 0 };
+    let mut stalled = Stalls::default();
     eprintln!("{} watchdog started", utc_stamp());
     while !stop() {
         // The list is read each round, so a config edit needs no restart.
@@ -409,6 +563,7 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
             if Instant::now() >= next_guard {
                 next_guard = Instant::now() + Duration::from_secs(15);
                 guard.check(root, &cfg);
+                stalled.check(root, &cfg);
             }
             std::thread::sleep(Duration::from_millis(500));
         }

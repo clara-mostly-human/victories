@@ -2,7 +2,7 @@
 //! minutes by the health pass) and as a short text digest (`fleet digest`).
 
 use crate::config::Config;
-use crate::online::{alert_log, load_average, pause_file, recent_think_p99_ms, utc_stamp};
+use crate::online::{alert_log, last_turn_age_s, load_average, pause_file, recent_think_p99_ms, utc_stamp};
 use crate::stats::{Filter, Record};
 use crate::store::{now_ms, Store};
 use crate::supervise::bot_pid;
@@ -24,6 +24,8 @@ pub struct BotLine {
     pub rating_day: f64,
     pub last_game_ms: Option<i64>,
     pub think_p99_ms: Option<f64>,
+    /// seconds since the bot last answered a turn (from its log)
+    pub last_turn_s: Option<f64>,
 }
 
 /// One finished game, as the bot and the ladder snapshot know it.
@@ -208,7 +210,15 @@ fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>
             rank,
             rating_day: version_change,
             last_game_ms: one(store, "SELECT MAX(COALESCE(ended_ms, started_ms)) FROM matches WHERE bot = ?1", [&b.name]),
-            think_p99_ms: recent_think_p99_ms(root, &b.name),
+            // The last 90 seconds of turns when the bot is in a match; between matches, the
+            // last finished game's figure, so the column is never empty for a bot that plays.
+            think_p99_ms: recent_think_p99_ms(root, &b.name).or_else(|| {
+                store
+                    .conn
+                    .query_row("SELECT think_p99_us / 1000.0 FROM matches WHERE bot = ?1 AND result IS NOT NULL AND think_p99_us IS NOT NULL ORDER BY started_ms DESC LIMIT 1", [&b.name], |r| r.get(0))
+                    .ok()
+            }),
+            last_turn_s: last_turn_age_s(root, &b.name),
         });
     }
     let mut arms = Vec::new();
@@ -278,13 +288,20 @@ fn utc_time(ms: i64) -> String {
     format!("{:02}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
 }
 
-fn state(b: &BotLine) -> (&'static str, &'static str) {
+/// What the bot is doing, and how to colour it. "playing" means it answered a turn within
+/// the last 90 seconds; a bot that is up but has been given no match for longer says so,
+/// with how long.
+fn state(b: &BotLine) -> (String, &'static str) {
     let stale = b.last_game_ms.map(|t| now_ms() - t > 900_000).unwrap_or(true);
     match (b.halted.is_some(), b.running, stale) {
-        (true, _, _) => ("halted", "bad"),
-        (_, Some(false), _) => ("down", "bad"),
-        (_, _, true) => ("quiet", "warn"),
-        _ => ("playing", "good"),
+        (true, _, _) => ("halted".into(), "bad"),
+        (_, Some(false), _) => ("down".into(), "bad"),
+        (_, _, true) => ("quiet".into(), "warn"),
+        _ => match b.last_turn_s {
+            Some(s) if s <= 90.0 => ("playing".into(), "good"),
+            Some(s) if s < 3600.0 => (format!("no match for {:.0} min", (s / 60.0).max(2.0)), "warn"),
+            _ => ("no match".into(), "warn"),
+        },
     }
 }
 
@@ -706,6 +723,7 @@ pub fn state_json(s: &Snapshot) -> serde_json::Value {
             "bot": b.name, "role": b.role, "state": state(b).0, "release": b.release, "version": b.version,
             "rating": b.rating.map(|r| r.round()), "rating_change_24h": b.rating_day.round(), "games_24h": b.day.games(), "games_last_hour": b.hour_games,
             "wins": b.day.wins, "losses": b.day.losses, "draws": b.day.draws, "score_pct": pct(&b.day), "think_p99_ms": b.think_p99_ms.map(|p| p.round()),
+            "last_turn_s": b.last_turn_s.map(|t| t.round()),
         })).collect::<Vec<_>>(),
         "arms": s.arms.iter().map(|a| {
             let (lo, hi) = a.record.interval();

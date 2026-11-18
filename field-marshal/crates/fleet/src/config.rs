@@ -64,6 +64,9 @@ pub struct Config {
     /// may the autopilot move the scouts and the canary to new builds by itself? (false:
     /// it still builds and gates, but a bot changes release only when a commit is named)
     pub autopilot_moves_bots: bool,
+    /// may the watchdog restart a bot of ours that sits without a match? (default false:
+    /// it only reports the stall and its cause)
+    pub stall_restarts: bool,
 }
 
 impl Default for Config {
@@ -71,7 +74,7 @@ impl Default for Config {
         Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0, habits_bots: vec!["StuartSutcliffe".into(), "Shelbot4".into()], corpus_branch: false, prefer_addresses: Vec::new(), queue_gap_ms: 1000,
             // The ladder's own quotas are 20,000 matches a day per owner and one match start
             // per bot every 300 ms; these sit well inside them.
-            comms_connects_per_minute: 20, comms_queues_per_minute: 90, comms_matches_per_day: 15_000, ladder_refresh_minutes: 0, baseline_playbooks: vec!["matrix-5".into()], autopilot_moves_bots: true }
+            comms_connects_per_minute: 20, comms_queues_per_minute: 90, comms_matches_per_day: 15_000, ladder_refresh_minutes: 0, baseline_playbooks: vec!["matrix-5".into()], autopilot_moves_bots: true, stall_restarts: false }
     }
 }
 
@@ -115,6 +118,7 @@ impl Config {
             comms_queues_per_minute: comms("queues_per_minute", d.comms_queues_per_minute),
             comms_matches_per_day: comms("matches_per_day", d.comms_matches_per_day),
             ladder_refresh_minutes: v.get("ladder_refresh_minutes").and_then(Value::as_u64).unwrap_or(0),
+            stall_restarts: v.get("stall_restarts").and_then(Value::as_bool).unwrap_or(false),
             autopilot_moves_bots: v.get("autopilot_moves_bots").and_then(Value::as_bool).unwrap_or(true),
             baseline_playbooks: v.get("baseline_playbooks").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).filter(|l: &Vec<String>| !l.is_empty()).unwrap_or(d.baseline_playbooks),
         }
