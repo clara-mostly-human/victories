@@ -233,8 +233,11 @@ impl Autopilot {
             }
         }
 
-        // 3. The scouts' base: a fleet build of the commit the flagship runs.
-        if let Some(sha) = &live_sha {
+        // 3. The scouts' base: a fleet build of the commit the flagship runs. Off when
+        // `"autopilot_moves_bots": false`: then a scout or the canary changes release only
+        // when someone names the commit (`fleet deploy`, `fleet release canary`), because
+        // every move is a restart and a new connection to the ladder.
+        if let (Some(sha), true) = (&live_sha, cfg.autopilot_moves_bots) {
             let builds = fleet_builds(&store);
             let mirror = match builds.iter().find(|r| same_bot(root, sha, &r.git_sha) == Some(true)) {
                 Some(r) => Some(r.clone()),
@@ -342,7 +345,7 @@ impl Autopilot {
         let builds = fleet_builds(&store);
         // (A release promoted straight to live by the flagship's thread counts too: the
         // canary always carries the newest search that is allowed on the ladder.)
-        if let Some(pass) = builds.iter().find(|r| r.status == "gated" || r.status == "live") {
+        if let (Some(pass), true) = (builds.iter().find(|r| r.status == "gated" || r.status == "live"), cfg.autopilot_moves_bots) {
             let on_canary: Vec<i64> = cfg
                 .bots
                 .iter()

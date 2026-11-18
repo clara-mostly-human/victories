@@ -55,5 +55,6 @@
   },
   "ladder_refresh_minutes": 30,
   "baseline_playbooks": ["matrix-5", "matrix-6"],
-  "corpus_branch": true
+  "corpus_branch": true,
+  "autopilot_moves_bots": false
 }

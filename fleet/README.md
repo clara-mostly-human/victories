@@ -177,6 +177,12 @@ Two experiments can run at once. One against named opponents (no bare `"*"` in i
 wide experiment. `"priority"` in the file overrides this. Its baseline counts only games
 against its own opponents.
 
+With `"autopilot_moves_bots": false` in `fleet/bots.json` (the setting since 2026-11-18)
+the autopilot still builds and gates each new bot commit, but it never moves a scout or
+the canary by itself: a bot changes release only when a commit is named and someone runs
+`fleet release canary <id>` and `fleet deploy <bot> <id>`, one bot at a time. Every move
+is a restart and a new connection, and new connections close together came with resets.
+
 The autopilot stops an arm early in two cases: two standard errors behind the control arm
 after 100 games (control's games over the arm's own time), or three standard errors behind
 the baseline that `plan show` prints after 30 games, provided it is also behind control. A
