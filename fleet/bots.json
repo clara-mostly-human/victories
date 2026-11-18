@@ -1,6 +1,7 @@
 {
   "bots": {
     "field-marshal": {
+      "gateway": true,
       "role": "flagship",
       "managed": false,
       "experiments": false,
@@ -9,6 +10,7 @@
       "owner": "the search thread (Build the main bot engine and client)"
     },
     "foot-soldier": {
+      "gateway": true,
       "role": "canary",
       "managed": true,
       "experiments": false,
@@ -17,6 +19,7 @@
       "owner": "the fleet (infrastructure thread)"
     },
     "shock-trooper": {
+      "gateway": true,
       "role": "scout",
       "managed": true,
       "experiments": true,
@@ -34,6 +37,7 @@
       "gateway": true
     },
     "spy-master": {
+      "gateway": true,
       "role": "scout",
       "managed": true,
       "experiments": true,
@@ -56,5 +60,8 @@
   "ladder_refresh_minutes": 5,
   "baseline_playbooks": ["matrix-5", "matrix-6"],
   "corpus_branch": true,
-  "autopilot_moves_bots": false
+  "autopilot_moves_bots": false,
+  "gateway": {
+    "ping_reject_ms": 120
+  }
 }

@@ -247,12 +247,17 @@ pub struct Shared {
     pub health: Mutex<HashMap<String, Value>>,
     /// which of our bots are queued (1) or in a match (2)
     active: Mutex<HashMap<String, u8>>,
+    /// the socket-test thresholds, in ms; re-read from `fleet/bots.json` while running
+    pub ping_reject_ms: AtomicU64,
+    pub slow_wire_ms: AtomicU64,
 }
 
 impl Shared {
     pub fn new(opt: Options, cfg: &Config) -> Shared {
         let now = Instant::now();
         Shared {
+            ping_reject_ms: AtomicU64::new(opt.ping_reject_ms.max(0.0) as u64),
+            slow_wire_ms: AtomicU64::new(opt.slow_wire_ms.max(1.0) as u64),
             connect_budget: Budget::new("connection", cfg.comms_connects_per_minute, Duration::from_secs(60)),
             queue_budget: Budget::new("queue request", cfg.comms_queues_per_minute, Duration::from_secs(60)),
             match_budget: Budget::new("match", cfg.comms_matches_per_day, Duration::from_secs(86_400)),
@@ -781,7 +786,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         if !flow.in_match {
             ping_ms = ping_test(&mut ws, &mut inbox);
             if let Some(ms) = ping_ms {
-                if opt.ping_reject_ms > 0.0 && ms > opt.ping_reject_ms && bad_sockets < 4 && inbox.is_empty() {
+                let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
+                if reject > 0.0 && ms > reject && bad_sockets < 4 && inbox.is_empty() {
                     bad_sockets += 1;
                     if bad_sockets == 1 {
                         bad_since = Instant::now();
@@ -818,6 +824,11 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         let mut last_ping = Instant::now();
         let mut ping_sent: Option<Instant> = None;
         let mut last_slow_check = Instant::now();
+        // keepalive pings in a row that were slower than the limit (the test at connect counts)
+        let mut slow_pings: u32 = match ping_ms {
+            Some(ms) if shared.ping_reject_ms.load(Ordering::Relaxed) > 0 && ms > shared.ping_reject_ms.load(Ordering::Relaxed) as f64 => 2,
+            _ => 0,
+        };
         let mut last_tick_1s = Instant::now() - Duration::from_secs(2);
         // socket testing in play
         let mut last_budget: Option<i64> = None;
@@ -873,7 +884,10 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     Ok(Message::Pong(_)) => {
                         last_heard = Instant::now();
                         if let Some(at) = ping_sent.take() {
-                            ping_ms = Some(at.elapsed().as_secs_f64() * 1000.0);
+                            let ms = at.elapsed().as_secs_f64() * 1000.0;
+                            ping_ms = Some(ms);
+                            let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
+                            slow_pings = if reject > 0.0 && ms > reject { slow_pings + 1 } else { 0 };
                         }
                     }
                     Ok(_) => last_heard = Instant::now(),
@@ -971,7 +985,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         if wires.len() >= 20 && wires.len() % 5 == 0 || lost >= 2 {
                             let m = median(&wires);
                             wire_ms = Some(m);
-                            if (wires.len() >= 20 && m > opt.slow_wire_ms) || lost >= 2 {
+                            if (wires.len() >= 20 && m > shared.slow_wire_ms.load(Ordering::Relaxed) as f64) || lost >= 2 {
                                 replace_why = Some(format!("slow socket: wire time {m:.0} ms over {} turns, {lost} turns lost on the wire", wires.len()));
                             }
                         }
@@ -990,7 +1004,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         if wires.len() >= 20 {
                             let m = median(&wires);
                             wire_ms = Some(m);
-                            if m <= opt.slow_wire_ms && lost < 2 {
+                            if m <= shared.slow_wire_ms.load(Ordering::Relaxed) as f64 && lost < 2 {
                                 // A good match on this socket: the run of slow ones is over.
                                 bad_sockets = 0;
                             }
@@ -1303,13 +1317,20 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                 why_closed = "no traffic and no pong for 45 s".into();
                 break 'conn;
             }
-            if last_ping.elapsed() > Duration::from_secs(20) {
+            // The keepalive ping doubles as the socket test between matches: every 20 s, and
+            // again after 3 s when the last one was slow, to be sure before acting on it.
+            if last_ping.elapsed() > Duration::from_secs(if slow_pings > 0 && !flow.in_match { 3 } else { 20 }) && ping_sent.is_none() {
                 last_ping = Instant::now();
                 ping_sent = Some(Instant::now());
                 if ws.send(Message::Ping(vec![b'g', b'w'])).is_err() {
                     why_closed = "ping failed".into();
                     break 'conn;
                 }
+            }
+            // Between matches a slow socket costs nothing to replace: do it before the next
+            // match starts on it.
+            if !flow.in_match && replace_why.is_none() && slow_pings >= 2 {
+                replace_why = Some(format!("slow socket: ping {} ms, twice in a row, between matches", ping_ms.map(|x| x.round()).unwrap_or(0.0)));
             }
             // A slow socket is replaced: at once in a match (the match resumes on the new
             // one), spaced across the fleet, and not for ever for one bot.
@@ -1333,7 +1354,12 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                             }
                         }
                         shared.replaced.fetch_add(1, Ordering::Relaxed);
-                        event(root, name, "slow_socket", json!({ "remote": remote.to_string(), "wire_ms": wire_ms.map(|x| x.round()), "lost_turns": lost, "in_a_row": bad_sockets, "found": "in play", "in_match": flow.in_match }));
+                        event(root, name, "slow_socket", json!({ "remote": remote.to_string(), "ping_ms": ping_ms.map(|x| x.round()), "wire_ms": wire_ms.map(|x| x.round()), "lost_turns": lost, "in_a_row": bad_sockets, "found": if flow.in_match { "in play" } else { "between matches" }, "in_match": flow.in_match }));
+                        if queued && !flow.in_match {
+                            // Out of the queue first, so no match starts on the socket we close.
+                            let _ = send(&mut ws, shared, json!({ "type": "leave" }).to_string());
+                            shared.set_active(name, 0);
+                        }
                         let _ = ws.close(None);
                         voluntary = true;
                         why_closed = why;
@@ -1639,6 +1665,7 @@ pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
     let mut running: Vec<(String, std::thread::JoinHandle<()>)> = Vec::new();
     let mut last_report = Instant::now();
     let mut last_verdict = String::new();
+    let mut last_options = Instant::now();
     eprintln!("gateway started");
     {
         let (root, shared, stop) = (root.to_path_buf(), shared.clone(), stop.clone());
@@ -1659,6 +1686,13 @@ pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
                     running.push((b.name.clone(), h));
                 }
             }
+        }
+        if last_options.elapsed() >= Duration::from_secs(10) {
+            // The socket-test limits can be changed while the gateway runs.
+            last_options = Instant::now();
+            let o = Options::load(root);
+            shared.ping_reject_ms.store(o.ping_reject_ms.max(0.0) as u64, Ordering::Relaxed);
+            shared.slow_wire_ms.store(o.slow_wire_ms.max(1.0) as u64, Ordering::Relaxed);
         }
         if last_state.elapsed() >= Duration::from_secs(2) {
             // The gateway's state and the health verdict, for `fleet status`, `fleet health`
