@@ -514,11 +514,17 @@ fn sparkline(trend: &[Option<f64>], w: f64, h: f64) -> String {
     let x = |k: usize| 1.0 + (w - 2.0) * k as f64 / (n - 1.0);
     let y = |v: f64| 1.0 + (h - 2.0) * (1.0 - v.clamp(0.0, 400.0) / 400.0);
     let mut path = String::new();
+    let mut dots = String::new();
     let mut pen_up = true;
     for (k, v) in trend.iter().enumerate() {
         match v {
             Some(v) => {
                 path.push_str(&format!("{}{:.1},{:.1} ", if pen_up { "M" } else { "L" }, x(k), y(*v)));
+                // A minute with no neighbour would draw nothing: give it a dot.
+                let alone = (k == 0 || trend[k - 1].is_none()) && trend.get(k + 1).map(|n| n.is_none()).unwrap_or(true);
+                if alone {
+                    dots.push_str(&format!("<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"2\"/>", x(k), y(*v)));
+                }
                 pen_up = false;
             }
             None => pen_up = true,
@@ -527,7 +533,7 @@ fn sparkline(trend: &[Option<f64>], w: f64, h: f64) -> String {
     let last = trend.iter().rev().flatten().next().copied();
     let class = ping_class(last);
     format!(
-        "<svg class=\"spark {class}\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\" role=\"img\" aria-label=\"ping over the last hour\"><line x1=\"0\" x2=\"{w}\" y1=\"{l:.1}\" y2=\"{l:.1}\" class=\"limit\"/><path d=\"{path}\"/></svg>",
+        "<svg class=\"spark {class}\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\" role=\"img\" aria-label=\"ping over the last hour\"><line x1=\"0\" x2=\"{w}\" y1=\"{l:.1}\" y2=\"{l:.1}\" class=\"limit\"/><path d=\"{path}\"/>{dots}</svg>",
         l = y(120.0)
     )
 }
@@ -542,7 +548,7 @@ fn rotation_text(r: &serde_json::Value, long: bool) -> String {
     let eta = r.get("eta_ms").and_then(|x| x.as_i64());
     if long {
         format!(
-            "Yes, because of a {}. Place in the queue: {pos} of {of}. Waiting for {}. Estimated {}.",
+            "Yes: {}. Place in the queue: {pos} of {of}. Waiting for {}. Estimated {}.",
             esc(r.get("reason").and_then(|x| x.as_str()).unwrap_or("slow socket")),
             esc(r.get("waiting_for").and_then(|x| x.as_str()).unwrap_or("its turn")),
             eta.map(|t| format!("at {} (in {})", at(t), span(now_ms(), t))).unwrap_or_else(|| "when its turn comes".into())
@@ -637,7 +643,7 @@ fn net_dialog(b: &BotLine) -> String {
         }
     }
     let lost_html = if n.lost.is_empty() {
-        "<p class=\"sub\">No turn lost in the last 24 hours, as far as the gateway has recorded (it records them since 2026-11-18 17:20 UTC).</p>".to_string()
+        "<p class=\"sub\">No turn lost in the last 24 hours, as far as the gateway has recorded (it records them since 2026-11-18 17:15 UTC).</p>".to_string()
     } else {
         let cause_text = |c: &str| match c {
             "reset" => "the ladder dropped the connection mid-match; it played these turns idle until the match resumed",
@@ -683,7 +689,7 @@ fn net_dialog(b: &BotLine) -> String {
 <tr><th></th><th class="n">Now</th><th class="n">Last minute</th><th class="n">Last 5 minutes</th><th class="n">Last hour</th></tr>
 {ping}{wire}{charge}{answer}
 </table></div>
-<p class="note">Ping is the round trip on the socket (at connect, then every 20 seconds). Wire is what the ladder charged for a turn less the time the bot took: the time on the wire. Charged is what the ladder billed; the bot's answer is its own time. Each cell is the mean, with the least and greatest under it. A good socket is about 40 to 65 ms ping and 70 ms on the wire; a slow one 150 and 300.</p>
+<p class="note">Ping is the round trip on the socket (at connect, then every 20 seconds, and every 3 seconds between matches while it is slow). Wire is what the ladder charged for a turn less the time the bot took: the time on the wire. Charged is what the ladder billed; the bot's answer is its own time. Each cell is the mean, with the least and greatest under it. A good socket is about 40 to 65 ms ping and 70 ms on the wire; a slow one 150 and 300.</p>
 <h4>Ping over the last hour, all its sockets</h4>
 <div class="bigspark">{big}</div>
 <h4>Turns lost, last 24 hours</h4>
@@ -912,6 +918,7 @@ button.net:hover, button.net:focus-visible {{ outline: 2px solid var(--accent); 
 svg.spark path {{ fill: none; stroke: var(--muted); stroke-width: 1.6; stroke-linejoin: round; }}
 svg.spark.good path {{ stroke: var(--good); }} svg.spark.warn path {{ stroke: var(--warn); }} svg.spark.bad path {{ stroke: var(--bad); }}
 svg.spark .limit {{ stroke: var(--line); stroke-dasharray: 3 3; }}
+svg.spark circle {{ fill: var(--muted); }} svg.spark.good circle {{ fill: var(--good); }} svg.spark.warn circle {{ fill: var(--warn); }} svg.spark.bad circle {{ fill: var(--bad); }}
 svg.bars rect.zero {{ fill: var(--line); }} svg.bars rect.warn {{ fill: var(--warn); }} svg.bars rect.bad {{ fill: var(--bad); }}
 .bigspark {{ background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }}
 .bigspark svg {{ width: 100%; height: 90px; }}
