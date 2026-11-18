@@ -54,7 +54,8 @@ def main():
     ap.add_argument("--gap", type=float, default=1.5)
     ap.add_argument("--top", type=int, default=12)
     ap.add_argument("--ours", default="field-marshal,foot-soldier,shock-trooper,quarter-master,spy-master")
-    ap.add_argument("--ours-share", type=float, default=0.4)
+    # Our own games first: the fight scorecards are about our arms (2026-11-18).
+    ap.add_argument("--ours-share", type=float, default=0.8)
     a = ap.parse_args()
 
     index_path = os.path.join(a.out, "index.jsonl")
