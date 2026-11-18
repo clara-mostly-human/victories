@@ -1,0 +1,10 @@
+{
+  "name": "pad-race",
+  "note": "Workstream 6 of the field-marshal plan. padstats over the replay corpus: a power pad multiplies damage by 3/2 for 50 ticks, the two power pads sit 7 tiles from each spawn and first appear at tick 20, and the strong bots are standing on one at tick 23. In our 50 corpus games against the three top owners and the two strong house bots they took the first power pad 39 times and averaged 1.64 power pads a game to our 0.54; over all our games it is 1.59 to 0.99, and we win 50% of the games where we take the first one against 35% where they do. Among themselves the strong bots split the pads evenly. Cause: our policy sets out for a pad only 3 ticks before it appears and only from within 7 tiles. This arm leaves in time to be on the pad when it appears (2 ticks a tile plus 4, within 9 tiles). Predicts: beats control, most against strong bots, with power pads taken rising from about 1 to about 1.5 a game. Needs a release at or after the commit that adds pad_race. Every opponent, balanced by opponent, map and seat.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "pad-race": { "pad_race": true }
+  }
+}

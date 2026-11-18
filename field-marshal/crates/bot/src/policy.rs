@@ -117,6 +117,11 @@ pub struct Playbook {
     /// the plain opponent of `prior_weight` is replaced by the measured one: how the strong
     /// bots on the ladder really move and attack in the opponent's situation (`oppmodel`)
     pub prior_model: bool,
+    /// walk to a power pad early enough to be standing there when it appears, instead of
+    /// setting out three ticks before. Replays: the strong bots are on the first power pad
+    /// at tick 23 (it appears at tick 20) and took it in 39 of our 50 games against them;
+    /// they average 1.64 power pads a game against us to our 0.54.
+    pub pad_race: bool,
     /// search: what a dash costs the opponent in our model of it. We value our own dash
     /// highly (`dash_cost`), but the ladder's best spend theirs freely to dash in and
     /// fire, so their price can be set lower.
@@ -239,6 +244,7 @@ impl Default for Playbook {
             prior_weight: 0.0,
             prior_hold: 0.5,
             prior_model: false,
+            pad_race: false,
             rollout_punish: false,
             press_bonus: 0.0,
             tempo_weight: 1.0,
@@ -330,7 +336,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -1150,13 +1156,17 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         let mut best: Option<(i32, P, &'static str)> = None;
         for (i, def) in e.map.pads.iter().enumerate() {
             let pad = s.pads[i];
-            let soon = pad.available || pad.respawn_tick - s.tick <= 3;
+            let d = chebyshev(my.pos, def.pos);
+            // A step takes two ticks, so a pad d tiles away is 2d ticks off; with `pad_race`
+            // we leave for a power pad in time to be on it when it appears.
+            let racing = pb.pad_race && def.kind == PadKind::Power;
+            let lead = if racing { 2 * d + 4 } else { 3 };
+            let soon = pad.available || pad.respawn_tick - s.tick <= lead;
             let wanted = match def.kind {
                 PadKind::Health => missing >= pb.health_pad_missing_hp,
                 PadKind::Power => my.power_until == NO_BUFF,
             };
-            let d = chebyshev(my.pos, def.pos);
-            let reach = if def.kind == PadKind::Health { 10 } else { 7 };
+            let reach = if def.kind == PadKind::Health { 10 } else if racing { 9 } else { 7 };
             // Do not race the opponent to a pad it is clearly closer to.
             let contested = visible && chebyshev(en.pos, def.pos) + 1 < d;
             if soon && wanted && d <= reach && !contested && !outside(def.pos, zone_now) && best.map(|(bd, _, _)| d < bd).unwrap_or(true) {

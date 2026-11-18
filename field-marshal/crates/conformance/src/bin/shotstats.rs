@@ -1,7 +1,7 @@
 //! shotstats: what a ranged shot is worth, measured on ladder replays (workstream 1 of
 //! the plan).
 //!
-//!   shotstats [--bots A,B,C] [--received] [--map NAME] [--fine] [--horizon 8] <replay dir or files>...
+//!   shotstats [--bots A,B,C] [--versus X,Y*] [--received] [--map NAME] [--fine] [--horizon 8] <replay dir or files>...
 //!
 //! For every tick where a fighter could act, had its shot ready and the opponent in sight
 //! within 6 tiles, it records the situation (range, whether the target could step or
@@ -61,6 +61,9 @@ fn main() {
     let fine = args.iter().any(|a| a == "--fine");
     // --received: count the shots fired at the named bots (the situation is then theirs as targets)
     let received = args.iter().any(|a| a == "--received");
+    // --versus: only games against these opponents (names, or prefixes ending in *)
+    let versus: Option<Vec<String>> = opt("--versus").map(|s| s.split(',').map(str::to_string).collect());
+    let is_versus = |name: &str| versus.as_ref().map(|v| v.iter().any(|p| p.strip_suffix('*').map(|pre| name.starts_with(pre)).unwrap_or(p == name))).unwrap_or(true);
     let mut fighter_games = 0u32;
     let mut files = Vec::new();
     let mut skip = false;
@@ -72,7 +75,7 @@ fn main() {
         if a == "--fine" || a == "--received" {
             continue;
         }
-        if a == "--bots" || a == "--horizon" || a == "--map" {
+        if a == "--bots" || a == "--horizon" || a == "--map" || a == "--versus" {
             skip = true;
             continue;
         }
@@ -91,7 +94,12 @@ fn main() {
             continue;
         }
         let Some(ranged) = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Projectile { .. })) else { continue };
-        let counted: Vec<bool> = (0..2).map(|i| bots.as_ref().map(|b| replay.bots.get(i).map(|n| b.contains(n)).unwrap_or(false)).unwrap_or(true)).collect();
+        let counted: Vec<bool> = (0..2)
+            .map(|i| {
+                bots.as_ref().map(|b| replay.bots.get(i).map(|n| b.contains(n)).unwrap_or(false)).unwrap_or(true)
+                    && replay.bots.get(1 - i).map(|n| is_versus(n)).unwrap_or(false)
+            })
+            .collect();
         if !counted[0] && !counted[1] {
             continue;
         }
