@@ -889,6 +889,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         let mut last_ping = Instant::now();
         let mut ping_sent: Option<Instant> = None;
         let mut last_slow_check = Instant::now();
+        let mut no_process_since: Option<Instant> = None;
         // keepalive pings in a row that were slower than the limit (the test at connect counts)
         let mut slow_pings: u32 = match ping_ms {
             Some(ms) if shared.ping_reject_ms.load(Ordering::Relaxed) > 0 && ms > shared.ping_reject_ms.load(Ordering::Relaxed) as f64 => 2,
@@ -1374,8 +1375,17 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     }
                 }
             }
-            if queued && !flow.in_match && engine.is_none() && resume_until.is_none() {
-                // Nobody to play a match: step out of the queue until a process attaches.
+            // How long there has been no bot process. A swap takes a second; the bot stays
+            // queued through it (leaving and queueing again is traffic the ladder has to
+            // account for, and a match that starts meanwhile is answered idle until the new
+            // process is in).
+            if engine.is_some() {
+                no_process_since = None;
+            } else if no_process_since.is_none() {
+                no_process_since = Some(Instant::now());
+            }
+            if queued && !flow.in_match && resume_until.is_none() && no_process_since.map(|t| t.elapsed() >= Duration::from_secs(10)).unwrap_or(false) {
+                // Nobody to play a match for ten seconds: step out of the queue until a process attaches.
                 let _ = send(&mut ws, shared, json!({ "type": "leave" }).to_string());
                 queued = false;
                 queued_since = None;
