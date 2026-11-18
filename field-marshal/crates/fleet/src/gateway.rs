@@ -543,15 +543,15 @@ fn median(v: &[f64]) -> f64 {
 
 /// The socket test at connect: three pings, the median round trip in milliseconds. Text
 /// frames that arrive meanwhile are kept for the caller. `None` when no pong came back.
-fn ping_test(ws: &mut Socket, early: &mut VecDeque<String>) -> Option<f64> {
+fn ping_test(ws: &mut Socket, early: &mut VecDeque<String>, pings: u8, wait: Duration) -> Option<f64> {
     let mut samples = Vec::new();
-    for k in 0..3u8 {
+    for k in 0..pings {
         let sent = Instant::now();
         if ws.send(Message::Ping(vec![b'g', b'w', k])).is_err() {
             return None;
         }
         let mut got = false;
-        while sent.elapsed() < Duration::from_millis(1500) && !got {
+        while sent.elapsed() < wait && !got {
             if let Some(fd) = socket_fd(ws) {
                 wait_readable(&[fd], Duration::from_millis(20));
             }
@@ -573,7 +573,9 @@ fn ping_test(ws: &mut Socket, early: &mut VecDeque<String>) -> Option<f64> {
         if !got {
             break;
         }
-        std::thread::sleep(Duration::from_millis(60));
+        if k + 1 < pings {
+            std::thread::sleep(Duration::from_millis(60));
+        }
     }
     if samples.is_empty() {
         None
@@ -686,6 +688,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
     // slow sockets in a row, and when the count started
     let mut bad_sockets = 0u32;
     let mut bad_since = Instant::now();
+    // slow sockets refused in a row while a match waited to be resumed
+    let mut resume_tries = 0u32;
     let mut down_why = String::from("not connected yet");
     let mut hello_fields_said = false;
 
@@ -788,28 +792,56 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         };
         let connected = Instant::now();
 
-        // The socket test. Not while a match waits to be resumed: there every second counts.
+        // The socket test: three pings before queueing. When a match waits to be resumed
+        // every second counts, so there it is one ping and a short wait (a pong that takes
+        // longer than that is a slow socket by definition), and at most three refusals.
         let mut inbox: VecDeque<String> = VecDeque::new();
-        let mut ping_ms: Option<f64> = None;
-        if !flow.in_match {
-            ping_ms = ping_test(&mut ws, &mut inbox);
+        let mut ping_ms: Option<f64>;
+        let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
+        {
+            let resuming = flow.in_match;
+            ping_ms = if !resuming {
+                ping_test(&mut ws, &mut inbox, 3, Duration::from_millis(1500))
+            } else if reject > 0.0 {
+                ping_test(&mut ws, &mut inbox, 1, Duration::from_millis(400)).or(Some(400.0))
+            } else {
+                None
+            };
+            if !resuming {
+                resume_tries = 0;
+            }
+            // A match start that arrived during the test: the match will be resumed on the
+            // next socket if this one is refused.
+            let hello = inbox.iter().find(|t| t.contains("\"hello\"")).and_then(|t| serde_json::from_str::<Value>(t).ok()).filter(|v| v.get("type").and_then(Value::as_str) == Some("hello"));
+            let in_a_hurry = resuming || hello.is_some();
             if let Some(ms) = ping_ms {
-                let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
                 if bad_sockets >= SLOW_TRIES && bad_since.elapsed() > SLOW_REST {
                     bad_sockets = 0;
                 }
-                if reject > 0.0 && ms > reject && bad_sockets < SLOW_TRIES && inbox.is_empty() {
-                    bad_sockets += 1;
-                    bad_since = Instant::now();
-                    backoff = replace_backoff(bad_sockets);
+                let may = if in_a_hurry { resume_tries < 3 } else { bad_sockets < SLOW_TRIES };
+                if reject > 0.0 && ms > reject && may {
+                    if in_a_hurry {
+                        resume_tries += 1;
+                        backoff = Duration::ZERO;
+                    } else {
+                        bad_sockets += 1;
+                        bad_since = Instant::now();
+                        backoff = replace_backoff(bad_sockets);
+                    }
+                    if let Some(h) = hello {
+                        flow.in_match = true;
+                        flow.match_id = h.get("match_id").and_then(Value::as_str).map(str::to_string);
+                        shared.set_active(name, 2);
+                    }
                     shared.replaced.fetch_add(1, Ordering::Relaxed);
-                    event(root, name, "slow_socket", json!({ "remote": remote.to_string(), "ping_ms": ms.round(), "in_a_row": bad_sockets, "retry_in_s": backoff.as_secs(), "found": "at connect" }));
+                    event(root, name, "slow_socket", json!({ "remote": remote.to_string(), "ping_ms": ms.round(), "in_a_row": bad_sockets, "retry_in_s": backoff.as_secs(), "found": if in_a_hurry { "at connect, with a match waiting" } else { "at connect" } }));
                     let _ = ws.close(None);
                     down_why = format!("a slow socket was dropped at connect (ping {ms:.0} ms)");
                     continue;
                 }
             }
         }
+        resume_tries = 0;
         event(root, name, "connected", json!({ "remote": remote.to_string(), "ping_ms": ping_ms.map(|x| x.round()), "resuming": flow.in_match }));
 
         // -- this connection ----------------------------------------------------------------
