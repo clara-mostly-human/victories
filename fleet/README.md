@@ -112,7 +112,7 @@ processes": `marshal --stdio`). Each attaches to the gateway over a Unix socket,
 stopped, replaced or crash and the bot's connection to the ladder stays up.
 
     fleet health                  # the one verdict, and a line per bot
-    fleet health --json           # everything the gateway knows (data/run/gateway.json)
+    fleet health --json           # everything the gateway knows (fleet.db, table gateway_state)
     fleet install gateway         # load or reload the gateway's agent
     fleet install <bot>           # the bot's supervisor: starts its bot process, attached
     fleet attach <bot> -- <cmd>   # attach a bot process the fleet does not start (the flagship)

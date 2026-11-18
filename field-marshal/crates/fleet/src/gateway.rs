@@ -26,7 +26,9 @@
 //!   step: a process that attaches or disagrees mid-match is sent the match start and the
 //!   latest observation again.
 //! - **Health.** One verdict per bot, from turns flowing, written to
-//!   `data/run/gateway.json` every two seconds; stalls are logged with their cause.
+//!   the store's `gateway_state` every second; stalls are logged with their cause. Every
+//!   socket gets an ID (`sockets` in `fleet.db`) and everything measured on it goes to the
+//!   time-series store `data/telemetry.db` (see `telemetry`).
 //!
 //! The bot process side of the protocol (one JSON object per line, both ways):
 //!
@@ -42,6 +44,7 @@
 use crate::config::{BotConfig, Config};
 use crate::online::log_line;
 use crate::store::{data_dir, default_db, now_ms, Store};
+use crate::telemetry::{self, Telemetry};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -56,6 +59,15 @@ use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
 pub const DEFAULT_URL: &str = "wss://victrisarena.com/bot";
+
+static TEL: std::sync::OnceLock<Telemetry> = std::sync::OnceLock::new();
+static TEL_OFF: std::sync::OnceLock<Telemetry> = std::sync::OnceLock::new();
+
+/// The gateway's telemetry: every socket's measurements, the events and the per-bot state
+/// (see `telemetry`). Records nothing until `run` has started it.
+fn tel() -> &'static Telemetry {
+    TEL.get().unwrap_or_else(|| TEL_OFF.get_or_init(Telemetry::off))
+}
 
 /// Errors that reconnecting cannot fix (the ladder's guide: stop on these).
 const FATAL_CODES: [&str; 15] = [
@@ -189,7 +201,7 @@ impl Budget {
     }
 
     /// When there will be room, if there is none now.
-    fn room_at(&self) -> Option<Instant> {
+    pub fn room_at(&self) -> Option<Instant> {
         let mut t = self.times.lock().unwrap_or_else(|p| p.into_inner());
         while t.front().map(|f| f.elapsed() >= self.window).unwrap_or(false) {
             t.pop_front();
@@ -270,8 +282,8 @@ pub struct Shared {
     pub health: Mutex<HashMap<String, Value>>,
     /// which of our bots are queued (1) or in a match (2)
     active: Mutex<HashMap<String, u8>>,
-    /// the flagship is on a slow socket right now (it gets the next replacement)
-    flagship_slow: std::sync::atomic::AtomicBool,
+    /// the rotation queue: bots on a slow socket, waiting for their turn to get a new one
+    rotation: Mutex<Vec<Waiting>>,
     /// replacement sockets in a row that came out slow, and until when replacing is off
     replace_fails: AtomicU64,
     replace_suspended: Mutex<Option<Instant>>,
@@ -284,7 +296,7 @@ impl Shared {
     pub fn new(opt: Options, cfg: &Config) -> Shared {
         let now = Instant::now();
         Shared {
-            flagship_slow: std::sync::atomic::AtomicBool::new(false),
+            rotation: Mutex::new(Vec::new()),
             replace_fails: AtomicU64::new(0),
             replace_suspended: Mutex::new(None),
             ping_reject_ms: AtomicU64::new(opt.ping_reject_ms.max(0.0) as u64),
@@ -327,28 +339,86 @@ impl Shared {
         }
     }
 
-    /// May a slow socket be given up for another now? One at a time across the fleet,
-    /// `replace_gap` apart, inside the ten-minute cap, and not at all while replacing has
-    /// been shown to be futile (see `replacement_came_out`).
-    fn may_replace(&self, flagship: bool) -> bool {
+    /// Puts a bot whose socket is slow in the rotation queue (or updates why it is there).
+    /// The flagship goes ahead of every other bot; the rest wait in the order they came.
+    fn want_rotation(&self, bot: &str, flagship: bool, reason: String) {
+        let mut q = self.rotation.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(w) = q.iter_mut().find(|w| w.bot == bot) {
+            w.reason = reason;
+            return;
+        }
+        let w = Waiting { bot: bot.to_string(), flagship, since: Instant::now(), since_ms: now_ms(), reason };
+        let at = if flagship { q.iter().position(|w| !w.flagship).unwrap_or(q.len()) } else { q.len() };
+        q.insert(at, w);
+    }
+
+    /// Takes a bot out of the rotation queue (its socket is good again, or gone).
+    fn cancel_rotation(&self, bot: &str) {
+        self.rotation.lock().unwrap_or_else(|p| p.into_inner()).retain(|w| w.bot != bot);
+    }
+
+    /// May this bot give up its socket for a new one now? Only the bot at the head of the
+    /// queue, one rotation at a time across the fleet, `replace_gap` apart, inside the
+    /// ten-minute cap, and none while rotating has been shown to be futile (see
+    /// `replacement_came_out`). On yes the bot leaves the queue and gets the reason back.
+    fn may_rotate(&self, bot: &str) -> Option<String> {
+        let mut q = self.rotation.lock().unwrap_or_else(|p| p.into_inner());
+        if q.first().map(|w| w.bot != bot).unwrap_or(true) {
+            return None;
+        }
         if let Some(until) = *self.replace_suspended.lock().unwrap_or_else(|p| p.into_inner()) {
             if Instant::now() < until {
-                return false;
+                return None;
             }
-        }
-        // The flagship is first in line: while its socket is slow, nobody else's is replaced.
-        if !flagship && self.flagship_slow.load(Ordering::Relaxed) {
-            return false;
         }
         let mut next = self.next_replace.lock().unwrap_or_else(|p| p.into_inner());
         if Instant::now() < *next {
-            return false;
+            return None;
         }
         if !self.replace_budget.try_take() {
-            return false;
+            return None;
         }
         *next = Instant::now() + self.opt.replace_gap;
-        true
+        Some(q.remove(0).reason)
+    }
+
+    /// Where a bot stands in the rotation queue, for its health line and the status page:
+    /// whether a rotation is scheduled, its place, why, what it waits for, and when it
+    /// should come (an estimate: the gate's next opening, then one gap per bot ahead).
+    pub fn rotation_status(&self, bot: &str) -> Value {
+        let q = self.rotation.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(pos) = q.iter().position(|w| w.bot == bot) else {
+            return json!({ "scheduled": false, "queue_length": q.len() });
+        };
+        let w = &q[pos];
+        let now = Instant::now();
+        let suspended = (*self.replace_suspended.lock().unwrap_or_else(|p| p.into_inner())).filter(|t| *t > now);
+        let mut open = *self.next_replace.lock().unwrap_or_else(|p| p.into_inner());
+        let mut waiting_for = if pos == 0 { "its next free moment: at connect, between matches or while waiting in the queue" } else { "the bots ahead of it" };
+        if let Some(at) = self.replace_budget.room_at() {
+            if at > open {
+                open = at;
+                waiting_for = "the cap on rotations in ten minutes, which is spent";
+            }
+        }
+        if let Some(until) = suspended {
+            if until > open {
+                open = until;
+                waiting_for = "rotating is paused: the last three new sockets were all slow";
+            }
+        }
+        let eta = open.max(now) + self.opt.replace_gap * pos as u32;
+        json!({
+            "scheduled": true, "position": pos + 1, "queue_length": q.len(), "reason": w.reason, "since_ms": w.since_ms,
+            "waiting_s": w.since.elapsed().as_secs(), "waiting_for": waiting_for,
+            "eta_ms": now_ms() + eta.saturating_duration_since(now).as_millis() as i64,
+        })
+    }
+
+    /// The whole queue, for the gateway's own state.
+    fn rotation_queue(&self) -> Value {
+        let q = self.rotation.lock().unwrap_or_else(|p| p.into_inner());
+        json!(q.iter().map(|w| json!({ "bot": w.bot, "reason": w.reason, "since_ms": w.since_ms })).collect::<Vec<_>>())
     }
 
     /// What the socket that replaced a slow one turned out to be. Three slow ones in a row,
@@ -382,9 +452,24 @@ impl Shared {
         self.active.lock().unwrap_or_else(|p| p.into_inner()).iter().filter(|(n, s)| n.as_str() != bot && **s > 0).count()
     }
 
+    /// A bot's health: kept here for the gateway's verdict, and written to the store's
+    /// `gateway_state` for everyone else.
     fn publish(&self, bot: &str, health: Value) {
+        let level = health.get("level").and_then(Value::as_str).unwrap_or("bad").to_string();
+        let verdict = health.get("verdict").and_then(Value::as_str).unwrap_or("?").to_string();
+        let socket_id = health.get("socket").and_then(|s| s.get("socket_id")).and_then(Value::as_i64);
+        tel().state(bot, &level, &verdict, socket_id, &health);
         self.health.lock().unwrap_or_else(|p| p.into_inner()).insert(bot.to_string(), health);
     }
+}
+
+/// A bot in the rotation queue.
+struct Waiting {
+    bot: String,
+    flagship: bool,
+    since: Instant,
+    since_ms: i64,
+    reason: String,
 }
 
 /// A frame waiting in a bot process's queue.
@@ -676,6 +761,11 @@ fn plan(root: &Path, name: &str) -> Result<Plan, String> {
 
 fn event(root: &Path, bot: &str, kind: &str, detail: Value) {
     eprintln!("[{bot}] gateway: {kind} {detail}");
+    if TEL.get().is_some() {
+        // Written by the telemetry thread, in its once-a-second batch.
+        tel().event(bot, kind, &detail);
+        return;
+    }
     if let Ok(store) = Store::open(&default_db(root), Duration::from_millis(500)) {
         store.event(Some(bot), &format!("gateway_{kind}"), &detail);
     }
@@ -685,24 +775,6 @@ fn queue_frame(version: &str) -> String {
     json!({ "type": "queue", "version": version }).to_string()
 }
 
-/// How long to wait before the next try at a good socket, after `bad` slow ones in a row:
-/// at once, then a little longer each time, never long. About half of all new sockets
-/// are slow (2026-11-18), so several tries in a row are ordinary, and a bot that waits is
-/// a bot that does not play.
-fn replace_backoff(bad: u32) -> Duration {
-    Duration::from_secs(match bad {
-        0 | 1 => 0,
-        2 => 2,
-        3 => 5,
-        4 => 10,
-        _ => 15,
-    })
-}
-
-/// After this many slow sockets in a row a bot keeps the one it has for a while.
-const SLOW_TRIES: u32 = 3;
-/// ... this long, before it starts trying again.
-const SLOW_REST: Duration = Duration::from_secs(300);
 
 /// What is true about this bot on the ladder's side. It outlives a connection and a bot
 /// process: this is the state a process is told and set back to.
@@ -716,6 +788,9 @@ struct Flow {
     last_turn: Option<Instant>,
     last_result: Option<Value>,
     matches: u64,
+    /// the last tick seen before the connection dropped mid-match (to count the turns the
+    /// ladder played idle for us until the match resumed)
+    dropped_at_tick: Option<i64>,
 }
 
 /// Runs one bot until asked to stop: its connection to the ladder, the bot process attached
@@ -748,13 +823,11 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
     let mut engine: Option<Engine> = None;
     let mut flow = Flow::default();
     let mut backoff = Duration::ZERO;
-    // slow sockets in a row, and when the count started
-    let mut bad_sockets = 0u32;
-    let mut bad_since = Instant::now();
-    // slow sockets refused in a row while a match waited to be resumed
-    let mut resume_tries = 0u32;
-    // the last connection was given up for being slow; the next one's test says if that paid
+    // the socket in use: its ID in the store's `sockets` table
+    let mut sid: Option<i64> = None;
+    // the last connection was given up for being slow (its ID); the next one's test says if that paid
     let mut after_replacement = false;
+    let mut rotated_from: Option<i64> = None;
     let mut down_why = String::from("not connected yet");
     let mut hello_fields_said = false;
 
@@ -801,6 +874,11 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
     };
 
     'outer: while !stop() {
+        // A socket that closed without passing the drop code below (a halt, a refusal).
+        if let Some(s) = sid.take() {
+            tel().socket_closed(s, "closed by the gateway");
+            shared.cancel_rotation(name);
+        }
         let p = match plan(root, name) {
             Ok(p) => p,
             Err(why) => {
@@ -810,9 +888,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     e.detach(&why);
                 }
                 shared.set_active(name, 0);
-                if name == "field-marshal" {
-                    shared.flagship_slow.store(false, Ordering::Relaxed);
-                }
+                shared.cancel_rotation(name);
                 nap(Duration::from_secs(5), stop);
                 continue;
             }
@@ -828,8 +904,6 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         };
         let url = p.bot.url.clone().unwrap_or_else(|| DEFAULT_URL.to_string());
         let role = p.bot.role.clone();
-        // The flagship may try harder for a good socket than the others.
-        let tries = if role == "flagship" { 5 } else { SLOW_TRIES };
         let mut label: Option<String> = p.version.clone().or_else(|| engine.as_ref().map(|e| e.version.clone()));
 
         // A bot process may attach while there is no connection.
@@ -841,7 +915,11 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         }
 
         // Connect, in the fleet's turn.
-        shared.publish(name, health(&flow, &engine, None, &label, &role, &down_why, backoff));
+        {
+            let mut h = health(&flow, &engine, None, &label, &role, &down_why, backoff);
+            h["rotation"] = shared.rotation_status(name);
+            shared.publish(name, h);
+        }
         if !backoff.is_zero() && !nap(backoff, stop) {
             break;
         }
@@ -863,62 +941,50 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         let connected = Instant::now();
 
         // The socket test: three pings before queueing. When a match waits to be resumed
-        // every second counts, so there it is one ping and a short wait (a pong that takes
-        // longer than that is a slow socket by definition), and at most three refusals.
+        // every second counts, so there it is one ping and a short wait.
         let mut inbox: VecDeque<String> = VecDeque::new();
         let mut ping_ms: Option<f64>;
         let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
-        {
-            let resuming = flow.in_match;
-            ping_ms = if !resuming {
-                ping_test(&mut ws, &mut inbox, 3, Duration::from_millis(1500))
-            } else if reject > 0.0 {
-                ping_test(&mut ws, &mut inbox, 1, Duration::from_millis(400)).or(Some(400.0))
-            } else {
-                None
-            };
-            if !resuming {
-                resume_tries = 0;
-            }
-            // A match start that arrived during the test: the match will be resumed on the
-            // next socket if this one is refused.
-            let hello = inbox.iter().find(|t| t.contains("\"hello\"")).and_then(|t| serde_json::from_str::<Value>(t).ok()).filter(|v| v.get("type").and_then(Value::as_str) == Some("hello"));
-            let in_a_hurry = resuming || hello.is_some();
-            if let (true, Some(ms), true) = (after_replacement, ping_ms, reject > 0.0) {
-                // This socket replaced a slow one: was it worth it?
-                after_replacement = false;
-                shared.replacement_came_out(root, ms <= reject);
-            }
-            if let Some(ms) = ping_ms {
-                if bad_sockets >= tries && bad_since.elapsed() > SLOW_REST {
-                    bad_sockets = 0;
-                }
-                let may = if in_a_hurry { resume_tries < 2 } else { bad_sockets < tries };
-                if reject > 0.0 && ms > reject && may && shared.may_replace(role == "flagship") {
+        let resuming = flow.in_match;
+        ping_ms = if !resuming {
+            ping_test(&mut ws, &mut inbox, 3, Duration::from_millis(1500))
+        } else {
+            ping_test(&mut ws, &mut inbox, 1, Duration::from_millis(400))
+        };
+        // Every socket is registered, slow or not: the store counts how many a bot was given.
+        let this = telemetry::socket_opened(root, name, &remote.to_string(), ping_ms, resuming, rotated_from.take());
+        sid = Some(this);
+        if let Some(ms) = ping_ms {
+            tel().point(this, "ping_ms", ms);
+        }
+        if let (true, Some(ms), true) = (after_replacement, ping_ms, reject > 0.0) {
+            // This socket replaced a slow one: was that worth it?
+            after_replacement = false;
+            shared.replacement_came_out(root, ms <= reject);
+        }
+        if let Some(ms) = ping_ms.filter(|ms| reject > 0.0 && *ms > reject) {
+            // A slow socket. The bot joins the rotation queue; if it is its turn, and no match
+            // is waiting on this socket, the socket is given up now, before anything is played
+            // on it. Otherwise the bot plays on it and rotates when its turn comes.
+            shared.want_rotation(name, role == "flagship", format!("ping {ms:.0} ms at connect"));
+            let hello = inbox.iter().any(|t| t.contains("\"hello\""));
+            if !resuming && !hello {
+                if let Some(reason) = shared.may_rotate(name) {
                     after_replacement = true;
-                    if in_a_hurry {
-                        resume_tries += 1;
-                        backoff = Duration::ZERO;
-                    } else {
-                        bad_sockets += 1;
-                        bad_since = Instant::now();
-                        backoff = replace_backoff(bad_sockets);
-                    }
-                    if let Some(h) = hello {
-                        flow.in_match = true;
-                        flow.match_id = h.get("match_id").and_then(Value::as_str).map(str::to_string);
-                        shared.set_active(name, 2);
-                    }
+                    rotated_from = sid.take();
+                    tel().socket_closed(this, &format!("rotated at connect: {reason}"));
                     shared.replaced.fetch_add(1, Ordering::Relaxed);
-                    event(root, name, "slow_socket", json!({ "remote": remote.to_string(), "ping_ms": ms.round(), "in_a_row": bad_sockets, "retry_in_s": backoff.as_secs(), "found": if in_a_hurry { "at connect, with a match waiting" } else { "at connect" } }));
+                    event(root, name, "rotated", json!({ "socket": this, "remote": remote.to_string(), "ping_ms": ms.round(), "when": "at connect" }));
                     let _ = ws.close(None);
-                    down_why = format!("a slow socket was dropped at connect (ping {ms:.0} ms)");
+                    down_why = format!("rotated at connect (ping {ms:.0} ms)");
+                    backoff = Duration::ZERO;
                     continue;
                 }
             }
+        } else if reject > 0.0 && ping_ms.is_some() {
+            shared.cancel_rotation(name);
         }
-        resume_tries = 0;
-        event(root, name, "connected", json!({ "remote": remote.to_string(), "ping_ms": ping_ms.map(|x| x.round()), "resuming": flow.in_match }));
+        event(root, name, "connected", json!({ "socket": this, "remote": remote.to_string(), "ping_ms": ping_ms.map(|x| x.round()), "resuming": flow.in_match }));
 
         // -- this connection ----------------------------------------------------------------
         let mut queued = false;
@@ -954,7 +1020,6 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         let mut wires: Vec<f64> = Vec::new();
         let mut lost = 0u32;
         let mut wire_ms: Option<f64> = None;
-        let mut replace_why: Option<String> = None;
         // refusals and stalls
         let mut refusal: Option<(String, Instant, Value)> = None;
         let mut soft_refusals = 0u32;
@@ -1004,6 +1069,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         if let Some(at) = ping_sent.take() {
                             let ms = at.elapsed().as_secs_f64() * 1000.0;
                             ping_ms = Some(ms);
+                            tel().point(this, "ping_ms", ms);
                             let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
                             slow_pings = if reject > 0.0 && ms > reject { slow_pings + 1 } else { 0 };
                         }
@@ -1027,6 +1093,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         let id = msg.get("match_id").and_then(Value::as_str).unwrap_or("").to_string();
                         if flow.match_id.as_deref() != Some(id.as_str()) || !flow.in_match {
                             if flow.match_id.as_deref() != Some(id.as_str()) {
+                                flow.dropped_at_tick = None;
                                 shared.match_budget.record();
                                 flow.matches += 1;
                             }
@@ -1087,10 +1154,19 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                             if let Some((at, took)) = answered {
                                 if at == t - 1 {
                                     wires.push((charge - took).max(0.0));
+                                    tel().point(this, "charge_ms", charge);
+                                    tel().point(this, "answer_ms", took);
+                                    tel().point(this, "wire_ms", (charge - took).max(0.0));
                                     if charge >= 1000.0 && took < 600.0 {
                                         lost += 1;
+                                        event(root, name, "turn_lost", json!({ "cause": "wire", "socket": this, "match": flow.match_id, "tick": t - 1, "turns": 1, "charge_ms": charge, "answer_ms": took.round() }));
                                     }
                                 }
+                            }
+                        }
+                        if let (Some(old), Some(t)) = (flow.dropped_at_tick.take(), tick) {
+                            if t - old > 1 {
+                                event(root, name, "turn_lost", json!({ "cause": "reset", "socket": this, "match": flow.match_id, "tick": old + 1, "turns": t - old - 1 }));
                             }
                         }
                         last_budget = budget;
@@ -1103,10 +1179,6 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         if wires.len() >= 20 && wires.len() % 5 == 0 || lost >= 2 {
                             let m = median(&wires);
                             wire_ms = Some(m);
-                            let limit = shared.slow_wire_ms.load(Ordering::Relaxed) as f64;
-                            if (wires.len() >= 20 && limit > 0.0 && m > limit) || lost >= 2 {
-                                replace_why = Some(format!("slow socket: wire time {m:.0} ms over {} turns, {lost} turns lost on the wire", wires.len()));
-                            }
                         }
                     }
                     "end" => {
@@ -1121,15 +1193,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         match_started = None;
                         shared.set_active(name, 0);
                         if wires.len() >= 20 {
-                            let m = median(&wires);
-                            wire_ms = Some(m);
-                            let limit = shared.slow_wire_ms.load(Ordering::Relaxed) as f64;
-                            if (limit <= 0.0 || m <= limit) && lost < 2 && m < 150.0 {
-                                // A good match on this socket: the run of slow ones is over.
-                                bad_sockets = 0;
-                            }
+                            wire_ms = Some(median(&wires));
                         }
-                        replace_why = None;
                         // The process writes the match down before anything else happens.
                         after_end = Some(Instant::now());
                     }
@@ -1323,6 +1388,14 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                             if np.version.is_some() {
                                 label = np.version.clone();
                             }
+                            // Between two matches a slow socket costs nothing to give up.
+                            if let Some(reason) = shared.may_rotate(name) {
+                                event(root, name, "rotated", json!({ "socket": this, "remote": remote.to_string(), "ping_ms": ping_ms.map(|x| x.round()), "wire_ms": wire_ms.map(|x| x.round()), "when": "between matches" }));
+                                let _ = ws.close(None);
+                                voluntary = true;
+                                why_closed = format!("rotated between matches: {reason}");
+                                break 'conn;
+                            }
                             // Every bot but the flagship leaves the freed match slot alone for a moment.
                             let gap = if np.bot.role == "flagship" { 0 } else { np.cfg.queue_gap_ms };
                             queue_due = Some(Instant::now() + Duration::from_millis(gap));
@@ -1352,6 +1425,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         Some((t, f)) if t == tick => (f, "fallback_turn"),
                         _ => (json!({ "tick": tick }).to_string(), "idle_turn"),
                     };
+                    // The turn was not the bot's own: its process was late, or there was none.
+                    event(root, name, "turn_lost", json!({ "cause": if engine.is_none() { "no process" } else { "late answer" }, "sent": kind, "socket": this, "match": flow.match_id, "tick": tick, "turns": 1, "waited_ms": waited.round() }));
                     if let Err(why) = send(&mut ws, shared, frame) {
                         why_closed = why;
                         break 'conn;
@@ -1461,43 +1536,20 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     break 'conn;
                 }
             }
-            // Between matches a slow socket costs nothing to replace: do it before the next
-            // match starts on it.
-            if !flow.in_match && replace_why.is_none() && slow_pings >= 2 {
-                replace_why = Some(format!("slow socket: ping {} ms, twice in a row, between matches", ping_ms.map(|x| x.round()).unwrap_or(0.0)));
-            }
-            // A slow socket is replaced: at once in a match (the match resumes on the new
-            // one), spaced across the fleet, and not for ever for one bot.
-            if let Some(why) = replace_why.clone() {
-                if bad_sockets >= tries && bad_since.elapsed() > SLOW_REST {
-                    bad_sockets = 0;
-                }
-                if last_slow_check.elapsed() > Duration::from_secs(2) {
-                    last_slow_check = Instant::now();
-                    if bad_sockets < tries && shared.may_replace(role == "flagship") {
-                        after_replacement = true;
-                        bad_sockets += 1;
-                        bad_since = Instant::now();
-                        {
-                            let mut slow = shared.slow.lock().unwrap_or_else(|p| p.into_inner());
-                            slow.retain(|a| *a != remote);
-                            slow.push(remote);
-                            if slow.len() >= 4 {
-                                slow.remove(0);
-                            }
-                        }
-                        shared.replaced.fetch_add(1, Ordering::Relaxed);
-                        event(root, name, "slow_socket", json!({ "remote": remote.to_string(), "ping_ms": ping_ms.map(|x| x.round()), "wire_ms": wire_ms.map(|x| x.round()), "lost_turns": lost, "in_a_row": bad_sockets, "found": if flow.in_match { "in play" } else { "between matches" }, "in_match": flow.in_match }));
-                        if queued && !flow.in_match {
-                            // Out of the queue first, so no match starts on the socket we close.
-                            let _ = send(&mut ws, shared, json!({ "type": "leave" }).to_string());
-                            shared.set_active(name, 0);
-                        }
-                        let _ = ws.close(None);
-                        voluntary = true;
-                        why_closed = why;
-                        break 'conn;
+            // While waiting for a match on a slow socket, the bot rotates when its turn comes.
+            if !flow.in_match && after_end.is_none() && resume_until.is_none() && last_slow_check.elapsed() > Duration::from_secs(2) {
+                last_slow_check = Instant::now();
+                if let Some(reason) = shared.may_rotate(name) {
+                    event(root, name, "rotated", json!({ "socket": this, "remote": remote.to_string(), "ping_ms": ping_ms.map(|x| x.round()), "wire_ms": wire_ms.map(|x| x.round()), "when": "waiting for a match" }));
+                    if queued {
+                        // Out of the queue first, so no match starts on the socket we close.
+                        let _ = send(&mut ws, shared, json!({ "type": "leave" }).to_string());
+                        shared.set_active(name, 0);
                     }
+                    let _ = ws.close(None);
+                    voluntary = true;
+                    why_closed = format!("rotated while waiting for a match: {reason}");
+                    break 'conn;
                 }
             }
 
@@ -1582,19 +1634,27 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     }
                     event(root, name, "resync", json!({ "match": flow.match_id, "tick": flow.tick, "in_match": flow.in_match }));
                 }
+                // Is this socket slow? Two slow pings in a row (the test at connect counts as
+                // two), or a wire time over 200 ms through a match. Then the bot waits in the
+                // rotation queue; when the socket recovers it leaves it.
+                let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
+                let slow_ping = reject > 0.0 && slow_pings >= 2;
+                let slow_wire = reject > 0.0 && wire_ms.map(|w| w > 200.0).unwrap_or(false);
+                if slow_ping || slow_wire {
+                    let why = if slow_ping { format!("ping {} ms", ping_ms.map(|x| x.round()).unwrap_or(0.0)) } else { format!("{} ms on the wire per turn", wire_ms.map(|x| x.round()).unwrap_or(0.0)) };
+                    shared.want_rotation(name, role == "flagship", why);
+                } else {
+                    shared.cancel_rotation(name);
+                }
                 let conn = json!({
-                    "connected": true, "remote": remote.to_string(), "up_s": connected.elapsed().as_secs(), "ping_ms": ping_ms.map(|x| x.round()), "wire_ms": wire_ms.map(|x| x.round()),
-                    "slow_in_a_row": bad_sockets, "last_frame_s": last_heard.elapsed().as_secs(), "queued": queued, "queued_s": queued_since.map(|t| t.elapsed().as_secs_f64().round()),
+                    "connected": true, "socket_id": this, "remote": remote.to_string(), "up_s": connected.elapsed().as_secs(), "ping_ms": ping_ms.map(|x| x.round()), "wire_ms": wire_ms.map(|x| x.round()),
+                    "slow": slow_ping || slow_wire, "last_frame_s": last_heard.elapsed().as_secs(), "queued": queued, "queued_s": queued_since.map(|t| t.elapsed().as_secs_f64().round()),
                     "match_s": match_started.map(|t| t.elapsed().as_secs_f64().round()), "stall_cause": if queued { Some(stall_cause.clone()) } else { None },
                     "refused": refusal.as_ref().map(|(code, at, d)| json!({ "code": code, "ago_s": at.elapsed().as_secs(), "detail": d })),
                 });
-                shared.publish(name, health(&flow, &engine, Some(conn), &label, &role, &down_why, backoff));
-                if role == "flagship" {
-                    // Is the flagship's socket slow? Then it gets the next replacement.
-                    let reject = shared.ping_reject_ms.load(Ordering::Relaxed) as f64;
-                    let slow = reject > 0.0 && (ping_ms.map(|x| x > reject).unwrap_or(false) || wire_ms.map(|x| x > 200.0).unwrap_or(false));
-                    shared.flagship_slow.store(slow, Ordering::Relaxed);
-                }
+                let mut h = health(&flow, &engine, Some(conn), &label, &role, &down_why, backoff);
+                h["rotation"] = shared.rotation_status(name);
+                shared.publish(name, h);
 
                 if !flow.in_match {
                     if stop() {
@@ -1660,8 +1720,21 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         if !flow.in_match {
             shared.set_active(name, 0);
         }
+        if flow.in_match {
+            flow.dropped_at_tick = flow.tick.or(flow.dropped_at_tick);
+        }
+        // The socket's record: closed, and why. A new socket is judged afresh.
+        if let Some(s) = sid.take() {
+            tel().socket_closed(s, &if voluntary { why_closed.clone() } else { format!("dropped: {why_closed}") });
+            if voluntary {
+                rotated_from = Some(s);
+                after_replacement = true;
+                shared.replaced.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        shared.cancel_rotation(name);
         backoff = if voluntary {
-            replace_backoff(bad_sockets)
+            Duration::ZERO
         } else if connected.elapsed() > Duration::from_secs(30) {
             Duration::ZERO
         } else {
@@ -1693,6 +1766,10 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
     if let Some(e) = engine.take() {
         e.detach("the gateway is stopping");
     }
+    if let Some(s) = sid.take() {
+        tel().socket_closed(s, "the gateway stopped");
+    }
+    shared.cancel_rotation(name);
     shared.set_active(name, 0);
     shared.publish(name, json!({ "bot": name, "verdict": "the gateway has stopped running this bot", "level": "bad", "ts_ms": now_ms() }));
     eprintln!("[{name}] gateway: stopped at {}", now_ms());
@@ -1800,6 +1877,11 @@ pub fn verdict(health: &HashMap<String, Value>, expected: &[String]) -> (String,
 pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
     let cfg = Config::load(root).unwrap_or_default();
     let shared = Arc::new(Shared::new(Options::load(root), &cfg));
+    let _ = TEL.set(Telemetry::start(root));
+    // Sockets a previous gateway left open in the record are closed now.
+    if let Ok(store) = Store::open(&default_db(root), Duration::from_secs(5)) {
+        let _ = store.conn.execute("UPDATE sockets SET closed_ms = ?1, close_reason = 'the gateway restarted' WHERE closed_ms IS NULL", [now_ms()]);
+    }
     let mut last_state = Instant::now() - Duration::from_secs(60);
     let mut running: Vec<(String, std::thread::JoinHandle<()>)> = Vec::new();
     let mut last_report = Instant::now();
@@ -1855,7 +1937,7 @@ pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
                 "ts_ms": now_ms(),
                 "verdict": word, "problems": problems,
                 "bots": running.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
-                "health": health,
+                "rotation_queue": shared.rotation_queue(),
                 "connections": b(&shared.connect_budget), "queue_requests": b(&shared.queue_budget), "matches": b(&shared.match_budget),
                 "socket_replacements": b(&shared.replace_budget),
                 "since_start": {
@@ -1865,13 +1947,8 @@ pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
                 },
                 "slow_addresses": shared.slow.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|a| a.to_string()).collect::<Vec<_>>(),
             });
-            let dir = data_dir(root).join("run");
-            let _ = std::fs::create_dir_all(&dir);
-            // Written beside and renamed: a reader never sees half a file.
-            let tmp = dir.join("gateway.json.new");
-            if std::fs::write(&tmp, state.to_string()).is_ok() {
-                let _ = std::fs::rename(&tmp, dir.join("gateway.json"));
-            }
+            // The gateway's own row in the store's `gateway_state` (each bot has its own).
+            tel().state("*", if word == "ok" { "ok" } else { "bad" }, &if problems.is_empty() { "every bot is playing or waiting for a match".to_string() } else { problems.join("; ") }, None, &state);
         }
         if last_report.elapsed() >= Duration::from_secs(300) {
             last_report = Instant::now();
@@ -1893,6 +1970,8 @@ pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
     for (_, h) in running {
         let _ = h.join();
     }
+    tel().state("*", "bad", "the gateway has stopped", None, &json!({ "ts_ms": now_ms() }));
+    tel().flush();
     eprintln!("gateway stopped");
 }
 
@@ -1961,10 +2040,36 @@ mod tests {
     }
 
     #[test]
-    fn slow_sockets_are_replaced_later_each_time() {
-        assert_eq!(replace_backoff(1), Duration::ZERO);
-        assert!(replace_backoff(2) < replace_backoff(3) && replace_backoff(3) < replace_backoff(4));
-        assert!(replace_backoff(9) <= Duration::from_secs(15), "never a long wait: a waiting bot does not play");
+    fn the_rotation_queue_puts_the_flagship_first_and_rotates_one_at_a_time() {
+        let mut opt = Options::default();
+        opt.replace_gap = Duration::from_millis(200);
+        opt.replacements_per_10min = 2;
+        let shared = Shared::new(opt, &Config::default());
+        shared.want_rotation("scout-a", false, "ping 190 ms".into());
+        shared.want_rotation("scout-b", false, "ping 180 ms".into());
+        shared.want_rotation("flag", true, "ping 200 ms".into());
+        // The flagship goes first, the scouts keep their order.
+        assert_eq!(shared.rotation_status("flag")["position"], 1);
+        assert_eq!(shared.rotation_status("scout-a")["position"], 2);
+        assert_eq!(shared.rotation_status("scout-b")["position"], 3);
+        assert_eq!(shared.rotation_status("nobody")["scheduled"], false);
+        // Only the head may rotate.
+        assert!(shared.may_rotate("scout-a").is_none());
+        assert_eq!(shared.may_rotate("flag").as_deref(), Some("ping 200 ms"));
+        assert_eq!(shared.rotation_status("flag")["scheduled"], false);
+        // The next one waits for the gap.
+        assert!(shared.may_rotate("scout-a").is_none());
+        let eta = shared.rotation_status("scout-a")["eta_ms"].as_i64().unwrap();
+        assert!(eta > now_ms() && eta <= now_ms() + 250);
+        std::thread::sleep(Duration::from_millis(220));
+        assert!(shared.may_rotate("scout-a").is_some());
+        // The cap (two in ten minutes) is spent: the third waits, and says why.
+        std::thread::sleep(Duration::from_millis(220));
+        assert!(shared.may_rotate("scout-b").is_none());
+        assert!(shared.rotation_status("scout-b")["waiting_for"].as_str().unwrap().contains("cap"));
+        // A bot whose socket recovers leaves the queue.
+        shared.cancel_rotation("scout-b");
+        assert_eq!(shared.rotation_status("scout-b")["scheduled"], false);
         // The cap on replacements never waits and never goes over.
         let b = Budget::new("socket replacement", 2, Duration::from_secs(600));
         assert!(b.try_take() && b.try_take());

@@ -160,6 +160,26 @@ CREATE TABLE IF NOT EXISTS replays (
   note TEXT
 );
 CREATE INDEX IF NOT EXISTS replays_queue ON replays (status, priority, ended);
+CREATE TABLE IF NOT EXISTS sockets (
+  id INTEGER PRIMARY KEY,
+  bot TEXT NOT NULL,
+  remote TEXT,
+  opened_ms INTEGER NOT NULL,
+  closed_ms INTEGER,
+  close_reason TEXT,
+  connect_ping_ms REAL,
+  resumed INTEGER NOT NULL DEFAULT 0,
+  replaced_socket INTEGER
+);
+CREATE INDEX IF NOT EXISTS sockets_bot ON sockets (bot, opened_ms);
+CREATE TABLE IF NOT EXISTS gateway_state (
+  bot TEXT PRIMARY KEY,
+  ts_ms INTEGER NOT NULL,
+  level TEXT NOT NULL,
+  verdict TEXT NOT NULL,
+  socket_id INTEGER,
+  detail TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS epochs (
   name TEXT PRIMARY KEY,
   ts_ms INTEGER NOT NULL,

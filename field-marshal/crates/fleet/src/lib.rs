@@ -31,3 +31,4 @@ pub mod report;
 pub mod stats;
 pub mod store;
 pub mod supervise;
+pub mod telemetry;

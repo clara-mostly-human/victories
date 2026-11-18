@@ -31,6 +31,15 @@ pub struct BotLine {
     /// its socket to the ladder: the last ping, and the median time on the wire per turn (ms)
     pub ping_ms: Option<f64>,
     pub wire_ms: Option<f64>,
+    /// its sockets, from the telemetry store and the socket record
+    pub net: Option<crate::telemetry::Network>,
+    /// its place in the gateway's rotation queue (`scheduled`, `position`, `eta_ms`, ...)
+    pub rotation: serde_json::Value,
+    /// turns lost (charged the full second), from its finished games: (lost, turns played)
+    /// over the last hour and the last 24 hours, and lost per hour for the last 24, oldest first
+    pub lost_hour: (i64, i64),
+    pub lost_day: (i64, i64),
+    pub lost_by_hour: Vec<i64>,
 }
 
 /// One finished game, as the bot and the ladder snapshot know it.
@@ -94,34 +103,38 @@ pub struct Snapshot {
     pub health: Option<GatewayHealth>,
 }
 
-/// The gateway's verdict, as it last wrote it (`data/run/gateway.json`).
+/// The gateway's verdict, from the store's `gateway_state` (one row per bot, and `*` for
+/// the gateway itself).
 #[derive(Clone, Debug, Default)]
 pub struct GatewayHealth {
     /// "ok" or "degraded"
     pub word: String,
     pub problems: Vec<String>,
-    /// how old the gateway's report is
+    /// how old the gateway's own row is
     pub age_s: i64,
     /// each bot behind the gateway: its verdict and level ("ok", "warn", "bad")
     pub bots: std::collections::HashMap<String, (String, String)>,
-    /// each bot's socket: the last ping and the median wire time per turn, in ms
-    pub sockets: std::collections::HashMap<String, (Option<f64>, Option<f64>)>,
+    /// each bot's whole state: its socket, its place in the rotation queue, its process
+    pub detail: std::collections::HashMap<String, serde_json::Value>,
+    /// the socket each bot is on
+    pub socket_ids: std::collections::HashMap<String, i64>,
 }
 
-pub fn gateway_health(root: &Path) -> Option<GatewayHealth> {
-    let text = std::fs::read_to_string(crate::store::data_dir(root).join("run").join("gateway.json")).ok()?;
-    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+pub fn gateway_health(store: &Store) -> Option<GatewayHealth> {
+    let rows = crate::telemetry::gateway_states(&store.conn);
+    let star = rows.iter().find(|r| r.bot == "*")?;
     let mut h = GatewayHealth {
-        word: v.get("verdict")?.as_str()?.to_string(),
-        problems: v.get("problems").and_then(|p| p.as_array()).map(|p| p.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
-        age_s: (now_ms() - v.get("ts_ms").and_then(|t| t.as_i64()).unwrap_or(0)) / 1000,
-        bots: Default::default(),
-        sockets: Default::default(),
+        word: if star.level == "ok" { "ok".into() } else { "degraded".into() },
+        problems: star.detail.get("problems").and_then(|p| p.as_array()).map(|p| p.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+        age_s: (now_ms() - star.ts_ms) / 1000,
+        ..Default::default()
     };
-    for (name, b) in v.get("health").and_then(|x| x.as_object())? {
-        h.bots.insert(name.clone(), (b.get("verdict").and_then(|x| x.as_str()).unwrap_or("?").to_string(), b.get("level").and_then(|x| x.as_str()).unwrap_or("bad").to_string()));
-        let num = |k: &str| b.get("socket").and_then(|s| s.get(k)).and_then(|x| x.as_f64());
-        h.sockets.insert(name.clone(), (num("ping_ms"), num("wire_ms")));
+    for r in rows.iter().filter(|r| r.bot != "*") {
+        h.bots.insert(r.bot.clone(), (r.verdict.clone(), r.level.clone()));
+        h.detail.insert(r.bot.clone(), r.detail.clone());
+        if let Some(id) = r.socket_id {
+            h.socket_ids.insert(r.bot.clone(), id);
+        }
     }
     Some(h)
 }
@@ -191,7 +204,8 @@ pub fn snapshot_for(root: &Path, store: &Store, cfg: &Config, only_bot: Option<&
 }
 
 fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>, only_bot: Option<String>, ladder_age_ms: Option<i64>, arm_tiers: Vec<(String, Record)>) -> Snapshot {
-    let health = gateway_health(root);
+    let health = gateway_health(store);
+    let tconn = crate::telemetry::open_read(root);
     let now = now_ms();
     let day = now - 86_400_000;
     let mut bots = Vec::new();
@@ -236,6 +250,35 @@ fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>
                 |r| r.get(0),
             )
             .unwrap_or(0.0);
+        // Its sockets: only for a bot behind the gateway, which has a row in its state.
+        let behind = health.as_ref().map(|h| h.bots.contains_key(&b.name)).unwrap_or(false);
+        let net = if behind {
+            health.as_ref().map(|h| crate::telemetry::network(&store.conn, tconn.as_ref(), &b.name, h.socket_ids.get(&b.name).copied().filter(|_| h.age_s <= 15)))
+        } else {
+            None
+        };
+        let rotation = health.as_ref().filter(|h| h.age_s <= 15).and_then(|h| h.detail.get(&b.name)).and_then(|d| d.get("rotation")).cloned().unwrap_or(serde_json::Value::Null);
+        let lost_in = |since: i64| -> (i64, i64) {
+            store
+                .conn
+                .query_row(
+                    "SELECT COALESCE(SUM(lost_turns), 0), COALESCE(SUM(final_tick), 0) FROM matches WHERE bot = ?1 AND result IS NOT NULL AND voided = 0 AND started_ms >= ?2",
+                    rusqlite::params![b.name, since],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap_or((0, 0))
+        };
+        let (lost_hour, lost_day) = (lost_in(now - 3_600_000), lost_in(now - 86_400_000));
+        let mut lost_by_hour = vec![0i64; 24];
+        if let Ok(mut q) = store.conn.prepare("SELECT (?2 - started_ms) / 3600000, COALESCE(SUM(lost_turns), 0) FROM matches WHERE bot = ?1 AND result IS NOT NULL AND voided = 0 AND started_ms >= ?2 - 86400000 GROUP BY 1") {
+            if let Ok(rows) = q.query_map(rusqlite::params![b.name, now], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?))) {
+                for (ago, n) in rows.flatten() {
+                    if (0..24).contains(&ago) {
+                        lost_by_hour[23 - ago as usize] = n;
+                    }
+                }
+            }
+        }
         bots.push(BotLine {
             name: b.name.clone(),
             role: b.role.clone(),
@@ -260,8 +303,13 @@ fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>
             }),
             last_turn_s: last_turn_age_s(root, &b.name),
             gateway: health.as_ref().filter(|h| h.age_s <= 15).and_then(|h| h.bots.get(&b.name).cloned()),
-            ping_ms: health.as_ref().filter(|h| h.age_s <= 15).and_then(|h| h.sockets.get(&b.name).and_then(|s| s.0)),
-            wire_ms: health.as_ref().filter(|h| h.age_s <= 15).and_then(|h| h.sockets.get(&b.name).and_then(|s| s.1)),
+            ping_ms: net.as_ref().and_then(|n| n.ping_now.map(|x| x.1)),
+            wire_ms: net.as_ref().and_then(|n| n.wire[1].map(|a| a.mean)),
+            net,
+            rotation,
+            lost_hour,
+            lost_day,
+            lost_by_hour,
         });
     }
     let mut arms = Vec::new();
@@ -424,6 +472,254 @@ pub fn fleet_health(s: &Snapshot) -> (bool, Vec<String>) {
     (problems.is_empty(), problems)
 }
 
+// ---- the network column and its panel ----------------------------------------------------------
+
+/// A ping or wire time, or a dash.
+fn ms(v: Option<f64>) -> String {
+    v.map(|x| format!("{x:.0} ms")).unwrap_or_else(|| "&ndash;".into())
+}
+
+/// A time the reader's browser shows in their own clock (see the script at the end).
+fn at(ms: i64) -> String {
+    format!("<time data-ms=\"{ms}\">{}</time>", utc_time(ms))
+}
+
+/// "42 s", "12 min", "3 h": how long from `from` to `to`.
+fn span(from: i64, to: i64) -> String {
+    let s = ((to - from).max(0)) / 1000;
+    match s {
+        0..=119 => format!("{s} s"),
+        120..=7199 => format!("{} min", s / 60),
+        _ => format!("{:.1} h", s as f64 / 3600.0),
+    }
+}
+
+/// Where a ping stands: a good socket answers in about 40 to 65 ms, a slow one in 150 and up.
+fn ping_class(v: Option<f64>) -> &'static str {
+    match v {
+        Some(x) if x < 120.0 => "good",
+        Some(x) if x < 150.0 => "warn",
+        Some(_) => "bad",
+        None => "",
+    }
+}
+
+/// A line of ping over the last hour, one point a minute, on a fixed scale (0 to 400 ms) so
+/// that every bot's line can be compared at a glance; the dashed line is the 120 ms limit.
+fn sparkline(trend: &[Option<f64>], w: f64, h: f64) -> String {
+    if trend.iter().all(|v| v.is_none()) {
+        return format!("<svg class=\"spark\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\" aria-hidden=\"true\"></svg>");
+    }
+    let n = trend.len().max(2) as f64;
+    let x = |k: usize| 1.0 + (w - 2.0) * k as f64 / (n - 1.0);
+    let y = |v: f64| 1.0 + (h - 2.0) * (1.0 - v.clamp(0.0, 400.0) / 400.0);
+    let mut path = String::new();
+    let mut pen_up = true;
+    for (k, v) in trend.iter().enumerate() {
+        match v {
+            Some(v) => {
+                path.push_str(&format!("{}{:.1},{:.1} ", if pen_up { "M" } else { "L" }, x(k), y(*v)));
+                pen_up = false;
+            }
+            None => pen_up = true,
+        }
+    }
+    let last = trend.iter().rev().flatten().next().copied();
+    let class = ping_class(last);
+    format!(
+        "<svg class=\"spark {class}\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\" role=\"img\" aria-label=\"ping over the last hour\"><line x1=\"0\" x2=\"{w}\" y1=\"{l:.1}\" y2=\"{l:.1}\" class=\"limit\"/><path d=\"{path}\"/></svg>",
+        l = y(120.0)
+    )
+}
+
+/// The rotation in words, short (for the table) or long (for the panel).
+fn rotation_text(r: &serde_json::Value, long: bool) -> String {
+    if r.get("scheduled").and_then(|x| x.as_bool()) != Some(true) {
+        return if long { "No. The socket is good, so the bot keeps it.".into() } else { "no rotation due".into() };
+    }
+    let pos = r.get("position").and_then(|x| x.as_i64()).unwrap_or(0);
+    let of = r.get("queue_length").and_then(|x| x.as_i64()).unwrap_or(0);
+    let eta = r.get("eta_ms").and_then(|x| x.as_i64());
+    if long {
+        format!(
+            "Yes, because of a {}. Place in the queue: {pos} of {of}. Waiting for {}. Estimated {}.",
+            esc(r.get("reason").and_then(|x| x.as_str()).unwrap_or("slow socket")),
+            esc(r.get("waiting_for").and_then(|x| x.as_str()).unwrap_or("its turn")),
+            eta.map(|t| format!("at {} (in {})", at(t), span(now_ms(), t))).unwrap_or_else(|| "when its turn comes".into())
+        )
+    } else {
+        format!("rotation queued, #{pos} of {of}{}", eta.map(|t| format!(", about {}", at(t))).unwrap_or_default())
+    }
+}
+
+/// Lost turns: the last hour as a badge with its rate, and a bar per hour for the last 24.
+fn lost_cell(b: &BotLine) -> String {
+    let rate = |(l, t): (i64, i64)| if t > 0 { format!("{:.1} per 100 turns", 100.0 * l as f64 / t as f64) } else { "no turns".into() };
+    let class = match b.lost_hour.0 {
+        0 => "good",
+        1..=4 => "warn",
+        _ => "bad",
+    };
+    let max = b.lost_by_hour.iter().copied().max().unwrap_or(0).max(5) as f64;
+    let mut bars = String::new();
+    for (k, n) in b.lost_by_hour.iter().enumerate() {
+        let h = if *n > 0 { (22.0 * *n as f64 / max).max(2.0) } else { 1.0 };
+        bars.push_str(&format!("<rect x=\"{}\" y=\"{:.1}\" width=\"4\" height=\"{h:.1}\" class=\"{}\"><title>{n} lost, {} h ago</title></rect>", k * 5, 23.0 - h, if *n == 0 { "zero" } else if *n >= 5 { "bad" } else { "warn" }, 23 - k));
+    }
+    format!(
+        "<span class=\"netline\"><span class=\"pill {class}\">{}</span><svg class=\"bars\" width=\"120\" height=\"24\" viewBox=\"0 0 120 24\" role=\"img\" aria-label=\"lost turns per hour, last 24 hours\">{bars}</svg></span><span class=\"sub\">last hour, {}; 24 h: {} ({})</span>",
+        b.lost_hour.0,
+        rate(b.lost_hour),
+        b.lost_day.0,
+        rate(b.lost_day)
+    )
+}
+
+/// The network cell: the current socket's ping as a coloured badge, the last hour as a
+/// line, and the socket count. Clicking it opens the bot's network panel.
+fn net_cell(b: &BotLine) -> String {
+    let Some(n) = &b.net else { return "<span class=\"sub\">not behind the gateway</span>".into() };
+    let now = n.ping_now.map(|x| x.1);
+    let socket = match &n.socket {
+        Some(sk) => format!("socket #{} for {}", sk.id, span(sk.opened_ms, now_ms())),
+        None => "no socket".into(),
+    };
+    format!(
+        "<button class=\"net\" type=\"button\" data-dialog=\"net-{name}\" title=\"Open the network details\"><span class=\"netline\"><span class=\"pill {class}\">{ping}</span>{spark}</span><span class=\"sub\">{socket} &middot; {sh} in the last hour &middot; {rot}</span></button>",
+        name = esc(&b.name),
+        class = ping_class(now),
+        ping = ms(now),
+        spark = sparkline(&n.trend, 132.0, 26.0),
+        sh = if n.sockets_hour == 1 { "1 socket".to_string() } else { format!("{} sockets", n.sockets_hour) },
+        rot = rotation_text(&b.rotation, false),
+    )
+}
+
+/// The network panel: everything about the bot's sockets.
+fn net_dialog(b: &BotLine) -> String {
+    let Some(n) = &b.net else { return String::new() };
+    let now = now_ms();
+    let agg = |a: &Option<crate::telemetry::Agg>| match a {
+        Some(a) => format!("{:.0} ms<span class=\"sub\">{:.0} to {:.0}, {} samples</span>", a.mean, a.min, a.max, a.n),
+        None => "&ndash;".into(),
+    };
+    let row = |label: &str, now: Option<f64>, a: &[Option<crate::telemetry::Agg>; 3]| {
+        format!("<tr><td>{label}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td></tr>", ms(now), agg(&a[0]), agg(&a[1]), agg(&a[2]))
+    };
+    let current = match &n.socket {
+        Some(sk) => format!(
+            "Socket <b>#{}</b> to {}, opened {} ({} ago){}. Ping at connect {}.",
+            sk.id,
+            esc(sk.remote.as_deref().unwrap_or("?")),
+            at(sk.opened_ms),
+            span(sk.opened_ms, now),
+            if sk.resumed { ", to resume a match" } else { "" },
+            ms(sk.connect_ping_ms)
+        ),
+        None => "No socket open.".into(),
+    };
+    // Lost turns, last 24 hours: by cause, by socket, by arm.
+    let mut by_cause: Vec<(String, i64)> = Vec::new();
+    let mut by_socket: Vec<(Option<i64>, String, i64)> = Vec::new();
+    let mut by_arm: Vec<(String, i64)> = Vec::new();
+    for (sock, cause, arm, turns) in &n.lost {
+        match by_cause.iter_mut().find(|c| c.0 == *cause) {
+            Some(c) => c.1 += turns,
+            None => by_cause.push((cause.clone(), *turns)),
+        }
+        match by_socket.iter_mut().find(|c| c.0 == *sock && c.1 == *cause) {
+            Some(c) => c.2 += turns,
+            None => by_socket.push((*sock, cause.clone(), *turns)),
+        }
+        match by_arm.iter_mut().find(|c| c.0 == *arm) {
+            Some(c) => c.1 += turns,
+            None => by_arm.push((arm.clone(), *turns)),
+        }
+    }
+    let lost_html = if n.lost.is_empty() {
+        "<p class=\"sub\">No turn lost in the last 24 hours, as far as the gateway has recorded (it records them since 2026-11-18 17:20 UTC).</p>".to_string()
+    } else {
+        let cause_text = |c: &str| match c {
+            "reset" => "the ladder dropped the connection mid-match; it played these turns idle until the match resumed",
+            "wire" => "the turn left in time and reached the ladder too late (slow socket)",
+            "late answer" => "the bot took too long; the gateway sent its quick fallback",
+            "no process" => "no bot process was attached; the gateway sent an empty turn",
+            _ => "",
+        };
+        let causes: String = by_cause.iter().map(|(c, t)| format!("<tr><td>{}</td><td class=\"n\">{t}</td><td class=\"sub\">{}</td></tr>", esc(c), cause_text(c))).collect();
+        let sockets: String = by_socket.iter().map(|(sk, c, t)| format!("<tr><td class=\"n\">{}</td><td>{}</td><td class=\"n\">{t}</td></tr>", sk.map(|x| format!("#{x}")).unwrap_or_else(|| "?".into()), esc(c))).collect();
+        let arms: String = by_arm.iter().map(|(a, t)| format!("<tr><td>{}</td><td class=\"n\">{t}</td></tr>", esc(a))).collect();
+        format!(
+            "<div class=\"cols\"><div class=\"wrap\"><table class=\"tight\"><tr><th>Cause</th><th class=\"n\">Turns</th><th></th></tr>{causes}</table></div><div class=\"wrap\"><table class=\"tight\"><tr><th class=\"n\">Socket</th><th>Cause</th><th class=\"n\">Turns</th></tr>{sockets}</table></div><div class=\"wrap\"><table class=\"tight\"><tr><th>Arm or playbook</th><th class=\"n\">Turns</th></tr>{arms}</table></div></div>"
+        )
+    };
+    let last_rot = match &n.last_rotation {
+        Some((t, why)) => format!("{} ({} ago): {}", at(*t), span(*t, now), esc(why)),
+        None => "none yet".into(),
+    };
+    let mut recent = String::new();
+    for sk in &n.recent {
+        recent.push_str(&format!(
+            "<tr><td class=\"n\">#{}</td><td>{}</td><td class=\"n\">{}</td><td class=\"n\">{}</td><td class=\"n\"><span class=\"pill {}\">{}</span></td><td>{}</td></tr>",
+            sk.id,
+            esc(sk.remote.as_deref().unwrap_or("?")),
+            at(sk.opened_ms),
+            span(sk.opened_ms, sk.closed_ms.unwrap_or(now)),
+            ping_class(sk.connect_ping_ms),
+            ms(sk.connect_ping_ms),
+            match (&sk.closed_ms, &sk.close_reason) {
+                (None, _) => "<b>open</b>".to_string(),
+                (Some(_), Some(r)) => esc(r),
+                (Some(_), None) => "closed".into(),
+            }
+        ));
+    }
+    format!(
+        r#"<dialog id="net-{name}" class="netbox" aria-label="{name}: network">
+<div class="netbox-head"><h3>{name}: network</h3><button type="button" class="close">Close</button></div>
+<p>{current}</p>
+<h4>The current socket</h4>
+<div class="wrap"><table class="tight">
+<tr><th></th><th class="n">Now</th><th class="n">Last minute</th><th class="n">Last 5 minutes</th><th class="n">Last hour</th></tr>
+{ping}{wire}{charge}{answer}
+</table></div>
+<p class="note">Ping is the round trip on the socket (at connect, then every 20 seconds). Wire is what the ladder charged for a turn less the time the bot took: the time on the wire. Charged is what the ladder billed; the bot's answer is its own time. Each cell is the mean, with the least and greatest under it. A good socket is about 40 to 65 ms ping and 70 ms on the wire; a slow one 150 and 300.</p>
+<h4>Ping over the last hour, all its sockets</h4>
+<div class="bigspark">{big}</div>
+<h4>Turns lost, last 24 hours</h4>
+<p>From its finished games: <b>{lh}</b> in the last hour, <b>{ld}</b> in 24 hours.</p>
+{lost_html}
+<h4>Rotation</h4>
+<ul class="facts">
+<li>Sockets given to the bot in the last hour: <b>{sh}</b>, of which <b>{rh}</b> rotated by the gateway (the rest were reconnects after the ladder dropped them).</li>
+<li>Last rotation: {last_rot}.</li>
+<li>Rotation scheduled: {rot}</li>
+</ul>
+<h4>Recent sockets</h4>
+<div class="wrap"><table class="tight">
+<tr><th class="n">Socket</th><th>Address</th><th class="n">Opened</th><th class="n">Open for</th><th class="n">Ping at connect</th><th>Closed because</th></tr>
+{recent}
+</table></div>
+</dialog>
+"#,
+        name = esc(&b.name),
+        current = current,
+        ping = row("Ping", n.ping_now.map(|x| x.1), &n.ping),
+        wire = row("Wire per turn", n.wire_now.map(|x| x.1), &n.wire),
+        charge = row("Charged per turn", None, &n.charge),
+        answer = row("The bot's answer", None, &n.answer),
+        big = sparkline(&n.trend, 640.0, 90.0),
+        sh = n.sockets_hour,
+        rh = n.rotations_hour,
+        last_rot = last_rot,
+        rot = rotation_text(&b.rotation, true),
+        recent = recent,
+        lh = b.lost_hour.0,
+        ld = b.lost_day.0,
+        lost_html = lost_html,
+    )
+}
+
 pub fn html(s: &Snapshot) -> String {
     let (healthy, problems) = fleet_health(s);
     let behind = s.bots.iter().filter(|b| b.gateway.is_some()).count();
@@ -437,7 +733,7 @@ pub fn html(s: &Snapshot) -> String {
         let (word, class) = state(b);
         let (lo, hi) = b.day.interval();
         bots.push_str(&format!(
-            "<tr><td><strong><a href=\"/?bot={0}\">{0}</a></strong><span class=\"sub\">{1}</span></td><td><span class=\"pill {class}\">{word}</span></td><td>{2}<span class=\"sub\">{3}</span></td><td class=\"n\">{4}</td><td class=\"n\">{5}<span class=\"sub\">{rank}{6:+.0} on this version</span></td><td class=\"n\">{7}<span class=\"sub\">{8} last hour</span></td><td class=\"n\">{9}&ndash;{10}&ndash;{11}</td><td class=\"n\">{12}<span class=\"sub\">{13}</span></td><td class=\"n\">{14}</td><td class=\"n\">{15}</td><td class=\"n\">{16}</td></tr>\n",
+            "<tr><td><strong><a href=\"/?bot={0}\">{0}</a></strong><span class=\"sub\">{1}</span></td><td><span class=\"pill {class}\">{word}</span></td><td>{2}<span class=\"sub\">{3}</span></td><td class=\"n\">{4}</td><td class=\"n\">{5}<span class=\"sub\">{rank}{6:+.0} on this version</span></td><td class=\"n\">{7}<span class=\"sub\">{8} last hour</span></td><td class=\"n\">{9}&ndash;{10}&ndash;{11}</td><td class=\"n\">{12}<span class=\"sub\">{13}</span></td><td class=\"n\">{14}</td><td>{16}</td><td>{15}</td></tr>\n",
             esc(&b.name),
             esc(&b.role),
             esc(&b.release),
@@ -453,8 +749,8 @@ pub fn html(s: &Snapshot) -> String {
             if b.day.games() > 0 { format!("{:.0}%", 100.0 * b.day.score()) } else { "&ndash;".into() },
             if b.day.games() > 0 { format!("{:.0} to {:.0}%", 100.0 * lo, 100.0 * hi) } else { String::new() },
             b.think_p99_ms.map(|p| format!("{p:.0} ms")).unwrap_or_else(|| "&ndash;".into()),
-            b.ping_ms.map(|p| format!("{p:.0} ms")).unwrap_or_else(|| "&ndash;".into()),
-            b.wire_ms.map(|p| format!("{p:.0} ms")).unwrap_or_else(|| "&ndash;".into()),
+            net_cell(b),
+            lost_cell(b),
             rank = b.rank.map(|r| format!("#{r}, ")).unwrap_or_default(),
         ));
     }
@@ -475,13 +771,17 @@ pub fn html(s: &Snapshot) -> String {
             (Some(c), None) => format!("{c:+.0}"),
             _ => "&ndash;".into(),
         };
-        let conn = match (g.charge_p50_ms, g.lost_turns) {
-            (Some(c), Some(l)) if l > 0 => format!("{c} ms<span class=\"sub\">{l} turns lost</span>"),
-            (Some(c), _) => format!("{c} ms"),
-            _ => "&ndash;".into(),
+        let conn = match g.charge_p50_ms {
+            Some(c) => format!("{c} ms"),
+            None => "&ndash;".into(),
+        };
+        let lost = match g.lost_turns {
+            Some(0) => "<span class=\"pill good\">0</span>".to_string(),
+            Some(l) => format!("<span class=\"pill {}\">{l}</span>", if l >= 5 { "bad" } else { "warn" }),
+            None => "&ndash;".into(),
         };
         game_rows.push_str(&format!(
-            "<tr><td class=\"n\"><time data-ms=\"{}\">{}</time></td><td><a href=\"/?bot={bot}\">{bot}</a><span class=\"sub\">{}</span></td><td><span class=\"pill {class}\">{}</span><span class=\"sub\">{}</span></td><td><strong>{}</strong><span class=\"sub\">{strength}</span></td><td>{}<span class=\"sub\">seat {}, {} ticks</span></td><td class=\"n\">{rating}</td><td class=\"n\">{}<span class=\"sub\">took {}</span></td><td>{}</td><td class=\"n\">{conn}</td></tr>\n",
+            "<tr><td class=\"n\"><time data-ms=\"{}\">{}</time></td><td><a href=\"/?bot={bot}\">{bot}</a><span class=\"sub\">{}</span></td><td><span class=\"pill {class}\">{}</span><span class=\"sub\">{}</span></td><td><strong>{}</strong><span class=\"sub\">{strength}</span></td><td>{}<span class=\"sub\">seat {}, {} ticks</span></td><td class=\"n\">{rating}</td><td class=\"n\">{}<span class=\"sub\">took {}</span></td><td>{}</td><td class=\"n\">{conn}</td><td class=\"n\">{lost}</td></tr>\n",
             g.ended_ms,
             esc(&utc_time(g.ended_ms)),
             esc(&g.version),
@@ -498,7 +798,7 @@ pub fn html(s: &Snapshot) -> String {
         ));
     }
     if game_rows.is_empty() {
-        game_rows = "<tr><td colspan=\"9\" class=\"sub\">No finished game yet.</td></tr>".into();
+        game_rows = "<tr><td colspan=\"10\" class=\"sub\">No finished game yet.</td></tr>".into();
     }
     let mut tiers = String::new();
     for (key, r) in &s.arm_tiers {
@@ -606,6 +906,24 @@ th.n {{ text-align: right; }}
 .pill.good {{ background: var(--good-bg); color: var(--good); }}
 .pill.warn {{ background: var(--warn-bg); color: var(--warn); }}
 .pill.bad {{ background: var(--bad-bg); color: var(--bad); }}
+button.net {{ all: unset; display: block; cursor: pointer; border-radius: 8px; padding: 2px 4px; margin: -2px -4px; }}
+button.net:hover, button.net:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
+.netline {{ display: flex; align-items: center; gap: 8px; }}
+svg.spark path {{ fill: none; stroke: var(--muted); stroke-width: 1.6; stroke-linejoin: round; }}
+svg.spark.good path {{ stroke: var(--good); }} svg.spark.warn path {{ stroke: var(--warn); }} svg.spark.bad path {{ stroke: var(--bad); }}
+svg.spark .limit {{ stroke: var(--line); stroke-dasharray: 3 3; }}
+svg.bars rect.zero {{ fill: var(--line); }} svg.bars rect.warn {{ fill: var(--warn); }} svg.bars rect.bad {{ fill: var(--bad); }}
+.bigspark {{ background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }}
+.bigspark svg {{ width: 100%; height: 90px; }}
+dialog.netbox {{ width: min(1100px, 94vw); max-height: 90vh; border: 1px solid var(--line); border-radius: 12px; background: var(--bg); color: var(--ink); padding: 18px 22px; }}
+dialog.netbox::backdrop {{ background: rgba(0, 0, 0, 0.45); }}
+.netbox-head {{ display: flex; justify-content: space-between; align-items: center; }}
+.netbox h3 {{ margin: 0; font-size: 20px; }}
+.netbox h4 {{ font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 18px 0 6px; }}
+.netbox .close {{ font: inherit; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }}
+.netbox table.tight {{ min-width: 0; }}
+.netbox ul.facts {{ margin: 0; padding-left: 20px; }}
+.netbox .cols {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; }}
 .banner {{ margin: 0 0 16px; padding: 12px 16px; border-radius: 10px; font-size: 14px; line-height: 1.5; }}
 .banner.good {{ background: var(--good-bg); color: var(--good); }}
 .banner.bad {{ background: var(--bad-bg); color: var(--bad); }}
@@ -632,13 +950,14 @@ h2 a.all {{ font-weight: 400; text-transform: none; letter-spacing: 0; margin-le
 
 <h2>Bots</h2>
 <div class="wrap"><table>
-<tr><th>Bot</th><th>State</th><th>Release</th><th class="n">Version</th><th class="n">Rating</th><th class="n">Games, 24 h</th><th class="n">W&ndash;L&ndash;D</th><th class="n">Score</th><th class="n">Think p99</th><th class="n">Ping</th><th class="n">Wire per turn</th></tr>
+<tr><th>Bot</th><th>State</th><th>Release</th><th class="n">Version</th><th class="n">Rating</th><th class="n">Games, 24 h</th><th class="n">W&ndash;L&ndash;D</th><th class="n">Score</th><th class="n">Think p99</th><th>Turns lost</th><th>Network (click for details)</th></tr>
 {bots}</table></div>
-<p class="note">Score counts a draw as half a win; the range under it is the 95% interval. Think p99 is over the last 90 seconds of play, or the last finished game when the bot is between matches. State is the gateway's verdict for a bot behind the gateway: it says "playing" only while turns are being answered. Ping is the last round trip on the bot's socket to the ladder (measured at connect and every 20 seconds); wire per turn is the median of what the ladder charged for a turn less the time the bot took, over the current or last match. A good socket is about 40 to 65 ms ping and 70 ms on the wire; a slow one about 150 ms and 300.</p>
+{dialogs}
+<p class="note">Score counts a draw as half a win; the range under it is the 95% interval. Think p99 is over the last 90 seconds of play, or the last finished game when the bot is between matches. State is the gateway's verdict for a bot behind the gateway: it says "playing" only while turns are being answered. Network is the bot's socket to the ladder: the badge is its last ping, the line its ping over the last hour (the dashed line is 120 ms), then how long it has had this socket, how many it was given in the last hour, and whether a rotation is due. Click it for everything.</p>
 
 <h2>{games_title}</h2>
 <div class="wrap"><table>
-<tr><th class="n">Ended</th><th>Bot</th><th>Result</th><th>Opponent</th><th>Map</th><th class="n">Rating after</th><th class="n">Damage dealt</th><th>Playbook or arm</th><th class="n">Charged per turn</th></tr>
+<tr><th class="n">Ended</th><th>Bot</th><th>Result</th><th>Opponent</th><th>Map</th><th class="n">Rating after</th><th class="n">Damage dealt</th><th>Playbook or arm</th><th class="n">Charged per turn</th><th class="n">Turns lost</th></tr>
 {game_rows}</table></div>
 <p class="note">Each bot writes a game here the moment it ends. Rating after is the bot's rating carried forward by the change the ladder reported. {standings} Charged per turn is the median of what the ladder billed for a turn: our thinking plus the trip there and back.</p>
 
@@ -663,15 +982,45 @@ h2 a.all {{ font-weight: 400; text-transform: none; letter-spacing: 0; margin-le
 </main>
 <script>
 // Times are stored in UTC; show them in the reader's own time.
-for (const t of document.querySelectorAll('time[data-ms]')) {{
-  const d = new Date(Number(t.dataset.ms));
-  if (!isNaN(d)) t.textContent = d.toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit', second: '2-digit' }});
+function localTimes() {{
+  for (const t of document.querySelectorAll('time[data-ms]')) {{
+    const d = new Date(Number(t.dataset.ms));
+    if (!isNaN(d)) t.textContent = d.toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit', second: '2-digit' }});
+  }}
 }}
+localTimes();
+// The network cell opens its panel; Close, Escape or a click outside closes it.
+document.addEventListener('click', (e) => {{
+  const open = e.target.closest('[data-dialog]');
+  if (open) {{ const d = document.getElementById(open.dataset.dialog); if (d) d.showModal(); return; }}
+  if (e.target.closest('dialog .close')) {{ e.target.closest('dialog').close(); return; }}
+  if (e.target.tagName === 'DIALOG') e.target.close();
+}});
+// Fresh every 15 seconds, in place: an open panel stays open, with its new numbers.
+async function refresh() {{
+  try {{
+    const r = await fetch(location.href, {{ cache: 'no-store' }});
+    if (!r.ok) return;
+    const doc = new DOMParser().parseFromString(await r.text(), 'text/html');
+    const fresh = doc.querySelector('main');
+    if (!fresh) return;
+    const open = document.querySelector('dialog[open]');
+    const id = open ? open.id : null;
+    const top = open ? open.scrollTop : 0;
+    const y = window.scrollY;
+    document.querySelector('main').replaceWith(fresh);
+    localTimes();
+    if (id) {{ const d = document.getElementById(id); if (d) {{ d.showModal(); d.scrollTop = top; }} }}
+    window.scrollTo(0, y);
+  }} catch (e) {{}}
+}}
+setInterval(refresh, 15000);
 </script>
 </body>
 </html>
 "##,
         games_title = games_title,
+        dialogs = s.bots.iter().map(net_dialog).collect::<String>(),
         game_rows = game_rows,
         standings = standings,
         tiers = if tiers.is_empty() { "<tr><td colspan=\"4\" class=\"sub\">No experiment is running.</td></tr>".to_string() } else { tiers },
@@ -810,6 +1159,11 @@ pub fn state_json(s: &Snapshot) -> serde_json::Value {
             "rating": b.rating.map(|r| r.round()), "rating_change_24h": b.rating_day.round(), "games_24h": b.day.games(), "games_last_hour": b.hour_games,
             "wins": b.day.wins, "losses": b.day.losses, "draws": b.day.draws, "score_pct": pct(&b.day), "think_p99_ms": b.think_p99_ms.map(|p| p.round()),
             "last_turn_s": b.last_turn_s.map(|t| t.round()), "ping_ms": b.ping_ms.map(|p| p.round()), "wire_ms": b.wire_ms.map(|p| p.round()),
+            "socket_id": b.net.as_ref().and_then(|n| n.socket.as_ref().map(|s| s.id)),
+            "ping_5m_ms": b.net.as_ref().and_then(|n| n.ping[1].map(|a| a.mean.round())), "wire_5m_ms": b.net.as_ref().and_then(|n| n.wire[1].map(|a| a.mean.round())),
+            "sockets_last_hour": b.net.as_ref().map(|n| n.sockets_hour), "rotations_last_hour": b.net.as_ref().map(|n| n.rotations_hour),
+            "rotation_scheduled": b.rotation.get("scheduled").and_then(|x| x.as_bool()).unwrap_or(false), "rotation_position": b.rotation.get("position").and_then(|x| x.as_i64()),
+            "rotation_eta_ms": b.rotation.get("eta_ms").and_then(|x| x.as_i64()),
         })).collect::<Vec<_>>(),
         "arms": s.arms.iter().map(|a| {
             let (lo, hi) = a.record.interval();
@@ -865,7 +1219,7 @@ pub fn serve(root: &Path, port: u16, stop: &dyn Fn() -> bool) -> std::io::Result
             }
             let snap = snapshot_for(root, &store, &cfg, only.as_deref());
             Ok(match path.as_str() {
-                "/" | "/index.html" | "/status.html" => (html(&snap).replacen("<meta charset=\"utf-8\">", "<meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"20\">", 1), "text/html; charset=utf-8"),
+                "/" | "/index.html" | "/status.html" => (html(&snap), "text/html; charset=utf-8"),
                 "/state.json" => (state_json(&snap).to_string(), "application/json"),
                 _ => return Err("not found".into()),
             })

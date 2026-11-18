@@ -185,8 +185,9 @@ fn status(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
     let (ok, queued): (i64, i64) = store.conn.query_row("SELECT COALESCE(SUM(status = 'ok'), 0), COALESCE(SUM(status = 'queued'), 0) FROM replays", [], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e)?;
     let last_replay: Option<i64> = store.conn.query_row("SELECT MAX(fetched_ms) FROM replays WHERE status = 'ok'", [], |r| r.get(0)).map_err(e)?;
     // The gateway's comms budget, when it is running.
-    if let Some(g) = std::fs::read_to_string(supervise::run_dir(root).join("gateway.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
-        if now_ms() - g["ts_ms"].as_i64().unwrap_or(0) < 60_000 {
+    if let Some(star) = fleet::telemetry::gateway_states(&store.conn).into_iter().find(|r| r.bot == "*") {
+        let g = star.detail;
+        if now_ms() - star.ts_ms < 60_000 {
             let b = |k: &str| format!("{} of {}", g[k]["used"], g[k]["limit"]);
             println!(
                 "\ngateway: {} bots; comms budget in use: connections {} a minute, queue requests {} a minute, matches {} a day; since start {} drops, {} idle turns sent for late engines",
@@ -799,43 +800,50 @@ fn attach(root: &Path, raw: &[String]) -> Result<i32, String> {
     Err(format!("cannot run {}: {err}", cmd[0]))
 }
 
-/// The gateway's one verdict on the fleet, and each bot's line.
+/// The gateway's one verdict on the fleet, and each bot's line, from the store's
+/// `gateway_state` (the gateway writes it every second or two).
 fn health(root: &Path, as_json: bool) -> Result<i32, String> {
-    let path = data_dir(root).join("run").join("gateway.json");
-    let text = std::fs::read_to_string(&path).map_err(|_| "the gateway has written no state: is it running? (`fleet install gateway`)".to_string())?;
-    let v: Value = serde_json::from_str(&text).map_err(e)?;
-    let age_s = (now_ms() - v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0)) / 1000;
+    let store = Store::open(&default_db(root), Duration::from_secs(5)).map_err(|x| format!("cannot open the store: {x}"))?;
+    let rows = fleet::telemetry::gateway_states(&store.conn);
+    let Some(star) = rows.iter().find(|r| r.bot == "*") else {
+        return Err("the gateway has written no state: is it running? (`fleet install gateway`)".into());
+    };
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        let all: serde_json::Map<String, Value> = rows.iter().map(|r| (r.bot.clone(), json!({ "ts_ms": r.ts_ms, "level": r.level, "verdict": r.verdict, "socket_id": r.socket_id, "detail": r.detail }))).collect();
+        println!("{}", serde_json::to_string_pretty(&Value::Object(all)).unwrap_or_default());
         return Ok(0);
     }
+    let age_s = (now_ms() - star.ts_ms) / 1000;
     if age_s > 15 {
         println!("DOWN: the gateway last wrote its state {age_s} s ago; it is not running or it is stuck");
         return Ok(2);
     }
-    let word = v.get("verdict").and_then(Value::as_str).unwrap_or("?");
-    println!("{}", if word == "ok" { "OK: every bot is playing or waiting for a match".to_string() } else { format!("DEGRADED: {}", v.get("problems").and_then(Value::as_array).map(|p| p.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default()) });
-    if let Some(h) = v.get("health").and_then(Value::as_object) {
-        for (name, b) in h {
-            let s = |path: &[&str]| path.iter().fold(Some(b), |x, k| x.and_then(|x| x.get(*k))).filter(|x| !x.is_null()).map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).unwrap_or_else(|| "-".into());
-            println!(
-                "{:<15} {:<44} socket {} (ping {} ms, wire {} ms)  label {}  process {} {}  answers p50 {} ms p99 {} ms, late {}  last turn {} s ago",
-                name,
-                s(&["verdict"]),
-                s(&["socket", "remote"]),
-                s(&["socket", "ping_ms"]),
-                s(&["socket", "wire_ms"]),
-                s(&["label"]),
-                s(&["process", "release"]),
-                if b.get("process").and_then(|p| p.get("attached")).and_then(Value::as_bool) == Some(true) { "attached" } else { "NOT ATTACHED" },
-                s(&["process", "answer_ms_p50"]),
-                s(&["process", "answer_ms_p99"]),
-                s(&["process", "late"]),
-                s(&["flow", "last_turn_s"]),
-            );
-        }
+    println!("{}", if star.level == "ok" { "OK: every bot is playing or waiting for a match".to_string() } else { format!("DEGRADED: {}", star.verdict) });
+    for r in rows.iter().filter(|r| r.bot != "*") {
+        let b = &r.detail;
+        let s = |path: &[&str]| path.iter().fold(Some(b), |x, k| x.and_then(|x| x.get(*k))).filter(|x| !x.is_null()).map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).unwrap_or_else(|| "-".into());
+        let rot = match b.get("rotation") {
+            Some(x) if x.get("scheduled").and_then(Value::as_bool) == Some(true) => format!("rotation #{} of {}", s(&["rotation", "position"]), s(&["rotation", "queue_length"])),
+            _ => "no rotation due".into(),
+        };
+        println!(
+            "{:<15} {:<44} socket #{} {} (ping {} ms, wire {} ms, {rot})  label {}  process {} {}  answers p50 {} ms p99 {} ms, late {}  last turn {} s ago",
+            r.bot,
+            r.verdict,
+            r.socket_id.map(|x| x.to_string()).unwrap_or_else(|| "-".into()),
+            s(&["socket", "remote"]),
+            s(&["socket", "ping_ms"]),
+            s(&["socket", "wire_ms"]),
+            s(&["label"]),
+            s(&["process", "release"]),
+            if b.get("process").and_then(|p| p.get("attached")).and_then(Value::as_bool) == Some(true) { "attached" } else { "NOT ATTACHED" },
+            s(&["process", "answer_ms_p50"]),
+            s(&["process", "answer_ms_p99"]),
+            s(&["process", "late"]),
+            s(&["flow", "last_turn_s"]),
+        );
     }
-    Ok(if word == "ok" { 0 } else { 1 })
+    Ok(if star.level == "ok" { 0 } else { 1 })
 }
 
 fn main_inner() -> Result<i32, String> {
