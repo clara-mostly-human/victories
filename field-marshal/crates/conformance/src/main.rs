@@ -246,9 +246,103 @@ fn bench(seconds: f64) {
     }
 }
 
+/// Fits the tempo evaluation from replays: for every tick of every game, from fighter 1's
+/// side, regress the hp swing over the next `horizon` ticks on the tempo features.
+/// Ridge regression by normal equations; prints the weights as a Rust array.
+fn fit_eval(paths: &[String], horizon: usize) {
+    use victris_engine::tempo::{diff, N, NAMES};
+    let mut files = Vec::new();
+    for p in paths {
+        collect(Path::new(p), &mut files);
+    }
+    let mut xtx = vec![0.0f64; N * N];
+    let mut xty = vec![0.0f64; N];
+    let (mut n, mut sum_y, mut sum_yy) = (0u64, 0.0f64, 0.0f64);
+    let mut rows: Vec<([f32; N], f32)> = Vec::new();
+    for f in &files {
+        let Ok(text) = read_text(f) else { continue };
+        let Ok(replay) = parse_replay(&text) else { continue };
+        let e = &replay.engine;
+        let mut s = e.new_match(replay.seed);
+        let mut feats: Vec<[f32; N]> = Vec::new();
+        let mut hp: Vec<[i32; 2]> = Vec::new();
+        for t in &replay.ticks {
+            if s.result.is_some() {
+                break;
+            }
+            feats.push(diff(e, &s, 0));
+            hp.push([s.fighters[0].hp, s.fighters[1].hp]);
+            e.step(&mut s, &t.turns);
+        }
+        hp.push([s.fighters[0].hp, s.fighters[1].hp]);
+        for (i, x) in feats.iter().enumerate() {
+            let j = (i + horizon).min(hp.len() - 1);
+            // hp the opponent lost minus hp we lost (pickups count as negative losses)
+            let y = ((hp[i][1] - hp[j][1]) - (hp[i][0] - hp[j][0])) as f32;
+            rows.push((*x, y));
+        }
+    }
+    for (x, y) in &rows {
+        for a in 0..N {
+            xty[a] += x[a] as f64 * *y as f64;
+            for b in 0..N {
+                xtx[a * N + b] += x[a] as f64 * x[b] as f64;
+            }
+        }
+        n += 1;
+        sum_y += *y as f64;
+        sum_yy += (*y as f64).powi(2);
+    }
+    // Ridge, then Gaussian elimination with partial pivoting.
+    let lambda = 1e-3 * n as f64;
+    let mut a = xtx.clone();
+    let mut b = xty.clone();
+    for i in 0..N {
+        a[i * N + i] += lambda;
+    }
+    for col in 0..N {
+        let piv = (col..N).max_by(|x, y| a[x * N + col].abs().partial_cmp(&a[y * N + col].abs()).unwrap()).unwrap();
+        for k in 0..N {
+            a.swap(col * N + k, piv * N + k);
+        }
+        b.swap(col, piv);
+        let d = a[col * N + col];
+        if d.abs() < 1e-12 {
+            continue;
+        }
+        for r in 0..N {
+            if r != col {
+                let f = a[r * N + col] / d;
+                for k in 0..N {
+                    a[r * N + k] -= f * a[col * N + k];
+                }
+                b[r] -= f * b[col];
+            }
+        }
+    }
+    let w: Vec<f64> = (0..N).map(|i| if a[i * N + i].abs() < 1e-12 { 0.0 } else { b[i] / a[i * N + i] }).collect();
+    let mut sse = 0.0;
+    for (x, y) in &rows {
+        let p: f64 = (0..N).map(|i| w[i] * x[i] as f64).sum();
+        sse += (*y as f64 - p).powi(2);
+    }
+    let var = sum_yy - sum_y * sum_y / n as f64;
+    println!("{} games, {n} ticks, horizon {horizon}; mean swing {:.2}, sd {:.2}; R^2 {:.4}", files.len(), sum_y / n as f64, (var / n as f64).sqrt(), 1.0 - sse / var);
+    for i in 0..N {
+        let share = xtx[i * N + i] / n as f64;
+        println!("  {:>8.2}  {}   (nonzero on {:.1}% of ticks)", w[i], NAMES[i], 100.0 * share);
+    }
+    println!("pub const WEIGHTS: [f32; N] = [{}];", w.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(", "));
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
+        Some("fit-eval") if args.len() > 1 => {
+            let horizon = args.iter().position(|a| a == "--horizon").and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(12);
+            let paths: Vec<String> = args[1..].iter().filter(|a| !a.starts_with("--") && a.parse::<usize>().is_err()).cloned().collect();
+            fit_eval(&paths, horizon)
+        }
         Some("verify") if args.len() > 1 => std::process::exit(verify(&args[1..])),
         Some("bench") => bench(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3.0)),
         _ => {

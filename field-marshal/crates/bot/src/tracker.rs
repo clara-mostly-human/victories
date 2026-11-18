@@ -105,7 +105,16 @@ pub struct Tracker {
     pub last_mismatch: Option<String>,
     /// damage dealt so far by each fighter, counted from events
     dealt: [i32; 2],
+    /// our own estimate of match budget spent, in ms: think time plus a network allowance
+    /// per tick. The server charges both; this keeps long thinks from exhausting the match.
+    spent_ms: std::cell::Cell<u64>,
 }
+
+/// What a reply costs on top of thinking: network and server handling, as measured from
+/// this machine (median 105 ms, 90th percentile 136 ms).
+const TICK_OVERHEAD_MS: u64 = 125;
+/// Budget kept in hand for the rest of a match.
+const BUDGET_RESERVE_MS: u64 = 25_000;
 
 /// Which parts of a predicted view differ from the real one, with both values.
 fn view_diff(ours: &View, theirs: &View) -> Vec<String> {
@@ -196,6 +205,7 @@ impl Tracker {
             stats: TrackStats::default(),
             last_mismatch: None,
             dealt: [0, 0],
+            spent_ms: std::cell::Cell::new(0),
         })
     }
 
@@ -214,12 +224,33 @@ impl Tracker {
             stats: TrackStats::default(),
             last_mismatch: None,
             dealt: [0, 0],
+            spent_ms: std::cell::Cell::new(0),
         }
     }
 
     #[inline]
     fn idx(&self, p: P) -> usize {
         (p[1] * self.engine.map.w + p[0]) as usize
+    }
+
+    /// Records one decision's think time against the match budget.
+    pub fn charge_think(&self, took: std::time::Duration) {
+        self.spent_ms.set(self.spent_ms.get() + took.as_millis() as u64 + TICK_OVERHEAD_MS);
+    }
+
+    /// The think cap for this tick: the playbook's, cut down when the match budget could
+    /// not sustain it for the ticks that may remain.
+    pub fn think_cap_ms(&self, wanted: u64) -> u64 {
+        let rules = &self.engine.rules;
+        let budget = rules.limits.match_budget_ms.max(0) as u64;
+        let left = budget.saturating_sub(self.spent_ms.get()).saturating_sub(BUDGET_RESERVE_MS);
+        let tick = self.belief.map(|s| s.tick).unwrap_or(0).max(0);
+        let ticks_left = (rules.max_ticks - tick).max(1) as u64;
+        let sustainable = (left / ticks_left).saturating_sub(TICK_OVERHEAD_MS);
+        // Most games end long before the tick limit, so allow double the sustainable rate,
+        // but never more than the tick deadline can carry.
+        let per_tick_limit = (rules.limits.tick_ms.max(0) as u64).saturating_sub(400);
+        wanted.min(sustainable * 2).min(per_tick_limit)
     }
 
     pub fn my_id(&self) -> i64 {

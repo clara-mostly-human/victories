@@ -30,6 +30,7 @@
 use crate::tracker::Tracker;
 use serde_json::Value;
 use std::collections::VecDeque;
+use std::time::Instant;
 use victris_engine::geom::{add, chebyshev, octant, DIR_VEC, P};
 use victris_engine::map::PadKind;
 use victris_engine::observe::{can_see, View};
@@ -83,6 +84,24 @@ pub struct Playbook {
     /// ticks. Within two tiles such a shot lands the tick it is fired, so this is what
     /// makes the search respect a ready shooter at close range.
     pub model_shots: bool,
+    /// search: ticks looked ahead for the turns in contention (2, or 3 with time to spare)
+    pub depth: u32,
+    /// search: how many of our turns may get the third tick
+    pub deep3_rows: usize,
+    /// search: at inner nodes, how many of each side's likeliest turns go a tick further
+    pub inner_rows: usize,
+    pub inner_cols: usize,
+    /// search: think-time cap per decision in ms for the third tick (0 = no clock: always
+    /// finish, which keeps arena runs repeatable)
+    pub think_ms: u64,
+    /// search threads
+    pub threads: usize,
+    /// search: weight of the fitted tempo evaluation at the leaves (0 = off)
+    pub tempo_weight: f64,
+    /// cost of ending a step (so with no step next tick) within `stuck_range` tiles of an
+    /// opponent whose shot is ready
+    pub stuck_penalty: f64,
+    pub stuck_range: i32,
     /// search: on the second tick, give the opponent its repulsor after any movement.
     /// Strong ladder bots slam us the tick after we step, when we cannot move away.
     pub model_slams: bool,
@@ -128,6 +147,15 @@ impl Default for Playbook {
             model_repulsor: true,
             dash_slam: true,
             slam_risk: 5.0,
+            depth: 2,
+            deep3_rows: 4,
+            inner_rows: 3,
+            inner_cols: 3,
+            think_ms: 0,
+            threads: 1,
+            tempo_weight: 0.0,
+            stuck_penalty: 0.0,
+            stuck_range: 3,
             model_shots: true,
             model_slams: true,
             deepen: 16,
@@ -161,6 +189,30 @@ impl Playbook {
         f("incoming_weight", &mut p.incoming_weight);
         f("step_cost_under_fire", &mut p.step_cost_under_fire);
         f("slam_risk", &mut p.slam_risk);
+        f("stuck_penalty", &mut p.stuck_penalty);
+        f("tempo_weight", &mut p.tempo_weight);
+        let u = |k: &str| v.get(k).and_then(Value::as_u64);
+        if let Some(x) = u("depth") {
+            p.depth = x as u32;
+        }
+        if let Some(x) = u("deep3_rows") {
+            p.deep3_rows = x as usize;
+        }
+        if let Some(x) = u("inner_rows") {
+            p.inner_rows = x as usize;
+        }
+        if let Some(x) = u("inner_cols") {
+            p.inner_cols = x as usize;
+        }
+        if let Some(x) = u("think_ms") {
+            p.think_ms = x;
+        }
+        if let Some(x) = u("threads") {
+            p.threads = x as usize;
+        }
+        if let Some(x) = v.get("stuck_range").and_then(Value::as_i64) {
+            p.stuck_range = x as i32;
+        }
         if let Some(x) = v.get("health_pad_missing_hp").and_then(Value::as_i64) {
             p.health_pad_missing_hp = x as i32;
         }
@@ -281,7 +333,7 @@ fn outcome(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Pla
 /// One cell of the matrix game: both turns played on the exact engine, then a few ticks
 /// in which each side only steps out of what would hit it. The value is hp taken from
 /// the opponent minus hp lost, with a bonus for stuns and a large one for a kill.
-fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Playbook, rollout: i32, sims: &mut u32) -> (f64, State) {
+fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Playbook, rollout: i32, leaf: bool, sims: &mut u32) -> (f64, State) {
     let mut s = *before;
     e.step(&mut s, turns);
     *sims += 1;
@@ -341,11 +393,16 @@ fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
     if !s.fighters[me].alive {
         v -= 1000.0;
     }
+    // At a leaf, add what the position is worth beyond the ticks played: the fitted
+    // tempo value of the state right after the searched tick.
+    if leaf && pb.tempo_weight != 0.0 && after_tick.result.is_none() {
+        v += pb.tempo_weight * victris_engine::tempo::value(e, &after_tick, me, &victris_engine::tempo::WEIGHTS) as f64;
+    }
     (v, after_tick)
 }
 
 fn cell_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Playbook, sims: &mut u32) -> f64 {
-    tick_value(e, before, me, turns, pb, pb.rollout_ticks, sims).0
+    tick_value(e, before, me, turns, pb, pb.rollout_ticks, true, sims).0
 }
 
 /// Where a dash from `from` in `dir` would stop, ignoring anything that moves meanwhile.
@@ -369,7 +426,7 @@ fn dash_end(e: &Engine, s: &State, mover: usize, dir: u8) -> P {
 /// movements with or without a shot or a repulsor, against the opponent's movements.
 /// This is the second tick of the deepened search, so it keeps to the turns that decide
 /// exchanges and leaves positional merits to the first tick.
-fn subgame_value(e: &Engine, s: &State, me: usize, pb: &Playbook, k: &Kit, sims: &mut u32) -> f64 {
+fn subgame_value(e: &Engine, s: &State, me: usize, pb: &Playbook, k: &Kit, depth: u32, deadline: Option<Instant>, sims: &mut u32) -> f64 {
     let turns = |mine: RawTurn, theirs: RawTurn| if me == 0 { [mine, theirs] } else { [theirs, mine] };
     let (my, en) = (s.fighters[me], s.fighters[1 - me]);
     let mut mine: Vec<(RawTurn, f64)> = Vec::with_capacity(52);
@@ -437,15 +494,33 @@ fn subgame_value(e: &Engine, s: &State, me: usize, pb: &Playbook, k: &Kit, sims:
     let mut payoff = vec![0.0f64; rows * cols];
     for (m, (mt, cost)) in mine.iter().enumerate() {
         for (c, (tt, their_cost)) in theirs.iter().enumerate() {
-            payoff[m * cols + c] = tick_value(e, s, me, &turns(*mt, *tt), pb, pb.deep_rollout, sims).0 - cost + their_cost;
+            payoff[m * cols + c] = tick_value(e, s, me, &turns(*mt, *tt), pb, pb.deep_rollout, true, sims).0 - cost + their_cost;
         }
     }
-    solve_matrix(&payoff, rows, cols, 60).1
+    let (mix_r, mix_c, value) = solve_matrix(&payoff, rows, cols, 60);
+    if depth <= 1 || deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
+        return value;
+    }
+    // One tick further for the cells both sides are most likely to reach.
+    let top = |mix: &[f64], n: usize| -> Vec<usize> {
+        let mut order: Vec<usize> = (0..mix.len()).collect();
+        order.sort_by(|a, b| mix[*b].partial_cmp(&mix[*a]).unwrap());
+        order.truncate(n);
+        order
+    };
+    for &m in &top(&mix_r, pb.inner_rows) {
+        for &c in &top(&mix_c, pb.inner_cols) {
+            let (v1, s1) = tick_value(e, s, me, &turns(mine[m].0, theirs[c].0), pb, 0, false, sims);
+            let later = if s1.result.is_none() { subgame_value(e, &s1, me, pb, k, depth - 1, deadline, sims) } else { 0.0 };
+            payoff[m * cols + c] = v1 + later - mine[m].1 + theirs[c].1;
+        }
+    }
+    solve_matrix(&payoff, rows, cols, 60).2
 }
 
 /// Solves a zero-sum matrix game by regret matching. `a[m * cols + e]` is the row
-/// player's payoff. Returns the row player's average strategy and the game's value.
-fn solve_matrix(a: &[f64], rows: usize, cols: usize, iters: usize) -> (Vec<f64>, f64) {
+/// player's payoff. Returns both players' average strategies and the game's value.
+fn solve_matrix(a: &[f64], rows: usize, cols: usize, iters: usize) -> (Vec<f64>, Vec<f64>, f64) {
     let mut rr = vec![0.0f64; rows];
     let mut rc = vec![0.0f64; cols];
     let mut avg_r = vec![0.0f64; rows];
@@ -499,10 +574,17 @@ fn solve_matrix(a: &[f64], rows: usize, cols: usize, iters: usize) -> (Vec<f64>,
             value += avg_r[m] * avg_c[e] * a[m * cols + e];
         }
     }
-    (avg_r, value)
+    (avg_r, avg_c, value)
 }
 
 pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
+    let started = Instant::now();
+    let d = decide_inner(t, view, pb, started);
+    t.charge_think(started.elapsed());
+    d
+}
+
+fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> Decision {
     let idle = Decision { turn: RawTurn::IDLE, sims: 0, score: 0.0, note: "cannot act" };
     let Some(s) = t.belief else { return idle };
     let e = &t.engine;
@@ -725,6 +807,15 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
                 }
                 place -= if slam { 8.0 } else { 1.5 };
             }
+            // A step now leaves us unable to move next tick. If the opponent's shot is ready
+            // and it can be within two tiles of us by then, that is a free hit for it.
+            {
+                let stuck_next = *kind != 0 || my.cd_move > 1;
+                let shot_ready = k.ranged.map(|a| en.cd_attack[a as usize] <= 1).unwrap_or(false);
+                if stuck_next && shot_ready && d <= pb.stuck_range {
+                    place -= pb.stuck_penalty;
+                }
+            }
             // Within two tiles a shot lands the tick it is fired: be there only with the tempo.
             if d <= 2 && k.ranged.map(|a| en.cd_attack[a as usize] <= 1).unwrap_or(false) {
                 place -= if can_step_next { 2.0 } else { 6.0 };
@@ -843,7 +934,7 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
                 payoff[m * cols + c] = cell_value(e, &s, me, &turns(*mine, *reply), pb, &mut sims) + merit + their_cost;
             }
         }
-        let (mut mix, mut value) = solve_matrix(&payoff, rows, cols, 300);
+        let (mut mix, _, mut value) = solve_matrix(&payoff, rows, cols, 300);
         // Deepening: the turns the first solve likes best are played out one tick further,
         // with the next tick itself solved as a game, and the choice is made among them.
         if pb.deepen > 0 && dist_now <= pb.deep_range && rows > 1 {
@@ -851,16 +942,68 @@ pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
             let row_mean = |m: usize| payoff[m * cols..(m + 1) * cols].iter().sum::<f64>() / cols as f64;
             order.sort_by(|a, b| (mix[*b], row_mean(*b)).partial_cmp(&(mix[*a], row_mean(*a))).unwrap());
             order.truncate(pb.deepen);
+            // One of our turns played a tick further against every reply, the replies
+            // shared out over the search threads. `depth` counts ticks after the first.
+            let deepen_row = |m: usize, depth: u32, deadline: Option<Instant>, out: &mut [f64]| -> u32 {
+                let (mine, merit, _) = cands[m];
+                let threads = pb.threads.clamp(1, 16).min(cols.max(1));
+                let chunk = cols.div_ceil(threads);
+                let mut total = 0u32;
+                std::thread::scope(|scope| {
+                    let handles: Vec<_> = out
+                        .chunks_mut(chunk)
+                        .enumerate()
+                        .map(|(i, part)| {
+                            let theirs = &theirs;
+                            let k = &k;
+                            scope.spawn(move || {
+                                let mut n = 0u32;
+                                for (j, slot) in part.iter_mut().enumerate() {
+                                    let (reply, their_cost) = theirs[i * chunk + j];
+                                    let (v1, s1) = tick_value(e, &s, me, &turns(mine, reply), pb, 0, false, &mut n);
+                                    let later = if s1.result.is_none() { subgame_value(e, &s1, me, pb, k, depth, deadline, &mut n) } else { 0.0 };
+                                    *slot = v1 + later + merit + their_cost;
+                                }
+                                n
+                            })
+                        })
+                        .collect();
+                    for h in handles {
+                        total += h.join().unwrap_or(0);
+                    }
+                });
+                total
+            };
             let mut deep = vec![0.0f64; order.len() * cols];
             for (i, &m) in order.iter().enumerate() {
-                let (mine, merit, _) = cands[m];
-                for (c, (reply, their_cost)) in theirs.iter().enumerate() {
-                    let (v1, s1) = tick_value(e, &s, me, &turns(mine, *reply), pb, 0, &mut sims);
-                    let later = if s1.result.is_none() { subgame_value(e, &s1, me, pb, &k, &mut sims) } else { 0.0 };
-                    deep[i * cols + c] = v1 + later + merit + their_cost;
+                sims += deepen_row(m, 1, None, &mut deep[i * cols..(i + 1) * cols]);
+            }
+            let (mut deep_mix, _, mut deep_value) = solve_matrix(&deep, order.len(), cols, 300);
+            // With time left, the turns still in contention get a third tick, best first,
+            // until the clock runs out. Rows are replaced whole, so a row is never half deep.
+            if pb.depth >= 3 {
+                let deadline = if pb.think_ms > 0 { Some(started + std::time::Duration::from_millis(t.think_cap_ms(pb.think_ms))) } else { None };
+                let mut by_weight: Vec<usize> = (0..order.len()).collect();
+                by_weight.sort_by(|a, b| deep_mix[*b].partial_cmp(&deep_mix[*a]).unwrap());
+                let mut row = vec![0.0f64; cols];
+                let mut done = 0;
+                for &i in by_weight.iter().take(pb.deep3_rows) {
+                    if deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
+                        break;
+                    }
+                    sims += deepen_row(order[i], pb.depth - 1, deadline, &mut row);
+                    if deadline.map(|d| Instant::now() >= d).unwrap_or(false) {
+                        break; // a row cut short by the clock is not trusted
+                    }
+                    deep[i * cols..(i + 1) * cols].copy_from_slice(&row);
+                    done += 1;
+                }
+                if done > 0 {
+                    let solved = solve_matrix(&deep, order.len(), cols, 300);
+                    deep_mix = solved.0;
+                    deep_value = solved.2;
                 }
             }
-            let (deep_mix, deep_value) = solve_matrix(&deep, order.len(), cols, 300);
             mix = vec![0.0; rows];
             for (i, &m) in order.iter().enumerate() {
                 mix[m] = deep_mix[i];

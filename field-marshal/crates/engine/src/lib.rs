@@ -17,6 +17,7 @@ pub mod replay;
 pub mod rules;
 pub mod state;
 pub mod step;
+pub mod tempo;
 pub mod turn;
 
 pub use geom::P;
