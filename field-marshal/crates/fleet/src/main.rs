@@ -15,7 +15,8 @@
 //!   fleet ingest [bot ...]                        read marshal logs into the store
 //!
 //!   fleet plan list | show <name> | add <file.json> | pause <name> | resume <name> | stop <name>
-//!   fleet plan show <name> [--since 90m|04:45|<epoch>]   arms, and each arm against control over the arm's own time
+//!   fleet plan show <name> [--since 90m|04:45|<epoch>] [--baseline-playbook matrix-5] [--control-only]
+//!                                                 arms, and each arm against the default playbook over the arm's own time, by opponent rating
 //!   fleet plan add-arm <name> <arm> '<settings json>' | stop-arm <name> <arm> [--reason text] | resume-arm <name> <arm> | rebalance <name>
 //!   fleet epoch add <name> <time> [--note text] | list        named moments, usable wherever --since is
 //!   fleet assign --bot b --opponent o --map m --seat n --match id     what the plan would hand out (writes the row)
@@ -58,7 +59,7 @@ struct Args {
 }
 
 /// Flags that take no value.
-const SWITCHES: [&str; 8] = ["--all", "--no-tests", "--ours", "--not-ours", "--count", "--experiments", "--json", "--rebuild"];
+const SWITCHES: [&str; 9] = ["--all", "--no-tests", "--ours", "--not-ours", "--count", "--experiments", "--json", "--rebuild", "--control-only"];
 
 impl Args {
     fn parse(raw: &[String]) -> Args {
@@ -244,10 +245,73 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
             }
             let f = Filter { experiment: Some(name.to_string()), since_ms: from, ..Filter::default() };
             print!("\n{}", table("arm", &store.records("arm", &f).map_err(e)?));
-            // Each arm against the control's games from that arm's own first game on, so an
-            // arm that joined late is not compared with a control that played in other times.
-            println!("\neach arm against control over the arm's own time");
-            println!("{:<18} {:>5} {:>13} {:>6}   {:>5} {:>13} {:>6}   {:>8}  {}", "arm", "games", "record", "ticks", "games", "control", "ticks", "diff", "sure it is better");
+            // Each arm against the default playbook's games from that arm's own first game on,
+            // so an arm that joined late is not compared with games played in other times.
+            // The baseline is every game on the default playbook in that window: the control
+            // arm, and games of our bots outside any experiment that ran the default (the
+            // canary; the flagship while it plays the default). `--baseline-playbook` names
+            // it; `--control-only` narrows the baseline to the control arm.
+            let default_playbook = a.get("--baseline-playbook").unwrap_or("matrix-5").to_string();
+            let control_only = a.has("--control-only");
+            const BAND: &str = "CASE WHEN opponent_rating >= 2500 THEN '2500 and up' WHEN opponent_rating >= 2250 THEN '2250 to 2500' WHEN opponent_rating IS NULL THEN 'not rated' ELSE 'under 2250' END";
+            let by_band = |clause: &str, p: &[&dyn rusqlite::ToSql]| -> Result<Vec<(String, fleet::stats::Record, f64)>, String> {
+                let mut q = store
+                    .conn
+                    .prepare(&format!(
+                        "SELECT {BAND}, SUM(result = 'win'), SUM(result = 'loss'), SUM(result NOT IN ('win', 'loss')), COALESCE(AVG(final_tick), 0)
+                         FROM matches WHERE result IS NOT NULL AND voided = 0 AND {clause} GROUP BY 1"
+                    ))
+                    .map_err(e)?;
+                let rows = q
+                    .query_map(p, |r| Ok((r.get::<_, String>(0)?, fleet::stats::Record { wins: r.get(1)?, losses: r.get(2)?, draws: r.get(3)? }, r.get::<_, f64>(4)?)))
+                    .map_err(e)?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(rows)
+            };
+            let total = |rows: &[(String, fleet::stats::Record, f64)]| -> (fleet::stats::Record, f64) {
+                let mut t = fleet::stats::Record::default();
+                let mut ticks = 0.0;
+                for (_, r, k) in rows {
+                    t.wins += r.wins;
+                    t.losses += r.losses;
+                    t.draws += r.draws;
+                    ticks += k * r.games() as f64;
+                }
+                let n = t.games().max(1) as f64;
+                (t, ticks / n)
+            };
+            let line = |label: &str, ar: &fleet::stats::Record, at: f64, cr: &fleet::stats::Record, ct: f64| {
+                let (diff, sure) = if ar.games() > 0 && cr.games() > 0 {
+                    // Smoothed variances: a 6 and 0 record must not claim to be certain.
+                    let smooth = |r: &fleet::stats::Record| {
+                        let p = (r.wins as f64 + 0.5 * r.draws as f64 + 1.0) / (r.games() as f64 + 2.0);
+                        p * (1.0 - p) / r.games() as f64
+                    };
+                    let se = (smooth(ar) + smooth(cr)).sqrt();
+                    let d = ar.score() - cr.score();
+                    (format!("{:+.0} pts", 100.0 * d), format!("{:.0}%  ({:+.1} se)", 100.0 * fleet::stats::normal_cdf(d / se), d / se))
+                } else {
+                    ("-".to_string(), "-".to_string())
+                };
+                println!(
+                    "{:<26} {:>5} {:>13} {:>6}   {:>5} {:>13} {:>6}   {:>8}  {}",
+                    label,
+                    ar.games(),
+                    format!("{}W {}L {}D", ar.wins, ar.losses, ar.draws),
+                    if ar.games() > 0 { format!("{at:.0}") } else { "-".into() },
+                    cr.games(),
+                    format!("{}W {}L {}D", cr.wins, cr.losses, cr.draws),
+                    if cr.games() > 0 { format!("{ct:.0}") } else { "-".into() },
+                    diff,
+                    sure
+                );
+            };
+            println!(
+                "\neach arm against the default playbook ({}) over the arm's own time",
+                if control_only { "the control arm only".to_string() } else { format!("control arm and other games on {default_playbook}") }
+            );
+            println!("{:<26} {:>5} {:>13} {:>6}   {:>5} {:>13} {:>6}   {:>8}  {}", "arm, opponents", "games", "record", "ticks", "games", "baseline", "ticks", "diff", "sure it is better");
             let mut names: Vec<String> = x.arms.iter().map(|(n, _)| n.clone()).chain(x.stopped.iter().map(|(n, _)| n.clone())).filter(|n| n != "control").collect();
             names.dedup();
             for arm in names {
@@ -260,36 +324,24 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                     )
                     .map_err(e)?;
                 let Some(t0) = first else { continue };
-                let window = Filter { experiment: Some(name.to_string()), since_ms: Some(t0), ..Filter::default() };
-                let rows = store.records("arm", &window).map_err(e)?;
-                let rec = |n: &str| rows.iter().find(|r| r.key == n).map(|r| r.record).unwrap_or_default();
-                // average length of a game, in ticks
-                let ticks = |n: &str| rows.iter().find(|r| r.key == n).map(|r| format!("{:.0}", r.ticks)).unwrap_or_else(|| "-".into());
-                let (ar, cr) = (rec(&arm), rec("control"));
-                let (line, sure) = if ar.games() > 0 && cr.games() > 0 {
-                    // Smoothed variances: a 6 and 0 record must not claim to be certain.
-                    let smooth = |r: &fleet::stats::Record| {
-                        let p = (r.wins as f64 + 0.5 * r.draws as f64 + 1.0) / (r.games() as f64 + 2.0);
-                        p * (1.0 - p) / r.games() as f64
-                    };
-                    let se = (smooth(&ar) + smooth(&cr)).sqrt();
-                    let diff = ar.score() - cr.score();
-                    (format!("{:+.0} pts", 100.0 * diff), if se > 0.0 { format!("{:.0}%", 100.0 * fleet::stats::normal_cdf(diff / se)) } else { "-".into() })
+                let arm_rows = by_band("experiment_id = ?1 AND arm = ?2 AND started_ms >= ?3", &[&x.id, &arm, &t0])?;
+                let base_rows = if control_only {
+                    by_band("experiment_id = ?1 AND arm = 'control' AND started_ms >= ?2", &[&x.id, &t0])?
                 } else {
-                    ("-".to_string(), "-".to_string())
+                    by_band(
+                        "((experiment_id = ?1 AND arm = 'control') OR (experiment_id IS NULL AND playbook = ?2 AND opponent_ours = 0)) AND started_ms >= ?3",
+                        &[&x.id, &default_playbook, &t0],
+                    )?
                 };
-                println!(
-                    "{:<18} {:>5} {:>13} {:>6}   {:>5} {:>13} {:>6}   {:>8}  {}",
-                    arm,
-                    ar.games(),
-                    format!("{}W {}L {}D", ar.wins, ar.losses, ar.draws),
-                    ticks(&arm),
-                    cr.games(),
-                    format!("{}W {}L {}D", cr.wins, cr.losses, cr.draws),
-                    ticks("control"),
-                    line,
-                    sure
-                );
+                let ((ar, at), (cr, ct)) = (total(&arm_rows), total(&base_rows));
+                line(&arm, &ar, at, &cr, ct);
+                for band in ["2500 and up", "2250 to 2500", "under 2250", "not rated"] {
+                    let get = |rows: &[(String, fleet::stats::Record, f64)]| rows.iter().find(|r| r.0 == band).map(|r| (r.1, r.2)).unwrap_or_default();
+                    let ((ar, at), (cr, ct)) = (get(&arm_rows), get(&base_rows));
+                    if ar.games() + cr.games() > 0 {
+                        line(&format!("    {band}"), &ar, at, &cr, ct);
+                    }
+                }
             }
             for (arm, why) in &x.stopped {
                 println!("  arm {arm} was stopped: {why}");
