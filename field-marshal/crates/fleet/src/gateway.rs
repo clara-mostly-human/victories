@@ -284,6 +284,8 @@ pub struct Shared {
     active: Mutex<HashMap<String, u8>>,
     /// the rotation queue: bots on a slow socket, waiting for their turn to get a new one
     rotation: Mutex<Vec<Waiting>>,
+    /// when the ladder last dropped our connections (not counting the ones we closed)
+    resets: Mutex<VecDeque<Instant>>,
     /// replacement sockets in a row that came out slow, and until when replacing is off
     replace_fails: AtomicU64,
     replace_suspended: Mutex<Option<Instant>>,
@@ -297,6 +299,7 @@ impl Shared {
         let now = Instant::now();
         Shared {
             rotation: Mutex::new(Vec::new()),
+            resets: Mutex::new(VecDeque::new()),
             replace_fails: AtomicU64::new(0),
             replace_suspended: Mutex::new(None),
             ping_reject_ms: AtomicU64::new(opt.ping_reject_ms.max(0.0) as u64),
@@ -352,6 +355,22 @@ impl Shared {
         q.insert(at, w);
     }
 
+    /// The ladder dropped one of our connections.
+    fn note_reset(&self) {
+        let mut r = self.resets.lock().unwrap_or_else(|p| p.into_inner());
+        r.push_back(Instant::now());
+        while r.len() > 64 {
+            r.pop_front();
+        }
+    }
+
+    /// How many of our connections the ladder dropped in the last two minutes. Two or more
+    /// is a burst: then every reconnect is already a new socket (a fresh draw), and a
+    /// rotation would only add connections while the ladder is shedding them.
+    fn recent_resets(&self) -> usize {
+        self.resets.lock().unwrap_or_else(|p| p.into_inner()).iter().filter(|t| t.elapsed() < Duration::from_secs(120)).count()
+    }
+
     /// Takes a bot out of the rotation queue (its socket is good again, or gone).
     fn cancel_rotation(&self, bot: &str) {
         self.rotation.lock().unwrap_or_else(|p| p.into_inner()).retain(|w| w.bot != bot);
@@ -364,6 +383,9 @@ impl Shared {
     fn may_rotate(&self, bot: &str) -> Option<String> {
         let mut q = self.rotation.lock().unwrap_or_else(|p| p.into_inner());
         if q.first().map(|w| w.bot != bot).unwrap_or(true) {
+            return None;
+        }
+        if self.recent_resets() >= 2 {
             return None;
         }
         if let Some(until) = *self.replace_suspended.lock().unwrap_or_else(|p| p.into_inner()) {
@@ -406,6 +428,20 @@ impl Shared {
                 open = until;
                 waiting_for = "rotating is paused: the last three new sockets were all slow";
             }
+        }
+        let resets = self.recent_resets();
+        if resets >= 2 {
+            // Until the last two resets are more than two minutes old.
+            let r = self.resets.lock().unwrap_or_else(|p| p.into_inner());
+            let second_last = r.iter().rev().nth(1).copied();
+            drop(r);
+            if let Some(t) = second_last {
+                let until = t + Duration::from_secs(120);
+                if until > open {
+                    open = until;
+                }
+            }
+            waiting_for = "a quiet spell: the ladder is resetting our connections, and each reconnect is already a new socket";
         }
         let eta = open.max(now) + self.opt.replace_gap * pos as u32;
         json!({
@@ -926,14 +962,19 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         if !shared.connect_budget.take(stop) {
             break;
         }
-        Shared::pace(&shared.next_connect, opt.connect_gap);
+        // A match waiting to be resumed has ten seconds before the ladder gives up on it, and
+        // every second costs a turn played idle: it goes at once. Every other connection
+        // waits its turn, one every `connect_gap` across the fleet.
+        if !flow.in_match {
+            Shared::pace(&shared.next_connect, opt.connect_gap);
+        }
         shared.connects.fetch_add(1, Ordering::Relaxed);
         let prefer: Vec<std::net::IpAddr> = p.cfg.prefer_addresses.iter().filter_map(|a| a.parse().ok()).collect();
         let (mut ws, remote) = match connect(&url, &token, &prefer, shared) {
             Ok(x) => x,
             Err(why) => {
-                backoff = (backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(30));
-                event(root, name, "connect_failed", json!({ "why": why, "retry_in_s": backoff.as_secs() }));
+                backoff = if flow.in_match { Duration::from_millis(300) } else { (backoff * 2).clamp(Duration::from_secs(1), Duration::from_secs(30)) };
+                event(root, name, "connect_failed", json!({ "why": why, "retry_in_s": backoff.as_secs_f64(), "in_match": flow.in_match }));
                 down_why = why;
                 continue;
             }
@@ -966,7 +1007,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
             // A slow socket. The bot joins the rotation queue; if it is its turn, and no match
             // is waiting on this socket, the socket is given up now, before anything is played
             // on it. Otherwise the bot plays on it and rotates when its turn comes.
-            shared.want_rotation(name, role == "flagship", format!("ping {ms:.0} ms at connect"));
+            shared.want_rotation(name, role == "flagship", format!("slow ping, {ms:.0} ms at connect"));
             let hello = inbox.iter().any(|t| t.contains("\"hello\""));
             if !resuming && !hello {
                 if let Some(reason) = shared.may_rotate(name) {
@@ -1641,7 +1682,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                 let slow_ping = reject > 0.0 && slow_pings >= 2;
                 let slow_wire = reject > 0.0 && wire_ms.map(|w| w > 200.0).unwrap_or(false);
                 if slow_ping || slow_wire {
-                    let why = if slow_ping { format!("ping {} ms", ping_ms.map(|x| x.round()).unwrap_or(0.0)) } else { format!("{} ms on the wire per turn", wire_ms.map(|x| x.round()).unwrap_or(0.0)) };
+                    let why = if slow_ping { format!("slow ping, {} ms", ping_ms.map(|x| x.round()).unwrap_or(0.0)) } else { format!("slow wire, {} ms a turn", wire_ms.map(|x| x.round()).unwrap_or(0.0)) };
                     shared.want_rotation(name, role == "flagship", why);
                 } else {
                     shared.cancel_rotation(name);
@@ -1723,6 +1764,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         if flow.in_match {
             flow.dropped_at_tick = flow.tick.or(flow.dropped_at_tick);
         }
+        if !voluntary {
+            shared.note_reset();
+        }
         // The socket's record: closed, and why. A new socket is judged afresh.
         if let Some(s) = sid.take() {
             tel().socket_closed(s, &if voluntary { why_closed.clone() } else { format!("dropped: {why_closed}") });
@@ -1733,7 +1777,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
             }
         }
         shared.cancel_rotation(name);
-        backoff = if voluntary {
+        backoff = if voluntary || flow.in_match {
+            // A rotation's next socket is spaced by the queue; a match waits to be resumed.
             Duration::ZERO
         } else if connected.elapsed() > Duration::from_secs(30) {
             Duration::ZERO
