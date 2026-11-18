@@ -23,6 +23,7 @@ pub mod state;
 pub mod step;
 pub mod tempo;
 pub mod turn;
+pub mod valuefeat;
 
 pub use geom::P;
 pub use map::MapData;

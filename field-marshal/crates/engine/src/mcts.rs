@@ -37,6 +37,8 @@ pub struct Config {
     pub buff_value: f64,
     /// share of the prior that is spread evenly over all turns
     pub even: f32,
+    /// weight of the fitted judgment of positions at a leaf (`models::VALUE_WEIGHTS`)
+    pub value_weight: f64,
     /// nodes fewer than this many ticks below the root order forcing turns first
     /// (0 = off: at 150 ms a move it scored 8 of 18 against 10 of 18 without, so it is
     /// off until it earns its place)
@@ -45,7 +47,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, forcing_depth: 0 }
     }
 }
 
@@ -242,7 +244,11 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config) -> f64 {
         v += reward(&st, before);
     }
     let buff = |i: usize| if st.fighters[i].power_until == NO_BUFF { 0 } else { (st.fighters[i].power_until - st.tick).max(0) };
-    v + cfg.buff_value * (buff(0) - buff(1)) as f64
+    v += cfg.buff_value * (buff(0) - buff(1)) as f64;
+    if cfg.value_weight != 0.0 && st.result.is_none() {
+        v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, &crate::models::VALUE_WEIGHTS) as f64;
+    }
+    v
 }
 
 pub struct Search<'a> {

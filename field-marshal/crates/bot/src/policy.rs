@@ -135,6 +135,9 @@ pub struct Playbook {
     pub tree_ms: u64,
     /// ticks the tree search looks ahead
     pub tree_depth: u32,
+    /// weight of the fitted judgment of positions at the tree's leaves (0 = off; with it
+    /// on, the fixed value per buff tick is dropped, since the judgment covers it)
+    pub tree_value: f64,
     /// weight (hp per unit of log probability) of the learned movement prior: how likely
     /// a strong bot is to hold, step toward, away, sideways or dash in our situation
     /// (`movemodel`, fitted on 922 replay games; it predicts 50% of their moves in unseen
@@ -270,6 +273,7 @@ impl Default for Playbook {
             pad_bonus: 0.0,
             tree_ms: 0,
             tree_depth: 12,
+            tree_value: 0.0,
             move_prior_weight: 0.0,
             attack_prior_weight: 0.0,
             rollout_punish: false,
@@ -320,6 +324,7 @@ impl Playbook {
         f("frost_combo", &mut p.frost_combo);
         f("frost_wait_cost", &mut p.frost_wait_cost);
         f("move_prior_weight", &mut p.move_prior_weight);
+        f("tree_value", &mut p.tree_value);
         f("pad_bonus", &mut p.pad_bonus);
         f("attack_prior_weight", &mut p.attack_prior_weight);
         f("dash_cost_frosted", &mut p.dash_cost_frosted);
@@ -1175,7 +1180,10 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     // The tree search as the whole brain: both sides search for their best move on the
     // exact engine for `tree_ms`, and we play our most visited turn.
     if pb.tree_ms > 0 && visible {
-        let cfg = victris_engine::mcts::Config { depth: pb.tree_depth, ..Default::default() };
+        let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, ..Default::default() };
+        if pb.tree_value != 0.0 {
+            cfg.buff_value = 0.0;
+        }
         let mut search = victris_engine::mcts::Search::new(e, cfg);
         search.start();
         let mut done = 0u32;

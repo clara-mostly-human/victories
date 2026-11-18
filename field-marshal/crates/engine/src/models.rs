@@ -64,3 +64,7 @@ pub fn move_probs_for(e: &Engine, s: &State, x: usize) -> [f32; CLASSES] {
     move_probs(&features(e, s, x))
 }
 
+
+/// The judgment of positions (`valuefeat`), fitted by `valuefit` on the search's own
+/// games. All zeros until the first fit.
+pub const VALUE_WEIGHTS: [f32; crate::valuefeat::NV] = [0.0; crate::valuefeat::NV];

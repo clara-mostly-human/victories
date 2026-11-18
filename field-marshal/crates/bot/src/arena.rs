@@ -40,7 +40,14 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
     let mut events = Vec::new();
     let mut out = GameResult::default();
     let mut rng = (seed as u64).wrapping_mul(0x9e3779b97f4a7c15) | 1;
+    // ARENA_DUMP=file: for fitting the judgment of positions, every third tick is written
+    // as the value features (fighter 0 minus fighter 1) and the discounted hp fighter 0
+    // went on to gain or lose from there (discount 0.98 a tick, 40 for a kill).
+    let dumping = std::env::var_os("ARENA_DUMP").is_some();
+    let mut trace: Vec<([f32; victris_engine::valuefeat::NV], f64)> = Vec::new();
     while s.result.is_none() {
+        let before = (s.fighters[0].hp, s.fighters[1].hp);
+        let feats = if dumping { Some(victris_engine::valuefeat::diff(engine, &s, 0)) } else { None };
         let mut turns = [RawTurn::IDLE; 2];
         for i in 0..2 {
             let Some(book) = books[i] else {
@@ -76,6 +83,16 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
             prev[i] = Some(d.turn);
         }
         engine.step_events(&mut s, &turns, &mut events);
+        if let Some(f) = feats {
+            let mut r = ((s.fighters[0].hp.max(0) - before.0) - (s.fighters[1].hp.max(0) - before.1)) as f64;
+            if !s.fighters[1].alive {
+                r += 40.0;
+            }
+            if !s.fighters[0].alive {
+                r -= 40.0;
+            }
+            trace.push((f, r));
+        }
         for ev in &events {
             use victris_engine::events::Event;
             use victris_engine::rules::AttackKind;
@@ -95,6 +112,25 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
                 Event::ProjectileSpawn { owner, .. } => out.stats[*owner as usize - 1][7] += 1,
                 Event::Pickup { fighter, kind: victris_engine::map::PadKind::Power, .. } => out.stats[*fighter as usize - 1][8] += 1,
                 _ => {}
+            }
+        }
+    }
+    if dumping {
+        use std::io::Write;
+        let mut g = 0.0;
+        let mut lines = String::new();
+        for (i, (f, r)) in trace.iter().enumerate().rev() {
+            g = r + 0.98 * g;
+            if i % 3 == 0 {
+                for v in f {
+                    lines.push_str(&format!("{v:.3} "));
+                }
+                lines.push_str(&format!("{g:.2}\n"));
+            }
+        }
+        if let Some(path) = std::env::var_os("ARENA_DUMP") {
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = file.write_all(lines.as_bytes());
             }
         }
     }
