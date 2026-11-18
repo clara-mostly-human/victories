@@ -84,7 +84,7 @@ paused. Anything else long-running on this machine should check the same file.
   the flagship waits `queue_gap_ms` (one second) after a match before queueing, so the
   flagship gets a freed slot first, and a refused queue is retried after a few seconds.
 
-## The gateway (built and tested on the mock ladder, not yet carrying a live bot)
+## The gateway (on trial with one scout)
 
 `fleet gateway` is one process that holds the ladder connection of every bot whose entry has
 `"gateway": true`; each bot's engine runs behind it as a `marshal --stdio` child from that
@@ -94,6 +94,12 @@ within 800 ms (a stalled or crashed engine costs turns, never a disqualification
 restarts it, and swaps an engine to a new release between two matches without dropping the
 connection. `fleet install gateway` loads it; a bot's own supervisor stands down while
 `gateway` is true for it.
+
+It also keeps the comms budget, set under `"comms"` in `fleet/bots.json`: at most 20 new
+connections a minute, 90 queue requests a minute and 15,000 matches a day across all the
+bots behind it (the ladder's own quotas are 20,000 matches a day per owner and one match
+start per bot every 300 ms). When a budget is spent the gateway waits and says so in its
+log. `fleet status` shows how much of each is in use.
 
 ## The autopilot
 

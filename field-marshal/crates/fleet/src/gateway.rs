@@ -70,6 +70,75 @@ impl Default for Options {
     }
 }
 
+/// A budget: at most `limit` of something in any stretch of `window`. Whoever asks when it
+/// is spent waits for the oldest entry to age out.
+pub struct Budget {
+    pub name: &'static str,
+    pub limit: usize,
+    pub window: Duration,
+    times: Mutex<std::collections::VecDeque<Instant>>,
+    waits: AtomicU64,
+}
+
+impl Budget {
+    pub fn new(name: &'static str, limit: usize, window: Duration) -> Budget {
+        Budget { name, limit: limit.max(1), window, times: Mutex::new(Default::default()), waits: AtomicU64::new(0) }
+    }
+
+    /// How much of the budget is in use right now.
+    pub fn used(&self) -> usize {
+        let mut t = self.times.lock().unwrap_or_else(|p| p.into_inner());
+        while t.front().map(|f| f.elapsed() >= self.window).unwrap_or(false) {
+            t.pop_front();
+        }
+        t.len()
+    }
+
+    /// Books one use without waiting (for things the ladder decides, like a match starting).
+    pub fn record(&self) {
+        self.times.lock().unwrap_or_else(|p| p.into_inner()).push_back(Instant::now());
+    }
+
+    /// When there will be room, if there is none now.
+    fn room_at(&self) -> Option<Instant> {
+        let mut t = self.times.lock().unwrap_or_else(|p| p.into_inner());
+        while t.front().map(|f| f.elapsed() >= self.window).unwrap_or(false) {
+            t.pop_front();
+        }
+        if t.len() < self.limit {
+            None
+        } else {
+            t.front().map(|f| *f + self.window)
+        }
+    }
+
+    /// Waits for room without booking anything. False when asked to stop meanwhile.
+    pub fn wait_for_room(&self, stop: &dyn Fn() -> bool) -> bool {
+        let mut said = false;
+        while let Some(at) = self.room_at() {
+            if !said {
+                said = true;
+                self.waits.fetch_add(1, Ordering::Relaxed);
+                eprintln!("gateway: the {} budget is spent ({} in {} s); waiting {:.1} s", self.name, self.limit, self.window.as_secs(), at.saturating_duration_since(Instant::now()).as_secs_f64());
+            }
+            if stop() {
+                return false;
+            }
+            std::thread::sleep(at.saturating_duration_since(Instant::now()).min(Duration::from_millis(250)));
+        }
+        true
+    }
+
+    /// Waits for room, then books one use.
+    pub fn take(&self, stop: &dyn Fn() -> bool) -> bool {
+        if !self.wait_for_room(stop) {
+            return false;
+        }
+        self.record();
+        true
+    }
+}
+
 /// What all bot threads share: the pacing of connects and queue requests, and the counts.
 pub struct Shared {
     opt: Options,
@@ -83,12 +152,19 @@ pub struct Shared {
     pub refusals: AtomicU64,
     /// ladder addresses on which a match was slow, most recent last
     pub slow: Mutex<Vec<std::net::IpAddr>>,
+    /// the comms budget: new connections, queue requests and matches started
+    pub connect_budget: Budget,
+    pub queue_budget: Budget,
+    pub match_budget: Budget,
 }
 
 impl Shared {
-    pub fn new(opt: Options) -> Shared {
+    pub fn new(opt: Options, cfg: &Config) -> Shared {
         let now = Instant::now();
         Shared {
+            connect_budget: Budget::new("connection", cfg.comms_connects_per_minute, Duration::from_secs(60)),
+            queue_budget: Budget::new("queue request", cfg.comms_queues_per_minute, Duration::from_secs(60)),
+            match_budget: Budget::new("match", cfg.comms_matches_per_day, Duration::from_secs(86_400)),
             opt,
             next_connect: Mutex::new(now),
             next_queue: Mutex::new(now),
@@ -289,6 +365,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
     // the match in progress survives a reconnect and an engine restart
     let mut last_hello: Option<String> = None;
     let mut in_match = false;
+    let mut current_match: Option<String> = None;
 
     'outer: while !stop() {
         let (cfg, bot, dep) = match deployed(root, name) {
@@ -337,6 +414,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         if !backoff.is_zero() && !nap(backoff, stop) {
             break;
         }
+        if !shared.connect_budget.take(stop) {
+            break;
+        }
         Shared::pace(&shared.next_connect, shared.opt.connect_gap);
         shared.connects.fetch_add(1, Ordering::Relaxed);
         let prefer: Vec<std::net::IpAddr> = cfg.prefer_addresses.iter().filter_map(|a| a.parse().ok()).collect();
@@ -350,6 +430,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         };
         let connected = Instant::now();
         let version = engine.as_ref().map(|e| e.version.clone()).unwrap_or(dep.version.clone());
+        if !shared.match_budget.wait_for_room(stop) || !shared.queue_budget.take(stop) {
+            break;
+        }
         Shared::pace(&shared.next_queue, shared.opt.queue_gap);
         if send(&mut ws, shared, queue_frame(&version)).is_err() {
             continue;
@@ -378,6 +461,11 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         let kind = msg.get("type").and_then(Value::as_str).unwrap_or("");
                         match kind {
                             "hello" => {
+                                let id = msg.get("match_id").and_then(Value::as_str).unwrap_or("").to_string();
+                                if current_match.as_deref() != Some(id.as_str()) {
+                                    shared.match_budget.record();
+                                    current_match = Some(id);
+                                }
                                 in_match = true;
                                 refusals = 0;
                                 requeue_at = None;
@@ -580,6 +668,10 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                 } else if Instant::now() >= at {
                     requeue_at = None;
                     let version = engine.as_ref().map(|e| e.version.clone()).unwrap_or_default();
+                    if !shared.match_budget.wait_for_room(stop) || !shared.queue_budget.take(stop) {
+                        let _ = ws.close(None);
+                        break 'outer;
+                    }
                     Shared::pace(&shared.next_queue, shared.opt.queue_gap);
                     if let Err(why) = send(&mut ws, shared, queue_frame(&version)) {
                         why_closed = why;
@@ -663,7 +755,9 @@ fn nap(d: Duration, stop: &dyn Fn() -> bool) -> bool {
 /// Runs every bot that is set to go through the gateway, each on its own thread, and
 /// starts a thread for any bot that is switched over while it runs.
 pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
-    let shared = Arc::new(Shared::new(Options::default()));
+    let cfg = Config::load(root).unwrap_or_default();
+    let shared = Arc::new(Shared::new(Options::default(), &cfg));
+    let mut last_state = Instant::now() - Duration::from_secs(60);
     let mut running: Vec<(String, std::thread::JoinHandle<()>)> = Vec::new();
     let mut last_report = Instant::now();
     eprintln!("gateway started");
@@ -680,6 +774,24 @@ pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
                     running.push((b.name.clone(), h));
                 }
             }
+        }
+        if last_state.elapsed() >= Duration::from_secs(10) {
+            // What the budget looks like right now, for `fleet status`.
+            last_state = Instant::now();
+            let b = |x: &Budget| json!({ "used": x.used(), "limit": x.limit, "window_s": x.window.as_secs(), "times_waited": x.waits.load(Ordering::Relaxed) });
+            let state = json!({
+                "ts_ms": now_ms(),
+                "bots": running.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
+                "connections": b(&shared.connect_budget), "queue_requests": b(&shared.queue_budget), "matches": b(&shared.match_budget),
+                "since_start": {
+                    "connects": shared.connects.load(Ordering::Relaxed), "drops": shared.drops.load(Ordering::Relaxed),
+                    "frames_out": shared.frames_out.load(Ordering::Relaxed), "frames_in": shared.frames_in.load(Ordering::Relaxed),
+                    "idle_turns": shared.idle_turns.load(Ordering::Relaxed), "refused_queues": shared.refusals.load(Ordering::Relaxed),
+                },
+                "slow_addresses": shared.slow.lock().unwrap_or_else(|p| p.into_inner()).iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            });
+            let _ = std::fs::create_dir_all(data_dir(root).join("run"));
+            let _ = std::fs::write(data_dir(root).join("run").join("gateway.json"), state.to_string());
         }
         if last_report.elapsed() >= Duration::from_secs(300) {
             last_report = Instant::now();
@@ -700,4 +812,30 @@ pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
         let _ = h.join();
     }
     eprintln!("gateway stopped");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_holds_the_line() {
+        let b = Budget::new("test", 3, Duration::from_millis(300));
+        let never = || false;
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert!(b.take(&never));
+        }
+        assert!(t0.elapsed() < Duration::from_millis(100), "the first three are free");
+        assert_eq!(b.used(), 3);
+        // The fourth waits until the first has aged out of the window.
+        assert!(b.take(&never));
+        assert!(t0.elapsed() >= Duration::from_millis(290), "{:?}", t0.elapsed());
+        assert_eq!(b.waits.load(Ordering::Relaxed), 1);
+        // Asked to stop while waiting: gives up and books nothing.
+        let stop = || true;
+        assert!(b.take(&never));
+        assert!(b.take(&never));
+        assert!(!b.take(&stop));
+    }
 }

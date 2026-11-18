@@ -132,6 +132,7 @@ fn status(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
         let st = store.bot_state(&b.name).map_err(e)?;
         let loaded = launchd_loaded(&label(&b.name));
         let pid = bot_pid(root, &b.name);
+        let loaded = loaded || (b.gateway && launchd_loaded("com.victris.fleet-gateway"));
         let process = match (b.managed, pid, st.as_ref().and_then(|s| s.halted.clone())) {
             (false, _, _) => "(own)".to_string(),
             (true, _, Some(_)) => "HALTED".to_string(),
@@ -160,6 +161,21 @@ fn status(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
     let active: Vec<String> = store.experiments(true).map_err(e)?.into_iter().map(|x| x.name).collect();
     let (ok, queued): (i64, i64) = store.conn.query_row("SELECT COALESCE(SUM(status = 'ok'), 0), COALESCE(SUM(status = 'queued'), 0) FROM replays", [], |r| Ok((r.get(0)?, r.get(1)?))).map_err(e)?;
     let last_replay: Option<i64> = store.conn.query_row("SELECT MAX(fetched_ms) FROM replays WHERE status = 'ok'", [], |r| r.get(0)).map_err(e)?;
+    // The gateway's comms budget, when it is running.
+    if let Some(g) = std::fs::read_to_string(supervise::run_dir(root).join("gateway.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) {
+        if now_ms() - g["ts_ms"].as_i64().unwrap_or(0) < 60_000 {
+            let b = |k: &str| format!("{} of {}", g[k]["used"], g[k]["limit"]);
+            println!(
+                "\ngateway: {} bots; comms budget in use: connections {} a minute, queue requests {} a minute, matches {} a day; since start {} drops, {} idle turns sent for late engines",
+                g["bots"].as_array().map(|a| a.len()).unwrap_or(0),
+                b("connections"),
+                b("queue_requests"),
+                b("matches"),
+                g["since_start"]["drops"],
+                g["since_start"]["idle_turns"]
+            );
+        }
+    }
     println!("\nlive release: {live}");
     println!("experiments running: {}", if active.is_empty() { "none".to_string() } else { active.join(", ") });
     println!(
@@ -526,10 +542,34 @@ fn main_inner() -> Result<i32, String> {
             }
             supervise::install_self(&root)?;
             let (lbl, args, log, interval) = agent_spec(&root, what);
+            // A bot's supervisor takes as long to stop as its match takes to finish, and
+            // launchd will not load the new agent while the old one is still there. So the
+            // bot is asked to finish first, held down for the moment of the swap, and
+            // released once the new agent is in.
+            let mut held = false;
+            if !SERVICES.contains(&what) && launchd_loaded(&lbl) {
+                if let Some(pid) = bot_pid(&root, what) {
+                    let was_halted = store.bot_state(what).map_err(e)?.and_then(|s| s.halted).is_some();
+                    if !was_halted {
+                        store.set_halted(what, Some("being reinstalled")).map_err(e)?;
+                        held = true;
+                    }
+                    supervise::signal(pid, libc::SIGTERM);
+                    println!("waiting for {what} (pid {pid}) to finish its match");
+                    let until = std::time::Instant::now() + Duration::from_secs(900);
+                    while supervise::alive(pid) && std::time::Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            }
             if let Some(dir) = log.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            supervise::install_agent(&lbl, &supervise::plist(&lbl, &root, &args, &log, interval, what == "collector" || what == "autopilot"))?;
+            let installed = supervise::install_agent(&lbl, &supervise::plist(&lbl, &root, &args, &log, interval, what == "collector" || what == "autopilot"));
+            if held {
+                store.set_halted(what, None).map_err(e)?;
+            }
+            installed?;
             println!("{lbl} installed and loaded; log {}", log.display());
         }
         "uninstall" => {

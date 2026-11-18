@@ -28,9 +28,10 @@
       "role": "scout",
       "managed": true,
       "experiments": true,
-      "note": "Scout: runs the current release and takes arms from the experiment plan.",
+      "note": "Scout, and the first bot behind the gateway (trial since 2026-11-18): the gateway holds its connection, its engine runs as a child.",
       "expect_online": true,
-      "owner": "the fleet (infrastructure thread)"
+      "owner": "the fleet (infrastructure thread)",
+      "gateway": true
     },
     "spy-master": {
       "role": "scout",
@@ -48,5 +49,10 @@
   "prefer_addresses": [
     "104.21.89.84"
   ],
-  "queue_gap_ms": 1000
+  "queue_gap_ms": 1000,
+  "comms": {
+    "connects_per_minute": 20,
+    "queues_per_minute": 90,
+    "matches_per_day": 15000
+  }
 }
