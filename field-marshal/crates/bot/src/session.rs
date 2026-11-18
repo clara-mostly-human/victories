@@ -180,6 +180,8 @@ pub struct Session {
     pub early: Option<Box<dyn FnMut(String)>>,
     log: Option<std::fs::File>,
     log_day: String,
+    /// behind the gateway: the state of the ladder connection as the gateway last told us
+    gateway_connection: Option<String>,
 }
 
 fn utc_day() -> String {
@@ -249,7 +251,7 @@ fn diff_paths(a: &Value, b: &Value, path: &str, out: &mut Vec<String>) {
 
 impl Session {
     pub fn new(cfg: Config) -> Session {
-        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, refusals: 0, remote: None, slow_streak: 0, early: None, log: None, log_day: String::new() }
+        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, refusals: 0, remote: None, slow_streak: 0, early: None, log: None, log_day: String::new(), gateway_connection: None }
     }
 
     pub fn queue_frame(&self) -> String {
@@ -327,6 +329,41 @@ impl Session {
                 vec![]
             }
             Some("queued") => vec![],
+            // -- from the gateway, when this process plays through it ------------------------
+            Some("status") => {
+                // The truth about the connection it holds for us. Worth a line when the
+                // connection goes down or comes back, not once a second.
+                let now = msg.get("connection").and_then(Value::as_str).map(str::to_string);
+                if now != self.gateway_connection {
+                    self.note("gateway_connection", json!({ "connection": now, "remote": msg.get("remote"), "why": msg.get("why"), "match": msg.get("match"), "tick": msg.get("tick") }));
+                    self.gateway_connection = now;
+                }
+                vec![]
+            }
+            Some("ping") => {
+                // The heartbeat, with what this process believes: the gateway compares it
+                // with what is true and sets us right if we are out of step.
+                let view = json!({
+                    "type": "pong", "id": msg.get("id"),
+                    "match": self.cur.as_ref().map(|m| m.id.clone()),
+                    "tick": self.cur.as_ref().and_then(|m| m.last_turn.map(|(t, _)| t)),
+                });
+                vec![Out::Send(view.to_string())]
+            }
+            Some("sync") => {
+                // We were out of step. A match start and the latest observation follow if
+                // a match is on; if none is, the one we thought we were in is over.
+                self.note("gateway_sync", json!({ "why": msg.get("why"), "match": msg.get("match"), "tick": msg.get("tick") }));
+                if msg.get("match").map(Value::is_null).unwrap_or(true) {
+                    self.cur = None;
+                }
+                vec![]
+            }
+            Some("detach") => {
+                // The gateway lets this process go (a new release, a new label): finish.
+                self.note("gateway_detach", json!(msg.get("why")));
+                vec![Out::Done]
+            }
             other => {
                 self.note("unknown_message", json!(other));
                 vec![]

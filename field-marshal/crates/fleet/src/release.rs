@@ -131,7 +131,11 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
     // reconnecting when slow. 3: with --stdio --provisional it writes a quick fallback turn
     // before each decision.
     let main_rs = std::fs::read_to_string(ws.join("crates/bot/src/main.rs")).unwrap_or_default();
-    let client = if main_rs.contains("--provisional") {
+    let session_rs = std::fs::read_to_string(ws.join("crates/bot/src/session.rs")).unwrap_or_default();
+    let client = if session_rs.contains("\"pong\"") {
+        // speaks the gateway's status, heartbeat and resync messages
+        4
+    } else if main_rs.contains("--provisional") {
         3
     } else if main_rs.contains("--requeue-delay-ms") {
         2
