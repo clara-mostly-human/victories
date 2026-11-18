@@ -11,6 +11,8 @@ root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "log
 args = sys.argv[1:]
 bot = args[0] if args else "field-marshal"
 by_opponent = "--by-opponent" in args
+# Lines written before versions were logged belong to v1.
+version = args[args.index("--version") + 1] if "--version" in args else None
 
 matches, notes, think = [], collections.Counter(), []
 for path in sorted(glob.glob(os.path.join(root, bot, "*.jsonl"))):
@@ -20,6 +22,8 @@ for path in sorted(glob.glob(os.path.join(root, bot, "*.jsonl"))):
         except ValueError:
             continue
         t = r.get("t")
+        if version and r.get("version", "v1") != version:
+            continue
         if t == "match":
             matches.append(r)
         elif t == "tick":
@@ -41,7 +45,7 @@ rating = sum(m.get("rating_change") or 0 for m in matches)
 think.sort()
 p = lambda q: think[int((len(think) - 1) * q)] / 1000 if think else 0
 print(
-    f"{bot}: {len(matches)} games, {w}W {l}L {d}D, rating change {rating:+.0f}; "
+    f"{bot}{' ' + version if version else ''}: {len(matches)} games, {w}W {l}L {d}D, rating change {rating:+.0f}; "
     f"tracker mismatches {track['mismatch']} in {track['ticks']} ticks; refused frames {refused}, "
     f"rejected turn parts {rejected}, panics {panics}; think ms p50 {p(0.5):.2f} p99 {p(0.99):.2f} max {p(1):.2f}; "
     f"other log notes {dict(notes)}"

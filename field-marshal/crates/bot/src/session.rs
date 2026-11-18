@@ -207,6 +207,7 @@ impl Session {
         }
         line["ts"] = json!(now_ms());
         line["bot"] = json!(self.cfg.bot);
+        line["version"] = json!(self.cfg.version);
         if let Some(f) = self.log.as_mut() {
             let _ = writeln!(f, "{line}");
         }
