@@ -7,7 +7,6 @@
 //! repeated every 15 minutes while the bot stays down, and a recovery line follows when it
 //! is back.
 
-use crate::collect::HOST;
 use crate::config::Config;
 use crate::store::{default_db, Store};
 use serde_json::{json, Value};
@@ -38,25 +37,11 @@ pub fn utc_stamp() -> String {
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)
 }
 
-/// Is the bot online, according to the ladder? `Err` when the ladder could not be asked.
-pub fn is_online(bot: &str) -> Result<bool, String> {
-    if !bot.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return Err("a bot name the watchdog will not put in a URL".into());
-    }
-    let out = Command::new("curl")
-        .args(["-sS", "--max-time", "20", "-A", "fleet-watch/1.0", "-w", "\n%{http_code}", &format!("{HOST}/api/bots/{bot}")])
-        .output()
-        .map_err(|e| format!("curl: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    let cut = out.stdout.iter().rposition(|b| *b == b'\n').unwrap_or(0);
-    let code = String::from_utf8_lossy(&out.stdout[cut..]).trim().to_string();
-    if code != "200" {
-        return Err(format!("HTTP {code}"));
-    }
-    let v: Value = serde_json::from_slice(&out.stdout[..cut]).map_err(|e| e.to_string())?;
-    v.get("online").and_then(Value::as_bool).ok_or_else(|| "the answer has no `online` field".to_string())
+/// Is the bot on the ladder? Judged on this machine, from its own log: a bot that has
+/// written a turn, a match or a connection event lately is on. Nothing here asks the
+/// ladder: the gateway is the only thing on this machine that talks to it.
+pub fn is_online(root: &Path, bot: &str) -> Result<bool, String> {
+    Ok(wrote_recently(root, bot, Duration::from_secs(150)))
 }
 
 /// Has the bot written to its log within `within`?
@@ -69,29 +54,30 @@ pub fn wrote_recently(root: &Path, bot: &str, within: Duration) -> bool {
         .unwrap_or(false)
 }
 
-/// One request for the ladder's standings, into the store's `ladder` table. This is the
-/// only thing the fleet asks the ladder over HTTP, and it does so rarely (see
-/// `ladder_refresh_minutes`): it is what gives opponents their rating and rank on the
-/// status page, and our own bots their exact rating.
-pub fn refresh_ladder(store: &Store, ours: &[String]) -> Result<usize, String> {
-    let out = Command::new("curl")
-        .args(["-sS", "--max-time", "30", "-A", "fleet-watch/1.0", "-w", "\n%{http_code}", &format!("{HOST}/api/leaderboard?limit=500")])
-        .output()
-        .map_err(|e| format!("curl: {e}"))?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
-    }
-    let cut = out.stdout.iter().rposition(|b| *b == b'\n').unwrap_or(0);
-    let code = String::from_utf8_lossy(&out.stdout[cut..]).trim().to_string();
-    if code != "200" {
-        return Err(format!("HTTP {code}"));
-    }
-    let v: Value = serde_json::from_slice(&out.stdout[..cut]).map_err(|e| e.to_string())?;
-    let list = match &v {
-        Value::Array(a) => a.clone(),
-        Value::Object(o) => o.get("bots").and_then(Value::as_array).cloned().unwrap_or_default(),
-        _ => Vec::new(),
+/// The ladder's standings, into the store's `ladder` table: what gives opponents their
+/// rating and rank on the status page, and our own bots their exact rating. They are
+/// fetched on GitHub (workflow `standings.yml`, every five minutes) and read here from the
+/// repository's `standings` branch; this machine asks the ladder nothing.
+pub fn refresh_ladder(root: &Path, store: &Store, ours: &[String]) -> Result<usize, String> {
+    let dir = crate::store::data_dir(root).join("standings-remote");
+    let git = |args: &[&str], cwd: &Path| -> Result<String, String> {
+        let out = Command::new("git").current_dir(cwd).args(args).output().map_err(|e| format!("git: {e}"))?;
+        if !out.status.success() {
+            return Err(String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or("git failed").to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     };
+    if dir.join(".git").exists() {
+        git(&["fetch", "--quiet", "--depth", "1", "origin", "standings"], &dir)?;
+        git(&["reset", "--quiet", "--hard", "FETCH_HEAD"], &dir)?;
+    } else {
+        let url = git(&["remote", "get-url", "origin"], root)?;
+        let _ = std::fs::create_dir_all(crate::store::data_dir(root));
+        git(&["clone", "--quiet", "--single-branch", "--branch", "standings", "--depth", "1", &url, &dir.display().to_string()], root)?;
+    }
+    let text = std::fs::read_to_string(dir.join("standings.json")).map_err(|e| format!("standings.json: {e}"))?;
+    let v: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let list = v.get("leaderboard").and_then(Value::as_array).cloned().unwrap_or_default();
     let rows: Vec<(String, i64, f64, Option<String>, Option<i64>)> = list
         .iter()
         .enumerate()
@@ -109,9 +95,12 @@ pub fn refresh_ladder(store: &Store, ours: &[String]) -> Result<usize, String> {
         })
         .collect();
     if rows.is_empty() {
-        return Err("the standings came back empty".into());
+        return Err("the standings file holds no rows".into());
     }
+    // The same file twice changes nothing; say how old it is.
+    let fetched = v.get("fetched").and_then(Value::as_str).unwrap_or("?").to_string();
     store.set_ladder(&rows, ours).map_err(|e| e.to_string())?;
+    eprintln!("{} standings fetched on GitHub at {fetched}: {} rows", utc_stamp(), rows.len());
     Ok(rows.len())
 }
 
@@ -492,7 +481,7 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
             // ladder: it logs every turn and every match start. Only a silent bot is worth
             // a question to the ladder, which keeps requests from this address near zero
             // (they appear to count against the same limit as the bots' own connections).
-            let answer = if wrote_recently(root, &b.name, Duration::from_secs(150)) { Ok(true) } else { is_online(&b.name) };
+            let answer = is_online(root, &b.name);
             match answer {
                 Ok(true) => {
                     if w.alerted_at.is_some() {
@@ -510,7 +499,7 @@ pub fn run(root: &Path, stop: &dyn Fn() -> bool) {
                     if due {
                         w.alerted_at = Some(Instant::now());
                         let who = b.owner.as_deref().map(|o| format!(" Owner: {o}.")).unwrap_or_default();
-                        alert(root, "ALERT", Some(&b.name), &format!("{} is OFFLINE on the ladder, for {} min now.{who}", b.name, since.elapsed().as_secs() / 60));
+                        alert(root, "ALERT", Some(&b.name), &format!("{} has written nothing to its log for {} min: it is not playing.{who}", b.name, 2 + since.elapsed().as_secs() / 60));
                     }
                 }
                 Err(e) => {

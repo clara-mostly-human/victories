@@ -26,6 +26,8 @@ pub struct BotLine {
     pub think_p99_ms: Option<f64>,
     /// seconds since the bot last answered a turn (from its log)
     pub last_turn_s: Option<f64>,
+    /// the gateway's verdict on this bot and its level, when the bot is behind the gateway
+    pub gateway: Option<(String, String)>,
 }
 
 /// One finished game, as the bot and the ladder snapshot know it.
@@ -85,6 +87,35 @@ pub struct Snapshot {
     pub alerts: Vec<String>,
     pub load: f64,
     pub paused: Option<String>,
+    /// the gateway's health verdict, when the gateway is running
+    pub health: Option<GatewayHealth>,
+}
+
+/// The gateway's verdict, as it last wrote it (`data/run/gateway.json`).
+#[derive(Clone, Debug, Default)]
+pub struct GatewayHealth {
+    /// "ok" or "degraded"
+    pub word: String,
+    pub problems: Vec<String>,
+    /// how old the gateway's report is
+    pub age_s: i64,
+    /// each bot behind the gateway: its verdict and level ("ok", "warn", "bad")
+    pub bots: std::collections::HashMap<String, (String, String)>,
+}
+
+pub fn gateway_health(root: &Path) -> Option<GatewayHealth> {
+    let text = std::fs::read_to_string(crate::store::data_dir(root).join("run").join("gateway.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let mut h = GatewayHealth {
+        word: v.get("verdict")?.as_str()?.to_string(),
+        problems: v.get("problems").and_then(|p| p.as_array()).map(|p| p.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+        age_s: (now_ms() - v.get("ts_ms").and_then(|t| t.as_i64()).unwrap_or(0)) / 1000,
+        bots: Default::default(),
+    };
+    for (name, b) in v.get("health").and_then(|x| x.as_object())? {
+        h.bots.insert(name.clone(), (b.get("verdict").and_then(|x| x.as_str()).unwrap_or("?").to_string(), b.get("level").and_then(|x| x.as_str()).unwrap_or("bad").to_string()));
+    }
+    Some(h)
 }
 
 fn one<T: rusqlite::types::FromSql>(store: &Store, sql: &str, p: impl rusqlite::Params) -> Option<T> {
@@ -152,6 +183,7 @@ pub fn snapshot_for(root: &Path, store: &Store, cfg: &Config, only_bot: Option<&
 }
 
 fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>, only_bot: Option<String>, ladder_age_ms: Option<i64>, arm_tiers: Vec<(String, Record)>) -> Snapshot {
+    let health = gateway_health(root);
     let now = now_ms();
     let day = now - 86_400_000;
     let mut bots = Vec::new();
@@ -219,6 +251,7 @@ fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>
                     .ok()
             }),
             last_turn_s: last_turn_age_s(root, &b.name),
+            gateway: health.as_ref().filter(|h| h.age_s <= 15).and_then(|h| h.bots.get(&b.name).cloned()),
         });
     }
     let mut arms = Vec::new();
@@ -279,6 +312,7 @@ fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>
         alerts: lines.iter().rev().take(12).map(|l| l.to_string()).collect(),
         load: load_average(),
         paused: std::fs::read_to_string(pause_file(root)).ok().map(|s| s.trim().to_string()),
+        health,
     }
 }
 
@@ -292,6 +326,14 @@ fn utc_time(ms: i64) -> String {
 /// the last 90 seconds; a bot that is up but has been given no match for longer says so,
 /// with how long.
 fn state(b: &BotLine) -> (String, &'static str) {
+    // A bot behind the gateway: the gateway's verdict is the verdict.
+    if let Some((verdict, level)) = &b.gateway {
+        return (verdict.clone(), match level.as_str() {
+            "ok" => "good",
+            "warn" => "warn",
+            _ => "bad",
+        });
+    }
     let stale = b.last_game_ms.map(|t| now_ms() - t > 900_000).unwrap_or(true);
     match (b.halted.is_some(), b.running, stale) {
         (true, _, _) => ("halted".into(), "bad"),
@@ -353,7 +395,33 @@ fn esc(t: &str) -> String {
     t.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
+/// The one verdict for the whole fleet: is every bot playing or waiting for a match, and
+/// if not, which and why. From the gateway for the bots behind it, from the bots' own
+/// logs for the rest.
+pub fn fleet_health(s: &Snapshot) -> (bool, Vec<String>) {
+    let mut problems: Vec<String> = Vec::new();
+    match &s.health {
+        Some(h) if h.age_s > 15 => problems.push(format!("the gateway has not reported for {} s: it is down or stuck", h.age_s)),
+        Some(h) => problems.extend(h.problems.iter().cloned()),
+        None => {}
+    }
+    for b in s.bots.iter().filter(|b| b.gateway.is_none()) {
+        let (word, level) = state(b);
+        if level != "good" && !problems.iter().any(|p| p.starts_with(&format!("{}:", b.name))) {
+            problems.push(format!("{}: {word}", b.name));
+        }
+    }
+    (problems.is_empty(), problems)
+}
+
 pub fn html(s: &Snapshot) -> String {
+    let (healthy, problems) = fleet_health(s);
+    let behind = s.bots.iter().filter(|b| b.gateway.is_some()).count();
+    let banner = if healthy {
+        format!("<div class=\"banner good\"><b>Healthy.</b> Every bot is playing or waiting for a match. {behind} of {} are behind the gateway.</div>", s.bots.len())
+    } else {
+        format!("<div class=\"banner bad\"><b>Not healthy.</b> {}</div>", problems.iter().map(|p| esc(p)).collect::<Vec<_>>().join("<br>"))
+    };
     let mut bots = String::new();
     for b in &s.bots {
         let (word, class) = state(b);
@@ -526,6 +594,9 @@ th.n {{ text-align: right; }}
 .pill.good {{ background: var(--good-bg); color: var(--good); }}
 .pill.warn {{ background: var(--warn-bg); color: var(--warn); }}
 .pill.bad {{ background: var(--bad-bg); color: var(--bad); }}
+.banner {{ margin: 0 0 16px; padding: 12px 16px; border-radius: 10px; font-size: 14px; line-height: 1.5; }}
+.banner.good {{ background: var(--good-bg); color: var(--good); }}
+.banner.bad {{ background: var(--bad-bg); color: var(--bad); }}
 .bar {{ height: 4px; background: var(--line); border-radius: 2px; margin-top: 5px; min-width: 90px; }}
 .bar i {{ display: block; height: 4px; background: var(--accent); border-radius: 2px; }}
 ul {{ list-style: none; margin: 0; padding: 12px 16px; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }}
@@ -538,6 +609,7 @@ h2 a.all {{ font-weight: 400; text-transform: none; letter-spacing: 0; margin-le
 <body>
 <main>
 <header><h1>Victris Fleet Status</h1><span class="stamp">as of {at} UTC</span></header>
+{banner}
 <div class="tiles">
   <div class="tile"><b>{up} of {total}</b><span>bots up</span></div>
   <div class="tile"><b>{games}</b><span>games in 24 hours</span></div>
@@ -550,7 +622,7 @@ h2 a.all {{ font-weight: 400; text-transform: none; letter-spacing: 0; margin-le
 <div class="wrap"><table>
 <tr><th>Bot</th><th>State</th><th>Release</th><th class="n">Version</th><th class="n">Rating</th><th class="n">Games, 24 h</th><th class="n">W&ndash;L&ndash;D</th><th class="n">Score</th><th class="n">Think p99</th></tr>
 {bots}</table></div>
-<p class="note">Score counts a draw as half a win; the range under it is the 95% interval. Think p99 is over the last 90 seconds of play.</p>
+<p class="note">Score counts a draw as half a win; the range under it is the 95% interval. Think p99 is over the last 90 seconds of play, or the last finished game when the bot is between matches. State is the gateway's verdict for a bot behind the gateway: it says "playing" only while turns are being answered.</p>
 
 <h2>{games_title}</h2>
 <div class="wrap"><table>
@@ -592,6 +664,7 @@ for (const t of document.querySelectorAll('time[data-ms]')) {{
         standings = standings,
         tiers = if tiers.is_empty() { "<tr><td colspan=\"4\" class=\"sub\">No experiment is running.</td></tr>".to_string() } else { tiers },
         at = esc(&s.at.replace('T', " ").replace('Z', "")),
+        banner = banner,
         total = s.bots.len(),
         alerts_day = s.alerts_day,
         corpus = s.corpus_ok,
@@ -718,6 +791,7 @@ pub fn state_json(s: &Snapshot) -> serde_json::Value {
             "as_of": s.at, "bots_up": up, "bots": s.bots.len(), "games_24h": games, "alerts_24h": s.alerts_day,
             "replays": s.corpus_ok, "replays_24h": s.corpus_day, "replays_2400": s.corpus_strong, "replays_waiting": s.corpus_queued,
             "load": format!("{:.1}", s.load), "batch": if s.paused.is_some() { "paused" } else { "may run" }, "live_release": s.live,
+            "health": if fleet_health(s).0 { "healthy" } else { "NOT HEALTHY" }, "problems": fleet_health(s).1.join("; "),
         }],
         "bots": s.bots.iter().map(|b| serde_json::json!({
             "bot": b.name, "role": b.role, "state": state(b).0, "release": b.release, "version": b.version,

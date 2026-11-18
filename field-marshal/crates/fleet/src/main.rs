@@ -744,6 +744,99 @@ fn agent_spec(root: &Path, what: &str) -> (String, Vec<String>, std::path::PathB
     }
 }
 
+/// `fleet attach <bot> [--release r] -- <command...>`: attaches a bot process the fleet does
+/// not start itself (the flagship, run by its own thread) to the gateway, then becomes that
+/// command with the gateway socket as its input and output. The command must be a bot in
+/// `--stdio` mode. The version label is the gateway's to decide: if the store has one for
+/// this bot, it replaces the command's `--version`.
+fn attach(root: &Path, raw: &[String]) -> Result<i32, String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let split = raw.iter().position(|x| x == "--").ok_or("usage: fleet attach <bot> [--release r] -- <command> [args...]")?;
+    let a = Args::parse(&raw[..split]);
+    let bot = a.word(1, "the bot's name")?.to_string();
+    let mut cmd: Vec<String> = raw[split + 1..].to_vec();
+    if cmd.is_empty() {
+        return Err("usage: fleet attach <bot> [--release r] -- <command> [args...]".into());
+    }
+    let stored = Store::open(&default_db(root), Duration::from_secs(5)).ok().and_then(|s| s.bot_state(&bot).ok().flatten());
+    let flag = |cmd: &[String], name: &str| cmd.iter().position(|x| x == name).and_then(|k| cmd.get(k + 1).cloned());
+    let version = match stored.as_ref().and_then(|s| s.version.clone()) {
+        Some(v) => {
+            if let Some(k) = cmd.iter().position(|x| x == "--version") {
+                if k + 1 < cmd.len() {
+                    cmd[k + 1] = v.clone();
+                }
+            }
+            v
+        }
+        None => flag(&cmd, "--version").unwrap_or_else(|| "?".into()),
+    };
+    let release = a.get("--release").map(str::to_string).or_else(|| flag(&cmd, "--release")).or_else(|| stored.and_then(|s| s.release)).unwrap_or_else(|| "unmanaged".into());
+    let proto: i64 = a.num("--proto")?.unwrap_or(1);
+    // The gateway may be restarting: keep knocking.
+    let mut said = false;
+    let sock = loop {
+        match supervise::attach_to_gateway(root, &bot, &release, &version, proto) {
+            Ok(s) => break s,
+            Err(why) => {
+                if !said {
+                    eprintln!("fleet attach: the gateway is not taking bot processes yet ({why}); waiting");
+                    said = true;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+        }
+    };
+    let fd = sock.as_raw_fd();
+    unsafe {
+        if libc::dup2(fd, 0) < 0 || libc::dup2(fd, 1) < 0 {
+            return Err("cannot hand the gateway socket to the command".into());
+        }
+    }
+    let err = std::process::Command::new(&cmd[0]).args(&cmd[1..]).exec();
+    Err(format!("cannot run {}: {err}", cmd[0]))
+}
+
+/// The gateway's one verdict on the fleet, and each bot's line.
+fn health(root: &Path, as_json: bool) -> Result<i32, String> {
+    let path = data_dir(root).join("run").join("gateway.json");
+    let text = std::fs::read_to_string(&path).map_err(|_| "the gateway has written no state: is it running? (`fleet install gateway`)".to_string())?;
+    let v: Value = serde_json::from_str(&text).map_err(e)?;
+    let age_s = (now_ms() - v.get("ts_ms").and_then(Value::as_i64).unwrap_or(0)) / 1000;
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return Ok(0);
+    }
+    if age_s > 15 {
+        println!("DOWN: the gateway last wrote its state {age_s} s ago; it is not running or it is stuck");
+        return Ok(2);
+    }
+    let word = v.get("verdict").and_then(Value::as_str).unwrap_or("?");
+    println!("{}", if word == "ok" { "OK: every bot is playing or waiting for a match".to_string() } else { format!("DEGRADED: {}", v.get("problems").and_then(Value::as_array).map(|p| p.iter().filter_map(Value::as_str).collect::<Vec<_>>().join("; ")).unwrap_or_default()) });
+    if let Some(h) = v.get("health").and_then(Value::as_object) {
+        for (name, b) in h {
+            let s = |path: &[&str]| path.iter().fold(Some(b), |x, k| x.and_then(|x| x.get(*k))).filter(|x| !x.is_null()).map(|x| x.as_str().map(str::to_string).unwrap_or_else(|| x.to_string())).unwrap_or_else(|| "-".into());
+            println!(
+                "{:<15} {:<44} socket {} (ping {} ms, wire {} ms)  label {}  process {} {}  answers p50 {} ms p99 {} ms, late {}  last turn {} s ago",
+                name,
+                s(&["verdict"]),
+                s(&["socket", "remote"]),
+                s(&["socket", "ping_ms"]),
+                s(&["socket", "wire_ms"]),
+                s(&["label"]),
+                s(&["process", "release"]),
+                if b.get("process").and_then(|p| p.get("attached")).and_then(Value::as_bool) == Some(true) { "attached" } else { "NOT ATTACHED" },
+                s(&["process", "answer_ms_p50"]),
+                s(&["process", "answer_ms_p99"]),
+                s(&["process", "late"]),
+                s(&["flow", "last_turn_s"]),
+            );
+        }
+    }
+    Ok(if word == "ok" { 0 } else { 1 })
+}
+
 fn main_inner() -> Result<i32, String> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let a = Args::parse(&raw);
@@ -758,6 +851,33 @@ fn main_inner() -> Result<i32, String> {
     }
     if cmd == "run" {
         return Ok(supervise::run(&root, a.word(1, "the bot's name")?));
+    }
+    if cmd == "attach" {
+        return attach(&root, &raw);
+    }
+    if cmd == "mock-ladder" {
+        let d = fleet::mock::LadderOptions::default();
+        let opt = fleet::mock::LadderOptions {
+            port: a.num("--port")?.unwrap_or(d.port),
+            ticks: a.num("--ticks")?.unwrap_or(d.ticks),
+            tick_ms: a.num("--tick-ms")?.unwrap_or(d.tick_ms),
+            match_gap_ms: a.num("--match-gap-ms")?.unwrap_or(d.match_gap_ms),
+            slow_first: a.num("--slow-first")?.unwrap_or(d.slow_first),
+            slow_ms: a.num("--slow-ms")?.unwrap_or(d.slow_ms),
+            quota_first: a.num("--quota-first")?.unwrap_or(d.quota_first),
+            quota_hold_ms: a.num("--quota-hold-ms")?.unwrap_or(d.quota_hold_ms),
+            drop_at_tick: a.num("--drop-at-tick")?,
+            version_limit_first: a.get("--version-limit-first") == Some("yes"),
+        };
+        fleet::mock::run_ladder(opt)?;
+        return Ok(0);
+    }
+    if cmd == "mock-engine" {
+        fleet::mock::run_engine(a.num("--think-ms")?.unwrap_or(5), a.num("--die-at")?, a.get("--provisional") == Some("yes"));
+        return Ok(0);
+    }
+    if cmd == "health" {
+        return health(&root, a.has("--json"));
     }
     let mut store = Store::open(&default_db(&root), Duration::from_secs(10)).map_err(|x| format!("cannot open the store: {x}"))?;
     let cfg = Config::load(&root)?;
@@ -925,6 +1045,11 @@ fn main_inner() -> Result<i32, String> {
                 println!("{copied} replays brought in from the corpus branch; {verified} verified and indexed, {bad} failed verification");
             }
             mode @ ("run" | "once") => {
+                // Nothing on this machine but the gateway talks to the ladder. Replays are
+                // fetched on GitHub (workflow corpus.yml) and brought in with `collect import`.
+                if std::env::var("FLEET_FETCH_FROM_HERE").as_deref() != Ok("yes") {
+                    return Err("replays are not fetched from this machine any more: the GitHub workflow fetches them and `fleet collect import` brings them in".into());
+                }
                 unsafe {
                     libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
                     libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
@@ -965,7 +1090,7 @@ fn main_inner() -> Result<i32, String> {
             if cfg.ladder_refresh_minutes > 0 {
                 let last: i64 = store.conn.query_row("SELECT COALESCE(MAX(updated_ms), 0) FROM ladder", [], |r| r.get(0)).unwrap_or(0);
                 if now_ms() - last >= cfg.ladder_refresh_minutes as i64 * 60_000 {
-                    match fleet::online::refresh_ladder(&store, &cfg.names()) {
+                    match fleet::online::refresh_ladder(&root, &store, &cfg.names()) {
                         Ok(n) => println!("standings of {n} bots stored"),
                         Err(x) => eprintln!("standings not refreshed: {x}"),
                     }
@@ -1003,7 +1128,7 @@ fn main_inner() -> Result<i32, String> {
                     }
                 }
                 for b in &cfg.bots {
-                    let state = match fleet::online::is_online(&b.name) {
+                    let state = match fleet::online::is_online(&root, &b.name) {
                         Ok(true) => "online".to_string(),
                         Ok(false) => "OFFLINE".to_string(),
                         Err(x) => format!("unknown ({x})"),
@@ -1071,7 +1196,7 @@ fn main_inner() -> Result<i32, String> {
             other => return Err(format!("unknown epoch command {other}")),
         },
         "ladder" => {
-            let n = fleet::online::refresh_ladder(&store, &cfg.names())?;
+            let n = fleet::online::refresh_ladder(&root, &store, &cfg.names())?;
             println!("standings of {n} bots stored");
         }
         "alerts" => {

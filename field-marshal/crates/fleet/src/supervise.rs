@@ -117,6 +117,17 @@ pub fn bot_command(root: &Path, cfg: &Config, bot: &BotConfig, release: &str, re
     c
 }
 
+/// Connects to the gateway's local socket and says which bot process this is. The stream
+/// that comes back is the bot process's line to the ladder from then on.
+pub fn attach_to_gateway(root: &Path, bot: &str, release: &str, version: &str, proto: i64) -> Result<std::os::unix::net::UnixStream, String> {
+    use std::io::Write;
+    let path = crate::gateway::sock_path(root);
+    let sock = std::os::unix::net::UnixStream::connect(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let hello = json!({ "type": "attach", "bot": bot, "release": release, "version": version, "proto": proto, "pid": std::process::id() });
+    (&sock).write_all(format!("{hello}\n").as_bytes()).map_err(|e| e.to_string())?;
+    Ok(sock)
+}
+
 fn wait_child(child: &mut Child, bot: &str) -> Option<i32> {
     let mut told = false;
     let mut told_at = Instant::now();
@@ -199,13 +210,11 @@ pub fn run(root: &Path, name: &str) -> i32 {
         let deployed = state.as_ref().and_then(|s| Some((s.release.clone()?, s.version.clone()?)));
         let problem = if !bot.managed {
             Some("managed is false in fleet/bots.json".to_string())
-        } else if bot.gateway {
-            Some("run by the gateway (gateway is true in fleet/bots.json)".to_string())
         } else if let Some(h) = halted {
             Some(format!("halted ({h}); `fleet resume {name}` starts it again"))
         } else if deployed.is_none() {
             Some(format!("no release deployed; `fleet deploy {name} <release>`"))
-        } else if !root.join("bots").join(name).is_file() {
+        } else if !bot.gateway && !root.join("bots").join(name).is_file() {
             Some(format!("no token file bots/{name}: the bot must be registered first"))
         } else {
             None
@@ -225,6 +234,39 @@ pub fn run(root: &Path, name: &str) -> i32 {
         }
 
         let mut cmd = bot_command(root, &cfg, &bot, &release, &release_dir, &version);
+        if bot.gateway {
+            // The gateway holds this bot's connection to the ladder. The bot process attaches
+            // to it over the local socket and plays through that: its input and output ARE
+            // the socket, so nothing sits between it and the gateway.
+            match attach_to_gateway(root, name, &release, &version, if client_level(&release_dir) >= 4 { 2 } else { 1 }) {
+                Ok(sock) => {
+                    cmd.arg("--stdio");
+                    if client_level(&release_dir) >= 3 {
+                        cmd.arg("--provisional");
+                    }
+                    match (sock.try_clone(), sock.try_clone()) {
+                        (Ok(i), Ok(o)) => {
+                            cmd.stdin(std::process::Stdio::from(std::os::fd::OwnedFd::from(i)));
+                            cmd.stdout(std::process::Stdio::from(std::os::fd::OwnedFd::from(o)));
+                        }
+                        _ => {
+                            wait("cannot hand the gateway socket to the bot process".into(), &mut reported_wait);
+                            drop(store);
+                            nap(Duration::from_secs(2));
+                            continue;
+                        }
+                    }
+                    // `sock` closes at the end of this block; the child holds its own copies,
+                    // so the gateway sees the socket close exactly when the bot process exits.
+                }
+                Err(why) => {
+                    wait(format!("the gateway is not taking bot processes ({why}); trying again"), &mut reported_wait);
+                    drop(store);
+                    nap(Duration::from_secs(2));
+                    continue;
+                }
+            }
+        }
         let started = Instant::now();
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -233,6 +275,9 @@ pub fn run(root: &Path, name: &str) -> i32 {
                 continue;
             }
         };
+        // The command holds copies of whatever was handed to the child (the gateway socket);
+        // let go of them, so the socket closes when the child does.
+        drop(cmd);
         let pid = child.id() as i32;
         let _ = std::fs::write(pid_file(root, name), pid.to_string());
         // Keep the Mac from idling into sleep for as long as the bot lives.

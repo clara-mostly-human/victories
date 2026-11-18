@@ -22,6 +22,7 @@ pub mod collect;
 pub mod config;
 pub mod gateway;
 pub mod ingest;
+pub mod mock;
 pub mod net;
 pub mod online;
 pub mod plan;
