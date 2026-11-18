@@ -105,6 +105,8 @@ pub struct Tracker {
     pub last_mismatch: Option<String>,
     /// damage dealt so far by each fighter, counted from events
     dealt: [i32; 2],
+    /// dashes we have seen the opponent make in this match
+    pub enemy_dashes: u32,
     /// our own estimate of match budget spent, in ms: think time plus a network allowance
     /// per tick. The server charges both; this keeps long thinks from exhausting the match.
     spent_ms: std::cell::Cell<u64>,
@@ -205,6 +207,7 @@ impl Tracker {
             stats: TrackStats::default(),
             last_mismatch: None,
             dealt: [0, 0],
+            enemy_dashes: 0,
             spent_ms: std::cell::Cell::new(0),
         })
     }
@@ -224,6 +227,7 @@ impl Tracker {
             stats: TrackStats::default(),
             last_mismatch: None,
             dealt: [0, 0],
+            enemy_dashes: 0,
             spent_ms: std::cell::Cell::new(0),
         }
     }
@@ -265,6 +269,11 @@ impl Tracker {
     pub fn observe(&mut self, view: &View, events: &[Value], my_prev: Option<RawTurn>) -> Sync {
         let sync = self.observe_inner(view, events, my_prev);
         self.stats.count(&sync);
+        let their_id = self.enemy_id();
+        self.enemy_dashes += events
+            .iter()
+            .filter(|e| e.get("kind").and_then(Value::as_str) == Some("dash") && e.get("fighter").and_then(Value::as_i64) == Some(their_id))
+            .count() as u32;
         // Every hit involves us as attacker or target, so we are told about all of them:
         // the damage each fighter has dealt is known exactly, whatever was out of view.
         if sync == Sync::Start {

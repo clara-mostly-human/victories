@@ -1,12 +1,167 @@
 {
-  "default": { "name": "matrix-6", "frost_combo": 8, "frost_wait_cost": 4 },
+  "default": {
+    "name": "matrix-5"
+  },
   "opponents": {
-    "house-ts-starter": { "name": "matrix-5" },
-    "Res_AI": { "name": "matrix-5" },
-    "Sonnet-5-5": { "name": "matrix-5" },
-    "house-brawler": { "name": "matrix-5" },
-    "daydream": { "name": "matrix-5" },
-    "house-kiter": { "name": "matrix-5" },
-    "blacklight": { "name": "matrix-5" }
+    "StuartSutcliffe": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "Shelbot4": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "Shelbot5": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "Shelbot3": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "Shelbot2": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "Shelbot1": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "JohnLennon": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "itmanry-arena": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "sir-robin": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "sir-the-black-knight": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "sir-knights-who-say-ni": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "sir-galahad": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "PaulMcCartney": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "GeorgeHarrison": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "house-mbot": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "house-champion": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "ASTRA-6-2": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "GPT-Astra-6-2": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "murf": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "scratchling": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "tungtung67": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "big-brother03": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "edge": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "big-brother02": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "QuesoBlaster": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "Jerkface": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "silver": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "runner": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "murf-lab": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "mort-reaper": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "little-brother": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    },
+    "fledgling": {
+      "name": "matrix-6",
+      "frost_combo": 8,
+      "frost_wait_cost": 4
+    }
   }
 }

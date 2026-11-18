@@ -136,6 +136,11 @@ pub struct Playbook {
     /// taken from a frostburst's merit when the target can dash before it goes off: the
     /// price of having it on cooldown when the opening comes.
     pub frost_wait_cost: f64,
+    /// with a value above 0, the burst is held (`frost_wait_cost`) only against an
+    /// opponent that dashes: one seen dashing in this match, or any opponent before this
+    /// tick. Bots that never dash give no opening, and against them the burst is best
+    /// thrown at once (scout games: holding wins 89% against 98% under a rating of 2000).
+    pub frost_hold_grace: i32,
     /// the price of our dash while we stand in the opponent's frostburst (negative = the
     /// usual `dash_cost`). Replays: the top bots dash out of a burst 70% of the time when
     /// they can and come out 5 hp ahead; we dash out 26% of the time, walk out slowed and
@@ -221,6 +226,7 @@ impl Default for Playbook {
             dodge_prob_far: -1.0,
             frost_combo: 0.0,
             frost_wait_cost: 0.0,
+            frost_hold_grace: 0,
             dash_cost_frosted: -1.0,
             dash_dodge: 0.0,
             dash_dodge_slowed: 0.0,
@@ -328,6 +334,9 @@ impl Playbook {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
+        }
+        if let Some(x) = v.get("frost_hold_grace").and_then(Value::as_i64) {
+            p.frost_hold_grace = x as i32;
         }
         if let Some(x) = v.get("rollout_ticks").and_then(Value::as_i64) {
             p.rollout_ticks = x as i32;
@@ -1358,8 +1367,9 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                     // The bonus is for a burst thrown from where we stand or step. Paid on a
                     // dash as well, it had us dash after every opponent that dashed away
                     // (20 dashes a game in self-play against 7).
+                    let dasher = pb.frost_hold_grace <= 0 || t.enemy_dashes > 0 || view.tick < pb.frost_hold_grace;
                     let timing = if en.cd_dash <= fuse {
-                        -pb.frost_wait_cost
+                        if dasher { -pb.frost_wait_cost } else { 0.0 }
                     } else if *kind == 2 {
                         0.0
                     } else {
