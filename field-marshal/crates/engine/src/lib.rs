@@ -13,6 +13,7 @@ pub mod events;
 pub mod geom;
 pub mod hash;
 pub mod map;
+pub mod mcts;
 pub mod models;
 pub mod movefeat;
 pub mod observe;

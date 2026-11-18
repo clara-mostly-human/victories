@@ -136,3 +136,85 @@ pub fn clone_turn(e: &Engine, s: &State, x: usize, rng: &mut u64) -> RawTurn {
     }
     turn
 }
+
+/// The clone with three tactical habits every strong bot has, for use as the default
+/// policy of both sides in long playouts: it steps (or dashes) out of a hit that is about
+/// to land, takes the shot at a target that cannot get out of the way, and steps onto a
+/// power pad that is there within two tiles. Everything else is sampled as in `clone_turn`.
+pub fn tactical_turn(e: &Engine, s: &State, x: usize, rng: &mut u64) -> RawTurn {
+    let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
+    if f.state != FState::Idle || !o.alive {
+        return RawTurn::IDLE;
+    }
+    let mut turn = clone_turn(e, s, x, rng);
+    let pair = |mine: RawTurn| if x == 0 { [mine, RawTurn::IDLE] } else { [RawTurn::IDLE, mine] };
+    let seen = can_see(&e.rules, &e.map, f.pos, o.pos);
+    // The shot that cannot be avoided.
+    if seen {
+        let shot = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Projectile { .. })).filter(|i| f.cd_attack[*i] == 0);
+        if let Some(a) = shot {
+            let (dx, dy) = ((f.pos[0] - o.pos[0]) as f64, (f.pos[1] - o.pos[1]) as f64);
+            let flight = ((dx * dx + dy * dy).sqrt() / 2.0).ceil() as i32;
+            let stuck = o.state != FState::Idle || (o.cd_move >= flight && o.cd_dash >= flight);
+            if stuck {
+                turn.attack = RawTurn::IDLE.with_attack(a as u8, o.pos).attack;
+            }
+        }
+    }
+    // Out of the way of what is about to hit.
+    let mut probe = *s;
+    let coming = e.step(&mut probe, &pair(turn)).hp_lost[x] > 0;
+    if coming {
+        let mut found = false;
+        if f.cd_move == 0 {
+            for dir in 0..8u8 {
+                if e.map.step_blocked(f.pos, dir) {
+                    continue;
+                }
+                let mut alt = turn;
+                alt.mv = RawTurn::step(dir).mv;
+                alt.dash = RawTurn::IDLE.dash;
+                let mut trial = *s;
+                if e.step(&mut trial, &pair(alt)).hp_lost[x] == 0 {
+                    turn = alt;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found && f.cd_dash == 0 {
+            for dir in 0..8u8 {
+                let mut alt = turn;
+                alt.mv = RawTurn::IDLE.mv;
+                alt.dash = RawTurn::dash(dir).dash;
+                let mut trial = *s;
+                if e.step(&mut trial, &pair(alt)).hp_lost[x] == 0 {
+                    turn = alt;
+                    break;
+                }
+            }
+        }
+        return turn;
+    }
+    // Onto a power pad that is there, when we have no buff.
+    if f.cd_move == 0 && f.power_until == crate::state::NO_BUFF {
+        for (pi, def) in e.map.pads.iter().enumerate() {
+            if def.kind != crate::map::PadKind::Power || !(s.pads[pi].available || s.pads[pi].respawn_tick - s.tick <= 1) {
+                continue;
+            }
+            let pd = chebyshev(f.pos, def.pos);
+            if pd == 0 || pd > 2 {
+                continue;
+            }
+            for dir in 0..8u8 {
+                let dest = add(f.pos, DIR_VEC[dir as usize]);
+                if !e.map.step_blocked(f.pos, dir) && dest != o.pos && chebyshev(dest, def.pos) < pd {
+                    turn.mv = RawTurn::step(dir).mv;
+                    turn.dash = RawTurn::IDLE.dash;
+                    return turn;
+                }
+            }
+        }
+    }
+    turn
+}
