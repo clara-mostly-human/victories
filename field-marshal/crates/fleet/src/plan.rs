@@ -72,6 +72,16 @@ pub fn name_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
+/// The opponent patterns of an experiment as a JSON list for SQL (`opponent GLOB value`),
+/// or `None` when the experiment takes every opponent. Games outside an experiment only
+/// count towards its baseline when they were against one of its opponents.
+pub fn opponents_filter(opponents: &[String]) -> Option<String> {
+    if opponents.iter().any(|p| p == "*") {
+        return None;
+    }
+    serde_json::to_string(opponents).ok()
+}
+
 impl Store {
     pub fn experiments(&self, only_active: bool) -> rusqlite::Result<Vec<Experiment>> {
         let mut q = self.conn.prepare(

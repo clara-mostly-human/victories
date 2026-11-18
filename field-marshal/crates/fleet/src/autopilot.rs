@@ -14,7 +14,7 @@
 //!    always stand on the proven base. They are not moved while an experiment is running.
 //!
 //! It also stops an experiment arm that is two standard errors behind `control` after 100
-//! games. It never promotes and never touches the flagship: "live" is what `fleet release promote`
+//! games, or three behind the baseline after 30. It never promotes and never touches the flagship: "live" is what `fleet release promote`
 //! last set, and the flagship's own thread decides when to restart onto it. Everything it does is one line in
 //! `logs/fleet-alerts.log` (kind PIPELINE) and an event in the store.
 
@@ -45,6 +45,20 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// Releases the fleet built itself (`r<N>-<sha>`), newest first.
+/// How many standard errors `arm` is behind `base`, with smoothed variances (one win and
+/// one loss added to each side) so a short one-sided record does not claim to be certain.
+/// The same sum `fleet plan show` prints.
+pub fn behind_se(arm: &crate::stats::Record, base: &crate::stats::Record) -> f64 {
+    if arm.games() == 0 || base.games() == 0 {
+        return 0.0;
+    }
+    let smooth = |r: &crate::stats::Record| {
+        let p = (r.wins as f64 + 0.5 * r.draws as f64 + 1.0) / (r.games() as f64 + 2.0);
+        p * (1.0 - p) / r.games() as f64
+    };
+    (base.score() - arm.score()) / (smooth(arm) + smooth(base)).sqrt().max(1e-9)
+}
+
 fn fleet_builds(store: &Store) -> Vec<Release> {
     let mut v: Vec<Release> = store.releases().unwrap_or_default().into_iter().filter(|r| r.id.starts_with('r') && r.git_sha.len() == 40).collect();
     v.sort_by_key(|r| -r.seq);
@@ -135,7 +149,8 @@ impl Autopilot {
         }
 
         // Early stopping: an arm that is two standard errors behind control after 100 games
-        // has had its chance, and its games go to the arms still in the running.
+        // has had its chance, and its games go to the arms still in the running. So has one
+        // that is three behind the baseline after 30.
         for e in store.experiments(true).map_err(|e| e.to_string())? {
             for (arm, _) in e.arms.iter().filter(|(a, _)| a != "control") {
                 // The arm against the control's games from the arm's own first game on: a
@@ -148,6 +163,41 @@ impl Autopilot {
                 let rows = store.records("arm", &crate::stats::Filter { experiment: Some(e.name.clone()), since_ms: Some(t0), ..Default::default() }).map_err(|e| e.to_string())?;
                 let rec = |n: &str| rows.iter().find(|r| r.key == n).map(|r| r.record).unwrap_or_default();
                 let (r, control) = (rec(arm), rec("control"));
+                // The fast rule: an arm that is three standard errors behind the baseline
+                // after 30 games is not coming back. The baseline is the one `plan show`
+                // prints (control, plus games outside the experiment on the default
+                // playbooks, over the arm's own time), with the same smoothed variances, so
+                // the number here is the number people read. The arm must also be behind
+                // control itself, in case the wider baseline met other opponents.
+                if r.games() >= 30 && control.games() > 0 && r.score() < control.score() {
+                    let names = serde_json::to_string(&cfg.baseline_playbooks).unwrap_or_else(|_| "[]".into());
+                    let base = store
+                        .conn
+                        .query_row(
+                            "SELECT COALESCE(SUM(result = 'win'), 0), COALESCE(SUM(result = 'loss'), 0), COALESCE(SUM(result NOT IN ('win', 'loss')), 0) FROM matches
+                             WHERE result IS NOT NULL AND voided = 0 AND started_ms >= ?3
+                               AND ((experiment_id = ?1 AND arm = 'control') OR (experiment_id IS NULL AND playbook IN (SELECT value FROM json_each(?2)) AND opponent_ours = 0
+                                    AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(?4) WHERE matches.opponent GLOB value))))",
+                            rusqlite::params![e.id, names, t0, crate::plan::opponents_filter(&e.opponents)],
+                            |q| Ok(crate::stats::Record { wins: q.get(0)?, losses: q.get(1)?, draws: q.get(2)? }),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    let behind = behind_se(&r, &base);
+                    if base.games() >= 30 && behind >= 3.0 {
+                        let why = format!(
+                            "{:.0}% over {} games against the baseline's {:.0}% over {} in the same time, {behind:.1} standard errors behind",
+                            100.0 * r.score(),
+                            r.games(),
+                            100.0 * base.score(),
+                            base.games()
+                        );
+                        if store.stop_arm(e.id, arm, &why).unwrap_or(0) > 0 {
+                            log_line(root, "PIPELINE", &format!("experiment {}: arm {arm} stopped early: {why}", e.name));
+                            store.event(None, "arm_stopped", &json!({ "experiment": e.name, "arm": arm, "why": why }));
+                        }
+                        continue;
+                    }
+                }
                 if r.games() < 100 || control.games() < 50 {
                     continue;
                 }
@@ -353,5 +403,24 @@ impl Autopilot {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::behind_se;
+    use crate::stats::Record;
+
+    #[test]
+    fn a_short_bad_run_is_three_errors_behind_but_a_short_even_one_is_not() {
+        let base = Record { wins: 150, losses: 50, draws: 0 };
+        // 13 and 21 against a 75% baseline: well past three standard errors.
+        assert!(behind_se(&Record { wins: 13, losses: 21, draws: 0 }, &base) >= 3.0);
+        // 20 and 14 against the same baseline is behind, but not by that much.
+        let mild = behind_se(&Record { wins: 20, losses: 14, draws: 0 }, &base);
+        assert!(mild > 0.0 && mild < 3.0, "{mild}");
+        // An arm ahead of the baseline is not behind at all, and nothing divides by zero.
+        assert!(behind_se(&Record { wins: 30, losses: 4, draws: 0 }, &base) < 0.0);
+        assert_eq!(behind_se(&Record::default(), &base), 0.0);
     }
 }

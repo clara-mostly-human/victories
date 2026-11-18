@@ -260,6 +260,8 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
             };
             let default_playbook = baseline_names.join(", ");
             let baseline_json = serde_json::to_string(&baseline_names).unwrap_or_else(|_| "[]".into());
+            // An experiment against named opponents is only compared with games against them.
+            let only_opponents: Option<String> = fleet::plan::opponents_filter(&x.opponents);
             let control_only = a.has("--control-only");
             const BAND: &str = "CASE WHEN opponent_rating >= 2500 THEN '2500 and up' WHEN opponent_rating >= 2250 THEN '2250 to 2500' WHEN opponent_rating IS NULL THEN 'not rated' ELSE 'under 2250' END";
             let by_band = |clause: &str, p: &[&dyn rusqlite::ToSql]| -> Result<Vec<(String, fleet::stats::Record, f64)>, String> {
@@ -337,8 +339,9 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                     by_band("experiment_id = ?1 AND arm = 'control' AND started_ms >= ?2", &[&x.id, &t0])?
                 } else {
                     by_band(
-                        "((experiment_id = ?1 AND arm = 'control') OR (experiment_id IS NULL AND playbook IN (SELECT value FROM json_each(?2)) AND opponent_ours = 0)) AND started_ms >= ?3",
-                        &[&x.id, &baseline_json, &t0],
+                        "((experiment_id = ?1 AND arm = 'control') OR (experiment_id IS NULL AND playbook IN (SELECT value FROM json_each(?2)) AND opponent_ours = 0
+                           AND (?4 IS NULL OR EXISTS (SELECT 1 FROM json_each(?4) WHERE matches.opponent GLOB value)))) AND started_ms >= ?3",
+                        &[&x.id, &baseline_json, &t0, &only_opponents],
                     )?
                 };
                 let ((ar, at), (cr, ct)) = (total(&arm_rows), total(&base_rows));
@@ -416,9 +419,15 @@ fn plan(store: &mut Store, a: &Args) -> Result<(), String> {
                 return Err("the file needs \"arms\": at least two, each a name with playbook settings ({} is the bot's own playbook)".into());
             }
             let games = v.get("games_per_arm").and_then(Value::as_i64).unwrap_or(100);
-            let priority = v.get("priority").and_then(Value::as_i64).unwrap_or(0);
+            // An experiment against named opponents goes before one against everybody, so
+            // it can run beside a wide experiment and take just its opponents' games.
+            let narrow = !opponents.iter().any(|o| o == "*");
+            let priority = v.get("priority").and_then(Value::as_i64).unwrap_or(narrow as i64);
             let id = store.add_experiment(name, &opponents, list("bots").as_deref(), &arms, games, priority, v.get("note").and_then(Value::as_str)).map_err(|x| format!("cannot add {name}: {x}"))?;
             println!("experiment {name} added (id {id}): {} arms x {games} games against {}", arms.len(), opponents.join(", "));
+            if priority > 0 {
+                println!("it takes its opponents' games ahead of any wider experiment (priority {priority}); every other game stays with the others");
+            }
         }
         "add-arm" => {
             let name = a.word(2, "the experiment's name")?;

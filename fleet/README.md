@@ -172,6 +172,16 @@ match row are one transaction, so several bots can draw at once.
     fleet plan add-arm slam-risk-vs-top risk2 '{"slam_risk": 2}'   # joins a running experiment
     fleet plan pause|resume|stop <name>
 
+Two experiments can run at once. One against named opponents (no bare `"*"` in its
+`opponents`) gets priority 1 and takes its opponents' games; every other game stays with the
+wide experiment. `"priority"` in the file overrides this. Its baseline counts only games
+against its own opponents.
+
+The autopilot stops an arm early in two cases: two standard errors behind the control arm
+after 100 games (control's games over the arm's own time), or three standard errors behind
+the baseline that `plan show` prints after 30 games, provided it is also behind control. A
+stopped arm keeps its games, and the remaining arms share evenly from then on.
+
 `plan show` reads each arm against a baseline over the arm's own time: the control arm, plus
 games of our bots outside any experiment that played the default playbook. The default file
 can play more than one named playbook (matrix-5, and matrix-6 against bots rated 2250 and
