@@ -437,6 +437,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         if send(&mut ws, shared, queue_frame(&version)).is_err() {
             continue;
         }
+        // ticks of this match on which the override test sent an empty turn first
+        let mut test_ticks: Vec<i64> = Vec::new();
         let mut requeue_at: Option<Instant> = None;
         // a match just ended and the engine has not yet said what it would do next
         let mut after_end: Option<Instant> = None;
@@ -471,11 +473,29 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                                 requeue_at = None;
                                 after_end = None;
                             }
-                            "observation" => pending = msg.get("tick").and_then(Value::as_i64).map(|t| (t, Instant::now())),
+                            "observation" => {
+                                pending = msg.get("tick").and_then(Value::as_i64).map(|t| (t, Instant::now()));
+                                // The override test: on every Nth tick an empty turn goes out at
+                                // once, ahead of the engine's real one, to learn which of two
+                                // answers for one tick the ladder applies.
+                                if let (Some((tick, _)), true) = (pending, bot.provisional_test_every > 0) {
+                                    if tick > 0 && tick % bot.provisional_test_every as i64 == 0 {
+                                        if let Err(why) = send(&mut ws, shared, json!({ "tick": tick }).to_string()) {
+                                            why_closed = why;
+                                            break 'conn;
+                                        }
+                                        test_ticks.push(tick);
+                                    }
+                                }
+                            }
                             "end" => {
                                 in_match = false;
                                 last_hello = None;
                                 pending = None;
+                                if !test_ticks.is_empty() {
+                                    event(root, name, "provisional_test", json!({ "match": current_match, "ticks": test_ticks }));
+                                    test_ticks.clear();
+                                }
                             }
                             "error" => {
                                 let code = msg.get("code").and_then(Value::as_str).unwrap_or("?").to_string();

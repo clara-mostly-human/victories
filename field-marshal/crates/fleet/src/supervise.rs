@@ -397,7 +397,8 @@ pub fn install_agent(label: &str, text: &str) -> Result<(), String> {
     // launchd needs a moment to let go of the old job; loading too early fails with
     // "Bootstrap failed: 5: Input/output error".
     let mut last = String::new();
-    for _ in 0..120 {
+    // An agent that lets a match finish before it exits can take minutes to go.
+    for _ in 0..2000 {
         if !launchd_loaded(label) {
             let out = Command::new("launchctl").arg("bootstrap").arg(format!("gui/{}", uid())).arg(&path).output().map_err(|e| e.to_string())?;
             if out.status.success() {

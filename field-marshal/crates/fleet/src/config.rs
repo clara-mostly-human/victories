@@ -31,6 +31,9 @@ pub struct BotConfig {
     pub owner: Option<String>,
     /// the gateway holds this bot's connection and runs its engine behind it
     pub gateway: bool,
+    /// override test (gateway bots): on every Nth tick send an empty turn first, then the
+    /// engine's; 0 is off
+    pub provisional_test_every: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +92,7 @@ impl Config {
                     expect_online: flag("expect_online"),
                     owner: text("owner"),
                     gateway: flag("gateway"),
+                    provisional_test_every: b.get("provisional_test_every").and_then(Value::as_u64).unwrap_or(0),
                 });
             }
         }
