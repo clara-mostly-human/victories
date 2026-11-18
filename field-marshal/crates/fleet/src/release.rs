@@ -308,6 +308,8 @@ pub fn evidence(store: &Store, id: &str, o: &EvidenceOptions) -> Result<Value, S
         missing.push(format!("{} of {} opponents in common with the baseline", p.shared_opponents, o.min_shared_opponents));
     }
     let conf = p.confidence();
+    // A second view when the ladder's list gave opponent ratings: performance rating.
+    let perf = |spec: &str| store.rated_games(&spec_filter(spec)).ok().and_then(|g| crate::stats::performance(&g).map(|(r, se)| json!({ "rating": r.round(), "plus_minus": (1.96 * se).round(), "games": g.len() })));
     let verdict = if !missing.is_empty() {
         "waiting"
     } else if p.diff > 0.0 && conf >= o.confidence {
@@ -322,6 +324,7 @@ pub fn evidence(store: &Store, id: &str, o: &EvidenceOptions) -> Result<Value, S
         "candidate": { "games": p.candidate.games(), "wins": p.candidate.wins, "losses": p.candidate.losses, "draws": p.candidate.draws, "score": p.candidate.score() },
         "baseline_record": { "games": p.baseline.games(), "wins": p.baseline.wins, "losses": p.baseline.losses, "draws": p.baseline.draws, "score": p.baseline.score() },
         "shared_opponents": p.shared_opponents, "shared_candidate_games": p.shared_candidate_games, "shared_baseline_games": p.shared_baseline_games,
+        "performance": { "candidate": perf(id), "baseline": perf(&baseline) },
         "score_difference": p.diff, "standard_error": p.se, "confidence_better": conf, "needed": o.confidence, "ts_ms": now_ms(),
     });
     store.set_release_json(id, "evidence", &report).map_err(|e| e.to_string())?;
@@ -357,5 +360,30 @@ pub fn promote(root: &Path, store: &Store, cfg: &Config, id: &str, force: Option
             eprintln!("{} is a flagship the fleet does not manage: its owner deploys {} by hand", b.name, PathBuf::from(&r.path).join("marshal").display());
         }
     }
+    Ok(out)
+}
+
+/// Compares any two sets of ladder games (release ids or `bot:version`) the way `evidence`
+/// does, without storing anything.
+pub fn compare(store: &Store, candidate: &str, baseline: &str) -> Result<String, String> {
+    let c = store.records("opponent", &spec_filter(candidate)).map_err(|e| e.to_string())?;
+    let b = store.records("opponent", &spec_filter(baseline)).map_err(|e| e.to_string())?;
+    let p = paired(&c, &b);
+    let line = |name: &str, r: &Record, spec: &str| {
+        let perf = store.rated_games(&spec_filter(spec)).ok().and_then(|g| crate::stats::performance(&g).map(|(x, se)| format!(", performance rating {x:.0} +/- {:.0} over {} rated games", 1.96 * se, g.len()))).unwrap_or_default();
+        format!("{name}: {} games, {}W {}L {}D, {:.0}%{perf}\n", r.games(), r.wins, r.losses, r.draws, 100.0 * r.score())
+    };
+    let mut out = line(candidate, &p.candidate, candidate);
+    out.push_str(&line(baseline, &p.baseline, baseline));
+    out.push_str(&format!(
+        "against the {} opponents both met ({} and {} games): {} scores {:+.1} points, standard error {:.1}; {:.0}% sure it is the better one\n",
+        p.shared_opponents,
+        p.shared_candidate_games,
+        p.shared_baseline_games,
+        candidate,
+        100.0 * p.diff,
+        100.0 * p.se,
+        100.0 * p.confidence()
+    ));
     Ok(out)
 }

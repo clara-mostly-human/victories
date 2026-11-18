@@ -5,7 +5,7 @@
 //! ```
 //!
 //! `managed` bots are run by `fleet run` under launchd. `experiments` lets a bot take arms
-//! from the experiment plan. Every name listed here counts as one of ours.
+//! from the experiment plan. `expect_online` puts a bot under the offline watchdog. Every name listed here counts as one of ours.
 
 use serde_json::Value;
 use std::path::Path;
@@ -23,6 +23,10 @@ pub struct BotConfig {
     /// ladder address, for pointing a bot at a local test server
     pub url: Option<String>,
     pub note: Option<String>,
+    /// the offline watchdog raises an alert when this bot is off the ladder
+    pub expect_online: bool,
+    /// who brings it back, named in the alert
+    pub owner: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -52,6 +56,8 @@ impl Config {
                     playbooks: text("playbooks").unwrap_or_else(|| "playbooks/default.json".into()),
                     url: text("url"),
                     note: text("note"),
+                    expect_online: flag("expect_online"),
+                    owner: text("owner"),
                 });
             }
         }

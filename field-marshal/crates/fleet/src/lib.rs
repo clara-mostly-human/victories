@@ -6,6 +6,7 @@
 //! - `collect`: the replay collector and the corpus index.
 //! - `config`: per-bot settings from `fleet/bots.json`.
 //! - `ingest`: backfill from `marshal` logs.
+//! - `online`: the offline watchdog (read-only: asks the ladder, raises alerts).
 //! - `supervise`: `fleet run <bot>`, the process launchd keeps alive for each bot.
 //! - `release`: build from a commit, arena gate, ladder evidence, promotion, hot swap.
 //!
@@ -15,6 +16,7 @@
 pub mod collect;
 pub mod config;
 pub mod ingest;
+pub mod online;
 pub mod plan;
 pub mod release;
 pub mod stats;

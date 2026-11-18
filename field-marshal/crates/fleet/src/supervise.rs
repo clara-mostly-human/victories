@@ -368,11 +368,20 @@ pub fn install_agent(label: &str, text: &str) -> Result<(), String> {
         let _ = Command::new("launchctl").arg("bootout").arg(format!("gui/{}/{label}", uid())).status();
     }
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
-    let out = Command::new("launchctl").arg("bootstrap").arg(format!("gui/{}", uid())).arg(&path).output().map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(format!("launchctl bootstrap failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
+    // launchd needs a moment to let go of the old job; loading too early fails with
+    // "Bootstrap failed: 5: Input/output error".
+    let mut last = String::new();
+    for _ in 0..40 {
+        if !launchd_loaded(label) {
+            let out = Command::new("launchctl").arg("bootstrap").arg(format!("gui/{}", uid())).arg(&path).output().map_err(|e| e.to_string())?;
+            if out.status.success() {
+                return Ok(());
+            }
+            last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    Ok(())
+    Err(format!("launchctl bootstrap failed: {last}"))
 }
 
 pub fn remove_agent(label: &str) -> Result<(), String> {

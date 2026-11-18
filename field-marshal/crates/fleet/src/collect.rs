@@ -108,7 +108,10 @@ pub fn verify(text: &str) -> Result<(usize, victris_engine::replay::Replay), Str
 /// One game from the ladder's match list.
 struct Listed {
     id: String,
+    started: String,
     ended: String,
+    /// rating after the game, by seat
+    after: [Option<f64>; 2],
     map: String,
     reason: String,
     final_tick: Option<i64>,
@@ -122,6 +125,7 @@ fn listed(m: &Value) -> Option<Listed> {
         return None;
     }
     let bots = m.get("bots")?.as_array()?;
+    let after = |n: i64| bots.iter().find(|b| b.get("fighter").and_then(Value::as_i64) == Some(n)).and_then(|b| b.get("rating_after")).and_then(Value::as_f64);
     let seat = |n: i64| -> Option<(String, String, Option<f64>, String)> {
         let b = bots.iter().find(|b| b.get("fighter").and_then(Value::as_i64) == Some(n))?;
         Some((
@@ -135,6 +139,8 @@ fn listed(m: &Value) -> Option<Listed> {
     let winner = m.get("winner").and_then(Value::as_str).and_then(|w| if w == a.3 { Some(1) } else if w == b.3 { Some(2) } else { None });
     Some(Listed {
         id,
+        started: m.get("started").and_then(Value::as_str).unwrap_or("").to_string(),
+        after: [after(1), after(2)],
         ended: m.get("ended").and_then(Value::as_str).unwrap_or("").to_string(),
         map: m.get("map").and_then(Value::as_str).unwrap_or("").to_string(),
         reason: m.get("reason").and_then(Value::as_str).unwrap_or("").to_string(),
@@ -142,6 +148,21 @@ fn listed(m: &Value) -> Option<Listed> {
         winner,
         bots: [(a.0, a.1, a.2), (b.0, b.1, b.2)],
     })
+}
+
+/// `2026-11-18T02:46:59.118Z` as milliseconds since the epoch.
+pub fn iso_ms(t: &str) -> Option<i64> {
+    let num = |a: usize, b: usize| t.get(a..b)?.parse::<i64>().ok();
+    let (y, m, d, h, mi, s) = (num(0, 4)?, num(5, 7)?, num(8, 10)?, num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    let ms = if t.as_bytes().get(19) == Some(&b'.') { num(20, 23).unwrap_or(0) } else { 0 };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let y2 = if m <= 2 { y - 1 } else { y };
+    let era = y2.div_euclid(400);
+    let yoe = y2.rem_euclid(400);
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(((days * 24 + h) * 60 + mi) * 60_000 + s * 1000 + ms)
 }
 
 fn matches_of(body: &[u8]) -> Vec<Value> {
@@ -238,6 +259,51 @@ impl<'a> Collector<'a> {
                 ],
             )
             .unwrap_or(0);
+        // The same list is the ladder's own record of our games: who we met, at what
+        // rating, and how it ended. A bot that writes its matches itself already has the
+        // row and only gains the ratings; a bot that does not (foot-soldier) gets its row here.
+        for k in 0..2 {
+            let (me, them) = (&l.bots[k], &l.bots[1 - k]);
+            if !self.ours.contains(&me.0) {
+                continue;
+            }
+            let result = match l.winner {
+                Some(w) if w == k as i64 + 1 => "win",
+                Some(_) => "loss",
+                None => "draw",
+            };
+            let change = match (me.2, l.after[k]) {
+                (Some(b), Some(a)) => Some(a - b),
+                _ => None,
+            };
+            let _ = self.store.conn.execute(
+                "INSERT INTO matches (match_id, bot, version, opponent, opponent_version, opponent_ours, map, seat, started_ms, ended_ms, result, reason,
+                   final_tick, rating_change, replay_url, source, opponent_rating, rating_before)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 'api', ?16, ?17)
+                 ON CONFLICT(match_id, bot) DO UPDATE SET opponent_rating = ?16, rating_before = ?17,
+                   opponent_version = COALESCE(opponent_version, ?5), result = COALESCE(result, ?11), reason = COALESCE(reason, ?12),
+                   final_tick = COALESCE(final_tick, ?13), ended_ms = COALESCE(ended_ms, ?10), rating_change = COALESCE(rating_change, ?14)",
+                params![
+                    l.id,
+                    me.0,
+                    me.1,
+                    them.0,
+                    them.1,
+                    self.ours.contains(&them.0) as i64,
+                    l.map,
+                    k as i64 + 1,
+                    iso_ms(&l.started),
+                    iso_ms(&l.ended),
+                    result,
+                    l.reason,
+                    l.final_tick,
+                    change,
+                    format!("/replays/{}.jsonl.gz", l.id),
+                    them.2,
+                    me.2
+                ],
+            );
+        }
         n > 0
     }
 
@@ -478,4 +544,16 @@ pub fn corpus(root: &Path, store: &Store, q: &Query) -> rusqlite::Result<Vec<Pat
     let mut stmt = store.conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params_from_iter(p), |r| r.get::<_, String>(0))?.map(|id| id.map(|id| replay_path(root, &id))).collect();
     rows
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iso_times() {
+        assert_eq!(iso_ms("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(iso_ms("2026-11-18T02:46:59.118Z"), Some(1_794_970_019_118));
+        assert_eq!(iso_ms("nonsense"), None);
+    }
 }

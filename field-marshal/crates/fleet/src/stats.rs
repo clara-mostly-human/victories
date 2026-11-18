@@ -101,6 +101,8 @@ pub struct Filter {
     pub since_ms: Option<i64>,
     /// leave out games against our own bots
     pub no_ours: bool,
+    /// only opponents rated at least this (games whose opponent rating is unknown are left out)
+    pub min_opponent_rating: Option<f64>,
 }
 
 impl Filter {
@@ -131,6 +133,9 @@ impl Filter {
         if let Some(t) = self.since_ms {
             add(&mut w, "started_ms >= ?", Sql::Integer(t));
         }
+        if let Some(r) = self.min_opponent_rating {
+            add(&mut w, "opponent_rating >= ?", Sql::Real(r));
+        }
         if self.no_ours {
             w.push_str(" AND opponent_ours = 0");
         }
@@ -144,6 +149,8 @@ pub struct Row {
     pub record: Record,
     pub rating: f64,
     pub ticks: f64,
+    /// mean rating of the opponents, where the ladder's list gave it
+    pub opponent_rating: Option<f64>,
 }
 
 /// Columns a record can be grouped by. Anything else is refused, so the text never reaches SQL.
@@ -169,7 +176,7 @@ impl Store {
         let (w, p) = f.sql();
         let mut q = self.conn.prepare(&format!(
             "SELECT {col} AS k, SUM(result = 'win'), SUM(result = 'loss'), SUM(result NOT IN ('win', 'loss')),
-                    COALESCE(SUM(rating_change), 0), COALESCE(AVG(final_tick), 0)
+                    COALESCE(SUM(rating_change), 0), COALESCE(AVG(final_tick), 0), AVG(opponent_rating)
              FROM matches WHERE {w} GROUP BY k ORDER BY COUNT(*) DESC, k"
         ))?;
         let rows = q
@@ -179,6 +186,7 @@ impl Store {
                     record: Record { wins: r.get(1)?, losses: r.get(2)?, draws: r.get(3)? },
                     rating: r.get(4)?,
                     ticks: r.get(5)?,
+                    opponent_rating: r.get(6)?,
                 })
             })?
             .collect();
@@ -188,11 +196,11 @@ impl Store {
 
 pub fn table(title: &str, rows: &[Row]) -> String {
     let width = rows.iter().map(|r| r.key.chars().count()).max().unwrap_or(4).max(title.chars().count());
-    let mut out = format!("{:<width$}  games    W    L    D  score   95% interval  rating  ticks\n", title);
+    let mut out = format!("{:<width$}  games    W    L    D  score   95% interval  rating  ticks  opp rating\n", title);
     for r in rows {
         let (lo, hi) = r.record.interval();
         out.push_str(&format!(
-            "{:<width$}  {:>5} {:>4} {:>4} {:>4}  {:>4.0}%   {:>3.0}% to {:>3.0}%  {:>+6.0}  {:>5.0}\n",
+            "{:<width$}  {:>5} {:>4} {:>4} {:>4}  {:>4.0}%   {:>3.0}% to {:>3.0}%  {:>+6.0}  {:>5.0}  {:>10}\n",
             r.key,
             r.record.games(),
             r.record.wins,
@@ -202,7 +210,8 @@ pub fn table(title: &str, rows: &[Row]) -> String {
             100.0 * lo,
             100.0 * hi,
             r.rating,
-            r.ticks
+            r.ticks,
+            r.opponent_rating.map(|x| format!("{x:.0}")).unwrap_or_else(|| "-".into())
         ));
     }
     out
@@ -272,6 +281,47 @@ pub fn paired(candidate: &[Row], baseline: &[Row]) -> Paired {
     out
 }
 
+/// Performance rating: the rating at which the expected score against these opponents
+/// equals the score actually made. `games` are (opponent rating, score of the game).
+/// Returns the rating and its standard error, or `None` without rated games.
+pub fn performance(games: &[(f64, f64)]) -> Option<(f64, f64)> {
+    if games.is_empty() {
+        return None;
+    }
+    let k = std::f64::consts::LN_10 / 400.0;
+    let expect = |r: f64, o: f64| 1.0 / (1.0 + (-(r - o) * k).exp());
+    // A clean sweep either way has no finite answer: half a point is added and removed.
+    let n = games.len() as f64;
+    let made: f64 = games.iter().map(|g| g.1).sum::<f64>().clamp(0.5, n - 0.5);
+    let mut r = games.iter().map(|g| g.0).sum::<f64>() / n;
+    for _ in 0..60 {
+        let e: f64 = games.iter().map(|g| expect(r, g.0)).sum();
+        let slope: f64 = games.iter().map(|g| expect(r, g.0) * (1.0 - expect(r, g.0))).sum::<f64>() * k;
+        if slope < 1e-12 {
+            break;
+        }
+        let step = ((made - e) / slope).clamp(-200.0, 200.0);
+        r += step;
+        if step.abs() < 0.01 {
+            break;
+        }
+    }
+    let info: f64 = games.iter().map(|g| expect(r, g.0) * (1.0 - expect(r, g.0))).sum::<f64>() * k * k;
+    Some((r, 1.0 / info.sqrt()))
+}
+
+impl Store {
+    /// (opponent rating, score) of every game the filter selects that has a rating.
+    pub fn rated_games(&self, f: &Filter) -> rusqlite::Result<Vec<(f64, f64)>> {
+        let (w, p) = f.sql();
+        let mut q = self.conn.prepare(&format!(
+            "SELECT opponent_rating, CASE result WHEN 'win' THEN 1.0 WHEN 'loss' THEN 0.0 ELSE 0.5 END FROM matches WHERE {w} AND opponent_rating IS NOT NULL"
+        ))?;
+        let rows = q.query_map(rusqlite::params_from_iter(p), |r| Ok((r.get(0)?, r.get(1)?)))?.collect();
+        rows
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,6 +337,19 @@ mod tests {
     }
 
     #[test]
+    fn performance_rating() {
+        // Even score against 2000-rated opponents is a 2000 performance.
+        let even: Vec<(f64, f64)> = (0..40).map(|i| (2000.0, (i % 2) as f64)).collect();
+        let (r, se) = performance(&even).unwrap();
+        assert!((r - 2000.0).abs() < 1.0, "{r}");
+        assert!(se > 40.0 && se < 70.0, "{se}");
+        // Three wins in four is about 191 points above them.
+        let strong: Vec<(f64, f64)> = (0..40).map(|i| (2000.0, if i % 4 == 0 { 0.0 } else { 1.0 })).collect();
+        assert!((performance(&strong).unwrap().0 - 2190.8).abs() < 2.0);
+        assert!(performance(&[]).is_none());
+    }
+
+    #[test]
     fn normal_cdf_values() {
         assert!((normal_cdf(0.0) - 0.5).abs() < 1e-6);
         assert!((normal_cdf(1.96) - 0.975).abs() < 1e-4);
@@ -295,7 +358,7 @@ mod tests {
 
     #[test]
     fn paired_ignores_who_was_drawn() {
-        let row = |k: &str, w, l| Row { key: k.into(), record: Record { wins: w, losses: l, draws: 0 }, rating: 0.0, ticks: 0.0 };
+        let row = |k: &str, w, l| Row { key: k.into(), record: Record { wins: w, losses: l, draws: 0 }, rating: 0.0, ticks: 0.0, opponent_rating: None };
         // Same strength against each opponent, but the candidate met the weak one more often.
         let cand = vec![row("weak", 36, 4), row("strong", 1, 9)];
         let base = vec![row("weak", 9, 1), row("strong", 4, 36)];

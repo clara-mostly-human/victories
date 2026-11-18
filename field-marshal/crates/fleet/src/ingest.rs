@@ -51,6 +51,15 @@ pub fn ingest_logs(store: &Store, log_dir: &Path, bot: &str, ours: &dyn Fn(&str)
                         seed: hello.as_ref().and_then(|h| h.get("seed")).and_then(Value::as_i64),
                     };
                     let started = hello.as_ref().and_then(|h| h.get("ts")).and_then(Value::as_i64).unwrap_or(ts);
+                    // A row made from the ladder's list knows less than the log (no playbook, no
+                    // timings): the log's row takes its place and keeps the ratings.
+                    let api: Option<(Option<f64>, Option<f64>)> = store
+                        .conn
+                        .query_row("SELECT opponent_rating, rating_before FROM matches WHERE match_id = ?1 AND bot = ?2 AND source = 'api'", rusqlite::params![id, bot], |r| Ok((r.get(0)?, r.get(1)?)))
+                        .ok();
+                    if api.is_some() {
+                        let _ = store.conn.execute("DELETE FROM matches WHERE match_id = ?1 AND bot = ?2", rusqlite::params![id, bot]);
+                    }
                     let before: i64 = store.conn.query_row("SELECT COUNT(*) FROM matches WHERE match_id = ?1 AND bot = ?2", rusqlite::params![id, bot], |r| r.get(0)).unwrap_or(0);
                     if before == 0 && store.match_started(&start, &text("playbook"), None, ours(&start.opponent), "log", started).is_ok() {
                         out.started += 1;
@@ -58,6 +67,9 @@ pub fn ingest_logs(store: &Store, log_dir: &Path, bot: &str, ours: &dyn Fn(&str)
                     let open: i64 = store.conn.query_row("SELECT COUNT(*) FROM matches WHERE match_id = ?1 AND bot = ?2 AND result IS NULL", rusqlite::params![id, bot], |r| r.get(0)).unwrap_or(0);
                     if open > 0 && store.match_finished(bot, &v, ts).unwrap_or(0) > 0 {
                         out.finished += 1;
+                    }
+                    if let Some((theirs, mine)) = api {
+                        let _ = store.conn.execute("UPDATE matches SET opponent_rating = ?3, rating_before = ?4 WHERE match_id = ?1 AND bot = ?2", rusqlite::params![id, bot, theirs, mine]);
                     }
                 }
                 _ => {}

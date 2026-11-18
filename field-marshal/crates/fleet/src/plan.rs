@@ -216,3 +216,74 @@ impl Store {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn temp_store(name: &str) -> Store {
+        let path = std::env::temp_dir().join(format!("fleet-test-{}-{name}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        Store::open(&path, Duration::from_secs(5)).unwrap()
+    }
+
+    fn start(id: usize, opponent: &str, map: &str, seat: i64) -> MatchStart {
+        MatchStart { match_id: format!("m{id}"), bot: "scout".into(), version: "v1".into(), release: None, opponent: opponent.into(), map: map.into(), seat: Some(seat), seed: None }
+    }
+
+    #[test]
+    fn patterns() {
+        assert!(name_matches("Shelbot*", "Shelbot4"));
+        assert!(name_matches("*", "anyone"));
+        assert!(name_matches("sir-*-v2", "sir-lancelot-v2"));
+        assert!(!name_matches("Shelbot*", "shelbot4"));
+        assert!(!name_matches("Stuart", "StuartSutcliffe"));
+    }
+
+    #[test]
+    fn arms_are_balanced_in_every_cell() {
+        let mut s = temp_store("balance");
+        let arms = vec![("a".to_string(), json!({})), ("b".to_string(), json!({ "x": 1 })), ("c".to_string(), json!({ "x": 2 }))];
+        s.add_experiment("e", &["top*".to_string()], None, &arms, 1000, 0, None).unwrap();
+        let mut id = 0;
+        let mut seen = std::collections::HashMap::new();
+        for _round in 0..6 {
+            for opponent in ["top1", "top2", "other"] {
+                for map in ["m1", "m2"] {
+                    for seat in [1, 2] {
+                        id += 1;
+                        let got = s.assign(&start(id, opponent, map, seat), "base", true, false).unwrap();
+                        if opponent == "other" {
+                            assert!(got.is_none());
+                        } else {
+                            *seen.entry((opponent, map, seat, got.unwrap().arm)).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        // 6 rounds over 3 arms: exactly 2 games per arm in each of the 8 cells.
+        assert_eq!(seen.len(), 24);
+        assert!(seen.values().all(|n| *n == 2), "{seen:?}");
+    }
+
+    #[test]
+    fn stops_at_the_quota_and_skips_our_own_bots() {
+        let mut s = temp_store("quota");
+        let arms = vec![("a".to_string(), json!({})), ("b".to_string(), json!({ "x": 1 }))];
+        s.add_experiment("e", &["rival".to_string()], Some(&["scout".to_string()]), &arms, 2, 0, None).unwrap();
+        // Our own bot as the opponent, and a bot that does not take part, get nothing.
+        assert!(s.assign(&start(100, "rival", "m", 1), "base", true, true).unwrap().is_none());
+        assert!(s.assign(&start(101, "rival", "m", 1), "base", false, false).unwrap().is_none());
+        for id in 0..4 {
+            assert!(s.assign(&start(id, "rival", "m", 1), "base", true, false).unwrap().is_some());
+        }
+        // Both arms have their two games: the fifth match plays the bot's own playbook.
+        assert!(s.assign(&start(4, "rival", "m", 1), "base", true, false).unwrap().is_none());
+        assert_eq!(s.experiment("e").unwrap().unwrap().status, "done");
+        // A reconnect to an earlier match gets the arm it was given then.
+        let again = s.assign(&start(0, "rival", "m", 1), "base", true, false).unwrap().unwrap();
+        assert_eq!(again.arm, "a");
+    }
+}

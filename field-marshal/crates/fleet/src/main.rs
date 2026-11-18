@@ -2,13 +2,15 @@
 //!
 //!   fleet status                                  every bot: running? which release? today's record
 //!   fleet run <bot>                               the supervisor (launchd runs this)
-//!   fleet install <bot> | watch | collector       install a launchd agent
-//!   fleet uninstall <bot> | watch | collector
+//!   fleet install <bot> | watch | collector | online      install a launchd agent
+//!   fleet uninstall <bot> | watch | collector | online
 //!   fleet stop <bot> | resume <bot> | restart <bot>
 //!   fleet deploy <bot> <release> [--version vN] [--force "<reason>"]
 //!
 //!   fleet stats [--by opponent|version|release|playbook|arm|map|seat|bot|cell] [--bot b]
-//!               [--opponent o] [--version v] [--release r] [--experiment e] [--since 24h] [--all]
+//!               [--opponent o] [--version v] [--release r] [--experiment e] [--since 24h]
+//!               [--min-opp-rating 2400] [--all]
+//!   fleet compare <candidate> <baseline>          two sets of ladder games, each a release id or bot:version
 //!   fleet ingest [bot ...]                        read marshal logs into the store
 //!
 //!   fleet plan list | show <name> | add <file.json> | pause <name> | resume <name> | stop <name>
@@ -25,6 +27,8 @@
 //!   fleet collect run | once [--max N] | index    the replay collector
 //!   fleet corpus [--min-rating 2400] [--bot name] [--ours | --not-ours] [--since 24h] [--limit N] [--count]
 //!   fleet watch                                   one health pass (launchd runs this every 5 minutes)
+//!   fleet online [run]                            is each bot online on the ladder? `run` is the offline watchdog
+//!   fleet alerts [N]                              the last N lines of the alert log
 
 use fleet::collect::{self, Collector};
 use fleet::config::Config;
@@ -388,6 +392,9 @@ fn watch(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Agents that are not bots.
+const SERVICES: [&str; 3] = ["watch", "collector", "online"];
+
 static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn on_signal(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
@@ -398,6 +405,7 @@ fn agent_spec(root: &Path, what: &str) -> (String, Vec<String>, std::path::PathB
     match what {
         "watch" => ("com.victris.fleet-watch".into(), vec![bin, "watch".into()], root.join("logs").join("fleet-watch.log"), Some(300)),
         "collector" => ("com.victris.fleet-collector".into(), vec![bin, "collect".into(), "run".into()], root.join("logs").join("fleet-collector.log"), None),
+        "online" => ("com.victris.fleet-online".into(), vec![bin, "online".into(), "run".into()], root.join("logs").join("fleet-online.log"), None),
         bot => (label(bot), vec![bin, "run".into(), bot.to_string()], root.join("logs").join(bot).join("run.log"), None),
     }
 }
@@ -424,7 +432,7 @@ fn main_inner() -> Result<i32, String> {
         "status" => status(&root, &store, &cfg)?,
         "install" => {
             let what = a.word(1, "a bot's name, `watch` or `collector`")?;
-            if what != "watch" && what != "collector" {
+            if !SERVICES.contains(&what) {
                 known(what)?;
                 if !cfg.bot(what).unwrap().managed {
                     return Err(format!("{what} is not managed by the fleet (managed is false in fleet/bots.json)"));
@@ -444,7 +452,7 @@ fn main_inner() -> Result<i32, String> {
         "uninstall" => {
             let what = a.word(1, "a bot's name, `watch` or `collector`")?;
             let (lbl, ..) = agent_spec(&root, what);
-            if what != "watch" && what != "collector" {
+            if !SERVICES.contains(&what) {
                 // Let the match finish before launchd takes the supervisor away.
                 if let Some(pid) = supervise::restart_bot(&root, what) {
                     println!("waiting for {what} (pid {pid}) to finish its match");
@@ -455,7 +463,7 @@ fn main_inner() -> Result<i32, String> {
                 }
             }
             supervise::remove_agent(&lbl)?;
-            if what != "watch" && what != "collector" {
+            if !SERVICES.contains(&what) {
                 let _ = store.set_halted(what, None);
             }
             println!("{lbl} removed");
@@ -497,6 +505,7 @@ fn main_inner() -> Result<i32, String> {
                 experiment: a.get("--experiment").map(str::to_string),
                 since_ms: a.get("--since").map(since).transpose()?,
                 no_ours: !a.has("--all"),
+                min_opponent_rating: a.num("--min-opp-rating")?,
             };
             let by = a.get("--by").unwrap_or("version");
             if fleet::stats::group_column(by).is_none() {
@@ -504,6 +513,7 @@ fn main_inner() -> Result<i32, String> {
             }
             print!("{}", table(by, &store.records(by, &f).map_err(e)?));
         }
+        "compare" => print!("{}", release::compare(&store, a.word(1, "the candidate (release id or bot:version)")?, a.word(2, "the baseline (release id or bot:version)")?)?),
         "ingest" => {
             let bots: Vec<String> = if a.words.len() > 1 { a.words[1..].to_vec() } else { cfg.names() };
             for bot in bots {
@@ -575,12 +585,43 @@ fn main_inner() -> Result<i32, String> {
             }
         }
         "watch" => watch(&root, &store, &cfg)?,
+        "online" => {
+            if a.words.get(1).map(String::as_str) == Some("run") {
+                unsafe {
+                    libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+                    libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+                }
+                drop(store);
+                fleet::online::run(&root, &|| STOP.load(Ordering::Relaxed));
+            } else {
+                for b in &cfg.bots {
+                    let state = match fleet::online::is_online(&b.name) {
+                        Ok(true) => "online".to_string(),
+                        Ok(false) => "OFFLINE".to_string(),
+                        Err(x) => format!("unknown ({x})"),
+                    };
+                    println!("{:<15} {:<8} {}", b.name, state, if b.expect_online { "watched" } else { "not watched" });
+                }
+            }
+        }
+        "alerts" => {
+            let n: usize = a.words.get(1).and_then(|n| n.parse().ok()).unwrap_or(20);
+            let text = std::fs::read_to_string(fleet::online::alert_log(&root)).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            for l in &lines[lines.len().saturating_sub(n)..] {
+                println!("{l}");
+            }
+        }
         other => return Err(format!("unknown command {other}; `fleet help` shows the commands")),
     }
     Ok(0)
 }
 
 fn main() {
+    // Output piped into `head` must end the program quietly, not with a panic.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     match main_inner() {
         Ok(code) => std::process::exit(code),
         Err(msg) => {
