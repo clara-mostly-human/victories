@@ -881,6 +881,8 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
     let mut after_replacement = false;
     let mut rotated_from: Option<i64> = None;
     let mut down_why = String::from("not connected yet");
+    // When the ladder last said another connection took this bot over ("replaced").
+    let mut last_replaced: Option<Instant> = None;
     let mut hello_fields_said = false;
 
     // Health as one JSON object; `conn` is the connection's part, when there is one.
@@ -1313,6 +1315,20 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                             shared.set_active(name, 0);
                             queue_due = Some(Instant::now() + Duration::from_secs(2));
                             forward = None;
+                        } else if code == "replaced" && last_replaced.map(|t| t.elapsed() > Duration::from_secs(15 * 60)).unwrap_or(true) {
+                            // 2026-11-18 21:43Z: the ladder said "replaced" to spy-master's only
+                            // connection, right after a reset and a resume; no other client
+                            // existed and the bot sat halted for half an hour. The first time in
+                            // fifteen minutes it is taken for the ladder's confusion over the
+                            // reset: wait a minute and connect again. A second time halts it.
+                            last_replaced = Some(Instant::now());
+                            log_line(root, "WARN", &format!("{name}: the ladder said another connection took over (replaced); none of ours did, so it connects again in 60 s (a second time within 15 min halts it)"));
+                            let _ = ws.close(None);
+                            flow.in_match = false;
+                            shared.set_active(name, 0);
+                            down_why = "the ladder said another connection took over (replaced); trying again in 60 s".into();
+                            backoff = Duration::from_secs(60);
+                            continue 'outer;
                         } else if FATAL_CODES.contains(&code.as_str()) {
                             if let Some(e) = engine.as_mut() {
                                 e.push(&text, false);
