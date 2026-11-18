@@ -1,0 +1,6 @@
+{
+  "default": { "name": "matrix-6", "frost_combo": 8, "frost_wait_cost": 4 },
+  "opponents": {
+    "house-ts-starter": { "name": "matrix-5" }
+  }
+}

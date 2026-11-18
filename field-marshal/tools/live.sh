@@ -22,8 +22,13 @@ if [ -f data/releases/field-marshal-use-fleet ] && [ -x data/releases/live/marsh
   [ -f data/releases/live.env ] && source data/releases/live.env
   version="$(tr -d '[:space:]' < field-marshal/versions/field-marshal)"
   echo "$(date '+%F %T') starting field-marshal $version from fleet release ${RELEASE:-?}"
+  # The flagship's own playbook: what the scouts' ladder games have earned it. The scouts'
+  # control arm stays on the release's default.json, so an experiment's baseline never
+  # moves when the flagship is promoted.
+  book="$rel/playbooks/default.json"
+  [ -f field-marshal/playbooks/flagship.json ] && book="field-marshal/playbooks/flagship.json"
   exec /usr/bin/caffeinate -i "$rel/marshal" --bot field-marshal --version "$version" \
-    --playbooks "$rel/playbooks/default.json" --log-dir logs/field-marshal --token-file bots/field-marshal \
+    --playbooks "$book" --log-dir logs/field-marshal --token-file bots/field-marshal \
     --fleet-db data/fleet.db --release "${RELEASE:-unknown}" --ours "$ours"
 fi
 rel="data/releases/field-marshal-current"
