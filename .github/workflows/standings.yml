@@ -1,0 +1,40 @@
+# Fetches the ladder's standings and our bots' ratings from GitHub's network every five
+# minutes and keeps them as one small file on the `standings` branch (a single commit,
+# replaced each run). The machine the bots play from reads that file; it makes no HTTP
+# request to the ladder itself.
+name: Ladder standings
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: standings
+  cancel-in-progress: true
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out the fetch script
+        uses: actions/checkout@v4
+        with:
+          sparse-checkout: fleet/tools
+      - name: Fetch standings
+        run: mkdir out && python3 fleet/tools/fetch_standings.py --out out/standings.json
+      - name: Publish to the standings branch
+        working-directory: out
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git init -q -b standings
+          git config user.name "standings-collector"
+          git config user.email "standings-collector@users.noreply.github.com"
+          git add standings.json
+          git commit -q -m "standings at $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" standings
