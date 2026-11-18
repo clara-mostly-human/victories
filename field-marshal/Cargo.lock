@@ -83,6 +83,7 @@ name = "conformance"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "marshal",
  "serde_json",
  "victris-engine",
 ]

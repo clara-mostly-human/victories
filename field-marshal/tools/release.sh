@@ -11,7 +11,7 @@ cd "$(dirname "$0")/.."
 version="$(tr -d '[:space:]' < versions/field-marshal)"
 sha="$(git rev-parse --short HEAD)"
 git diff --quiet HEAD -- crates playbooks versions || sha="$sha-dirty"
-cargo build --release -p marshal
+nice -n 15 cargo build --release -p marshal -j 4
 rel="../data/releases/field-marshal-$version-$sha"
 mkdir -p "$rel/playbooks"
 cp target/release/marshal "$rel/marshal"

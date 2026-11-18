@@ -103,6 +103,12 @@ pub struct Playbook {
     /// search: hard limit in ms on the second tick's deepening; turns not reached by then
     /// are left out of the choice
     pub hard_ms: u64,
+    /// search: in rollouts, each side takes the hit the other cannot avoid (a close shot
+    /// or a slam on a fighter that cannot move), instead of only dodging
+    pub rollout_punish: bool,
+    /// value of closing in while the opponent's shot is on cooldown and ours is ready,
+    /// per tile gained: the proactive half of the tempo game
+    pub press_bonus: f64,
     /// search: weight of the fitted tempo evaluation at the leaves (0 = off)
     pub tempo_weight: f64,
     /// cost of ending a step (so with no step next tick) within `stuck_range` tiles of an
@@ -160,7 +166,9 @@ impl Default for Playbook {
             inner_cols: 3,
             think_ms: 0,
             threads: 1,
-            hard_ms: 350,
+            hard_ms: 250,
+            rollout_punish: false,
+            press_bonus: 0.0,
             tempo_weight: 1.0,
             stuck_penalty: 0.0,
             stuck_range: 3,
@@ -199,6 +207,7 @@ impl Playbook {
         f("slam_risk", &mut p.slam_risk);
         f("stuck_penalty", &mut p.stuck_penalty);
         f("tempo_weight", &mut p.tempo_weight);
+        f("press_bonus", &mut p.press_bonus);
         let u = |k: &str| v.get(k).and_then(Value::as_u64);
         if let Some(x) = u("depth") {
             p.depth = x as u32;
@@ -230,7 +239,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -362,17 +371,24 @@ fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
             break;
         }
         let base = s;
-        let sum = e.step(&mut s, &[RawTurn::IDLE, RawTurn::IDLE]);
+        // What each side does unprompted: nothing, or with the punish policy the free
+        // hit when the other cannot move.
+        let mut plan = [RawTurn::IDLE, RawTurn::IDLE];
+        if pb.rollout_punish {
+            plan = [quick_turn(e, &base, 0), quick_turn(e, &base, 1)];
+        }
+        let sum = e.step(&mut s, &plan);
         *sims += 1;
         if sum.hp_lost == [0, 0] {
             continue;
         }
-        // Someone would be hit standing still: let whoever can step look for a way out.
-        let mut dodge = [RawTurn::IDLE, RawTurn::IDLE];
+        // Someone would be hit: whoever can still step, and was not already moving,
+        // looks for a way out (keeping any attack it had planned).
+        let mut dodge = plan;
         let mut any = false;
         for x in 0..2 {
             let f = &base.fighters[x];
-            if sum.hp_lost[x] == 0 || f.state != FState::Idle || f.cd_move != 0 {
+            if sum.hp_lost[x] == 0 || f.state != FState::Idle || f.cd_move != 0 || plan[x].mv != victris_engine::turn::DirIn::None {
                 continue;
             }
             for d in 0..8u8 {
@@ -381,11 +397,11 @@ fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
                 }
                 let mut trial = base;
                 let mut t2 = dodge;
-                t2[x] = RawTurn::step(d);
+                t2[x].mv = victris_engine::turn::DirIn::Dir(d);
                 let r = e.step(&mut trial, &t2);
                 *sims += 1;
                 if r.hp_lost[x] == 0 {
-                    dodge[x] = RawTurn::step(d);
+                    dodge[x].mv = victris_engine::turn::DirIn::Dir(d);
                     any = true;
                     break;
                 }
@@ -410,6 +426,65 @@ fn tick_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &
         v += pb.tempo_weight * victris_engine::tempo::value(e, &after_tick, me, &victris_engine::tempo::WEIGHTS) as f64;
     }
     (v, after_tick)
+}
+
+/// The turn a fighter takes in a rollout under the punish policy: the hit that cannot
+/// be avoided, if there is one, and otherwise nothing (it keeps its step in hand).
+/// Cheap by design: a few comparisons, no simulation.
+fn quick_turn(e: &Engine, s: &State, x: usize) -> RawTurn {
+    let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
+    if f.state != FState::Idle || !o.alive {
+        return RawTurn::IDLE;
+    }
+    let d = chebyshev(f.pos, o.pos);
+    let stuck = o.state != FState::Idle || o.cd_move > 0;
+    if !stuck || d > 3 {
+        return RawTurn::IDLE;
+    }
+    let mut shot = None;
+    let mut burst = None;
+    for (i, a) in e.rules.attacks.iter().enumerate() {
+        if f.cd_attack[i] != 0 {
+            continue;
+        }
+        match a.kind {
+            AttackKind::Projectile { .. } if shot.is_none() => shot = Some(i as u8),
+            AttackKind::Burst { push } if burst.is_none() => burst = Some((i as u8, push)),
+            _ => {}
+        }
+    }
+    // Next to a fighter that cannot move, with a wall behind it: the slam.
+    if let Some((a, push)) = burst {
+        if d == 1 && !o.invulnerable {
+            if let Some(dir) = octant(f.pos, o.pos) {
+                let mut p = o.pos;
+                for _ in 0..push {
+                    if e.map.step_blocked(p, dir) {
+                        return RawTurn::IDLE.with_burst(a);
+                    }
+                    p = add(p, DIR_VEC[dir as usize]);
+                }
+            }
+        }
+    }
+    if let Some(a) = shot {
+        if !e.map.has_line_of_sight(f.pos, o.pos) {
+            return RawTurn::IDLE;
+        }
+        // Within two tiles the shot lands this tick; from three, step in and fire.
+        if d <= 2 {
+            return RawTurn::IDLE.with_attack(a, o.pos);
+        }
+        if f.cd_move == 0 {
+            let want = [(o.pos[0] - f.pos[0]).signum(), (o.pos[1] - f.pos[1]).signum()];
+            if let Some(dir) = (0..8u8).find(|i| DIR_VEC[*i as usize] == want) {
+                if !e.map.step_blocked(f.pos, dir) {
+                    return RawTurn::step(dir).with_attack(a, o.pos);
+                }
+            }
+        }
+    }
+    RawTurn::IDLE
 }
 
 fn cell_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Playbook, sims: &mut u32) -> f64 {
@@ -827,6 +902,15 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                     place -= pb.stuck_penalty;
                 }
             }
+            // Their shot is spent for a few ticks and ours is not: this is when to close in,
+            // so that we are within two tiles when they next cannot step.
+            if pb.press_bonus > 0.0 {
+                let their_shot_away = k.ranged.map(|a| en.cd_attack[a as usize] >= 3).unwrap_or(false);
+                let ours_soon = k.ranged.map(|a| my.cd_attack[a as usize] <= 2).unwrap_or(false);
+                if their_shot_away && ours_soon && d >= 2 && d < dist_now {
+                    place += pb.press_bonus * (dist_now - d) as f64;
+                }
+            }
             // Within two tiles a shot lands the tick it is fired: be there only with the tempo.
             if d <= 2 && k.ranged.map(|a| en.cd_attack[a as usize] <= 1).unwrap_or(false) {
                 place -= if can_step_next { 2.0 } else { 6.0 };
@@ -955,6 +1039,10 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             order.truncate(pb.deepen);
             // One of our turns played a tick further against every reply, the replies
             // shared out over the search threads. `depth` counts ticks after the first.
+            // The hard stop is checked before every cell: past it, a cell keeps the value the
+            // one-tick solve gave it. A busy machine costs lookahead, never a missed tick.
+            let hard_stop = started + std::time::Duration::from_millis(pb.hard_ms.max(1));
+            let payoff = &payoff;
             let deepen_row = |m: usize, depth: u32, deadline: Option<Instant>, out: &mut [f64]| -> u32 {
                 let (mine, merit, _) = cands[m];
                 let threads = pb.threads.clamp(1, 16).min(cols.max(1));
@@ -970,6 +1058,10 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                             scope.spawn(move || {
                                 let mut n = 0u32;
                                 for (j, slot) in part.iter_mut().enumerate() {
+                                    if Instant::now() >= hard_stop {
+                                        *slot = payoff[m * cols + i * chunk + j];
+                                        continue;
+                                    }
                                     let (reply, their_cost) = theirs[i * chunk + j];
                                     let (v1, s1) = tick_value(e, &s, me, &turns(mine, reply), pb, 0, false, &mut n);
                                     let later = if s1.result.is_none() { subgame_value(e, &s1, me, pb, k, depth, deadline, &mut n) } else { 0.0 };
@@ -986,9 +1078,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 total
             };
             let mut deep = vec![0.0f64; order.len() * cols];
-            // A hard stop for the second tick too: a crowded position on a busy machine
-            // must not turn into a missed deadline. Rows not reached are dropped.
-            let hard_stop = started + std::time::Duration::from_millis(pb.hard_ms.max(1));
+            // Rows not started before the hard stop are dropped from the choice.
             let mut reached = 0;
             for (i, &m) in order.iter().enumerate() {
                 if i > 0 && Instant::now() >= hard_stop {

@@ -8,3 +8,4 @@ publish.workspace = true
 victris-engine = { path = "../engine" }
 serde_json = "1"
 flate2 = "1"
+marshal = { path = "../bot" }
