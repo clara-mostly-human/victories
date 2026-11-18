@@ -11,7 +11,9 @@ if [ ! -f "../bots/$name" ]; then
   echo "no token file bots/$name: the bot must be registered first" >&2
   exit 2
 fi
-version="$(tr -d '[:space:]' < "versions/$name" 2>/dev/null || tr -d '[:space:]' < versions/default)"
+vfile="versions/$name"
+[ -f "$vfile" ] || vfile="versions/default"
+version="$(tr -d '[:space:]' < "$vfile")"
 [ -x target/release/marshal ] || cargo build --release -p marshal
 echo "$(date '+%F %T') starting $name as $version"
 # caffeinate -i keeps the Mac from idling into sleep while the bot runs.
