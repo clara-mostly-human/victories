@@ -45,6 +45,7 @@ struct Cell {
     swing: f64,
     /// dashes by the target, by ticks since the launch (index 0 = the launch tick)
     dash_at: [u32; 8],
+    target_shot_hit: u32,
 }
 
 struct Launch {
@@ -57,6 +58,15 @@ struct Launch {
     slowed: bool,
     shot_hit: bool,
     dash_at: Option<usize>,
+    /// where the burst sits
+    pos: [i32; 2],
+    radius: i32,
+    /// the target's dash state at launch
+    dash: &'static str,
+    /// the target's first answer: dashed toward or away from the thrower, walked out, or stayed
+    answer: Option<&'static str>,
+    /// the target hit the thrower with a shot before the burst went off or just after
+    target_shot_hit: bool,
 }
 
 fn main() {
@@ -149,6 +159,29 @@ fn main() {
             // What this tick did for bursts already in the air (and a shot or two after).
             for l in launches.iter_mut() {
                 let o = 1 - l.x;
+                if ti <= l.explodes && l.answer.is_none() {
+                    let (was, is) = (before.fighters[o].pos, s.fighters[o].pos);
+                    let thrower = before.fighters[l.x].pos;
+                    let dashed = events.iter().any(|ev| matches!(ev, Event::Dash { fighter, .. } if *fighter as usize == o + 1));
+                    if dashed {
+                        l.answer = Some(if chebyshev(is, thrower) < chebyshev(was, thrower) { "dashed toward the thrower" } else { "dashed away or sideways" });
+                    } else if ti == l.tick && !e.map.in_blast(l.pos, l.radius, is) {
+                        l.answer = Some("stepped clear as it was thrown");
+                    } else if ti > l.tick && was != is && e.map.in_blast(l.pos, l.radius, was) {
+                        l.answer = Some("walked out");
+                    } else if ti == l.explodes {
+                        l.answer = Some(if e.map.in_blast(l.pos, l.radius, is) { "stayed in it" } else { "other" });
+                    }
+                }
+                if ti > l.tick && ti <= l.explodes + 3 {
+                    for ev in &events {
+                        if let Event::Hit { attacker, attack, .. } = ev {
+                            if *attacker as usize == o + 1 && *attack as usize == ranged {
+                                l.target_shot_hit = true;
+                            }
+                        }
+                    }
+                }
                 if ti <= l.explodes {
                     if s.fighters[o].cd_move >= 3 {
                         l.slowed = true;
@@ -175,7 +208,7 @@ fn main() {
                 }
             }
             for ev in &events {
-                let Event::AreaSpawn { owner, attack, pos, .. } = ev else { continue };
+                let Event::AreaSpawn { owner, attack, pos, radius, .. } = ev else { continue };
                 let x = *owner as usize - 1;
                 if *attack as usize != frost || !counted[if received { 1 - x } else { x }] {
                     continue;
@@ -209,6 +242,11 @@ fn main() {
                     slowed: false,
                     shot_hit: false,
                     dash_at: None,
+                    pos: *pos,
+                    radius: *radius,
+                    dash,
+                    answer: None,
+                    target_shot_hit: false,
                 });
             }
         }
@@ -216,13 +254,16 @@ fn main() {
         for l in launches {
             let j = (l.tick + horizon).min(hp.len() - 1);
             let swing = ((hp[l.tick][1 - l.x] - hp[j][1 - l.x]) - (hp[l.tick][l.x] - hp[j][l.x])) as f64;
-            for k in &l.keys {
+            let mut keys = l.keys.clone();
+            keys.push(format!("answer | {} | {}", l.dash.trim_end(), l.answer.unwrap_or("game ended")));
+            for k in &keys {
                 let c = table.entry(k.clone()).or_default();
                 c.n += 1;
                 c.hit += l.hit as u32;
                 c.dashed += l.dashed as u32;
                 c.slowed += l.slowed as u32;
                 c.shot_hit += l.shot_hit as u32;
+                c.target_shot_hit += l.target_shot_hit as u32;
                 c.swing += swing;
                 if let Some(at) = l.dash_at {
                     c.dash_at[at] += 1;
@@ -241,13 +282,13 @@ fn main() {
     }
     println!("{games} games, {fighter_games} counted fighter-games; swing = hp gained on the opponent over the next {horizon} ticks");
     println!(
-        "{:<44} {:>7} {:>8} {:>6} {:>12} {:>13} {:>9} {:>7}   {}",
-        "situation at launch", "bursts", "per game", "hit", "target dash", "target slowed", "shot hit", "swing", "target's dash, ticks after launch 0..6"
+        "{:<60} {:>7} {:>8} {:>6} {:>12} {:>13} {:>9} {:>7}   {}",
+        "situation at launch", "bursts", "per game", "hit", "target dash", "target slowed", "shot hit", "swing", "target's shot hit; target's dash, ticks after launch 0..6"
     );
     let pct = |a: u32, b: u32| if b == 0 { 0.0 } else { 100.0 * a as f64 / b as f64 };
     for (k, c) in &table {
         println!(
-            "{:<44} {:>7} {:>8.2} {:>5.0}% {:>11.0}% {:>12.0}% {:>8.0}% {:>+7.1}   {:?}",
+            "{:<60} {:>7} {:>8.2} {:>5.0}% {:>11.0}% {:>12.0}% {:>8.0}% {:>+7.1}   {:>3.0}%  {:?}",
             k,
             c.n,
             c.n as f64 / fighter_games.max(1) as f64,
@@ -256,6 +297,7 @@ fn main() {
             pct(c.slowed, c.n),
             pct(c.shot_hit, c.n),
             c.swing / c.n.max(1) as f64,
+            pct(c.target_shot_hit, c.n),
             &c.dash_at[..7]
         );
     }

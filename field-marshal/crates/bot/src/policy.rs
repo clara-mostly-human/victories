@@ -1233,7 +1233,16 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                         victris_engine::rules::AttackKind::Area { fuse, .. } => fuse,
                         _ => 0,
                     };
-                    let timing = if en.cd_dash > fuse { pb.frost_combo } else { -pb.frost_wait_cost };
+                    // The bonus is for a burst thrown from where we stand or step. Paid on a
+                    // dash as well, it had us dash after every opponent that dashed away
+                    // (20 dashes a game in self-play against 7).
+                    let timing = if en.cd_dash <= fuse {
+                        -pb.frost_wait_cost
+                    } else if *kind == 2 {
+                        0.0
+                    } else {
+                        pb.frost_combo
+                    };
                     (mv.with_attack(a, en.pos), pb.frost_cost, pb.frost_value + timing, "frostburst")
                 }
             };

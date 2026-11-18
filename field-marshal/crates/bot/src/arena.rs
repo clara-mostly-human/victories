@@ -21,6 +21,9 @@ pub struct GameResult {
     /// prediction mismatches of the two trackers (should stay zero)
     pub mismatches: u32,
     pub sims: u64,
+    /// per seat: damage dealt by ranged, area, burst, wall slam; zone damage taken;
+    /// bursts thrown (areas); dashes; shots fired
+    pub stats: [[u32; 8]; 2],
 }
 
 /// Plays one game. `books[i]` is the playbook of fighter index `i`.
@@ -44,11 +47,44 @@ pub fn play(engine: &Engine, seed: i64, books: [&Playbook; 2]) -> GameResult {
                 }
             }
             let d = decide(&trackers[i], &view, books[i]);
+            // ARENA_DASHLOG=1: one line for every dash, to see what the dashes are for.
+            if matches!(d.turn.dash, victris_engine::turn::DirIn::Dir(_)) && std::env::var_os("ARENA_DASHLOG").is_some() {
+                let (me, en) = (&s.fighters[i], &s.fighters[1 - i]);
+                let frosted = s.areas().iter().any(|b| b.owner as usize != i && engine.map.in_blast(b.pos, b.radius, me.pos));
+                let with = match d.turn.attack {
+                    victris_engine::turn::AttackIn::Named { attack, .. } => engine.rules.attacks[attack as usize].name.as_str(),
+                    _ => "-",
+                };
+                eprintln!(
+                    "dash {} tick {} note '{}' with {} | enemy seen {} dist {} their dash cd {} | in their frost {} | hp {} vs {}",
+                    books[i].name, view.tick, d.note, with, view.enemy.is_some(), victris_engine::geom::chebyshev(me.pos, en.pos), en.cd_dash, frosted, me.hp, en.hp
+                );
+            }
             out.sims += d.sims as u64;
             turns[i] = d.turn;
             prev[i] = Some(d.turn);
         }
         engine.step_events(&mut s, &turns, &mut events);
+        for ev in &events {
+            use victris_engine::events::Event;
+            use victris_engine::rules::AttackKind;
+            match ev {
+                Event::Hit { attacker, attack, damage, .. } => {
+                    let k = match engine.rules.attacks[*attack as usize].kind {
+                        AttackKind::Projectile { .. } => 0,
+                        AttackKind::Area { .. } => 1,
+                        AttackKind::Burst { .. } => 2,
+                    };
+                    out.stats[*attacker as usize - 1][k] += *damage as u32;
+                }
+                Event::WallSlam { attacker, damage, .. } => out.stats[*attacker as usize - 1][3] += *damage as u32,
+                Event::ZoneDamage { fighter, damage } => out.stats[*fighter as usize - 1][4] += *damage as u32,
+                Event::AreaSpawn { owner, .. } => out.stats[*owner as usize - 1][5] += 1,
+                Event::Dash { fighter, .. } => out.stats[*fighter as usize - 1][6] += 1,
+                Event::ProjectileSpawn { owner, .. } => out.stats[*owner as usize - 1][7] += 1,
+                _ => {}
+            }
+        }
     }
     let r = s.result.unwrap();
     out.winner = r.winner.map(|w| (w - 1) as usize);
@@ -65,6 +101,8 @@ pub struct Tally {
     pub ticks: u64,
     pub mismatches: u32,
     pub sims: u64,
+    /// the game statistics of `GameResult::stats`, summed for A and for B
+    pub stats: [[u64; 8]; 2],
 }
 
 impl Tally {
@@ -76,6 +114,11 @@ impl Tally {
         self.ticks += o.ticks;
         self.mismatches += o.mismatches;
         self.sims += o.sims;
+        for x in 0..2 {
+            for k in 0..8 {
+                self.stats[x][k] += o.stats[x][k];
+            }
+        }
     }
     /// A's score per game (win 1, draw 1/2) and the half-width of its 95% interval.
     pub fn score(&self) -> (f64, f64) {
@@ -109,6 +152,12 @@ pub fn run_match(a: &Playbook, b: &Playbook, pairs: u32, first_seed: i64, thread
                         t.ticks += g.ticks as u64;
                         t.mismatches += g.mismatches;
                         t.sims += g.sims;
+                        for seat in 0..2 {
+                            let side = if (seat == 0) != swapped { 0 } else { 1 };
+                            for k in 0..8 {
+                                t.stats[side][k] += g.stats[seat][k] as u64;
+                            }
+                        }
                         match g.winner {
                             None => t.draws += 1,
                             Some(w) if (w == 0) != swapped => t.a_wins += 1,
