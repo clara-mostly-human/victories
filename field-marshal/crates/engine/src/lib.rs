@@ -15,6 +15,7 @@ pub mod hash;
 pub mod map;
 pub mod mcts;
 pub mod models;
+pub mod models_own;
 pub mod movefeat;
 pub mod observe;
 pub mod replay;

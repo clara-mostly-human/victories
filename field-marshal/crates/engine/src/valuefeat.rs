@@ -11,7 +11,10 @@ use crate::rules::AttackKind;
 use crate::state::{FState, State, NO_BUFF};
 use crate::Engine;
 
-pub const NV: usize = 23;
+pub const NV: usize = 31;
+/// The first features, which the first generations of the judgment were fitted on; the
+/// rest (`EXTENDED`) cost more to compute and are skipped when their weights are all zero.
+pub const BASIC: usize = 23;
 
 fn wall_behind(e: &Engine, from: P, threat: P, reach: i32) -> bool {
     let Some(dir) = octant(threat, from) else { return false };
@@ -25,8 +28,8 @@ fn wall_behind(e: &Engine, from: P, threat: P, reach: i32) -> bool {
     false
 }
 
-/// The vector of fighter `x`.
-pub fn phi(e: &Engine, s: &State, x: usize) -> [f32; NV] {
+/// The vector of fighter `x`; with `extended` off the features past `BASIC` are left at zero.
+pub fn phi(e: &Engine, s: &State, x: usize, extended: bool) -> [f32; NV] {
     let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
     let b = |v: bool| v as i32 as f32;
     let cd = |pred: &dyn Fn(&AttackKind) -> bool| -> i32 {
@@ -57,7 +60,8 @@ pub fn phi(e: &Engine, s: &State, x: usize) -> [f32; NV] {
         }
     }
     let idle = f.state == FState::Idle;
-    [
+    let mut out = [0.0f32; NV];
+    out[..BASIC].copy_from_slice(&[
         hp,
         buff as f32 / 50.0,
         b(shot == 0),
@@ -81,12 +85,58 @@ pub fn phi(e: &Engine, s: &State, x: usize) -> [f32; NV] {
         b((3..=4).contains(&d) && shot == 0),
         b(d <= 3 && f.cd_dash == 0),
         hp * hp,
-    ]
+    ]);
+    if !extended {
+        return out;
+    }
+    // The opponent's cooldowns, as it threatens us.
+    let ocd = |pred: &dyn Fn(&AttackKind) -> bool| -> i32 {
+        e.rules.attacks.iter().enumerate().filter(|(_, a)| pred(&a.kind)).map(|(i, _)| o.cd_attack[i]).min().unwrap_or(99)
+    };
+    let their_burst = ocd(&|k| matches!(k, AttackKind::Burst { .. }));
+    let push = e.rules.attacks.iter().find_map(|a| if let AttackKind::Burst { push } = a.kind { Some(push) } else { None }).unwrap_or(0);
+    let pinned = push > 0 && wall_behind(e, f.pos, o.pos, push);
+    let sees = d <= e.rules.sight_radius && e.map.has_line_of_sight(f.pos, o.pos);
+    let (dx, dy) = ((f.pos[0] - o.pos[0]) as f64, (f.pos[1] - o.pos[1]) as f64);
+    let flight = ((dx * dx + dy * dy).sqrt() / 2.0).ceil() as i32;
+    let their_shot = e.rules.attacks.iter().find(|a| matches!(a.kind, AttackKind::Projectile { .. })).map(|a| a.damage).unwrap_or(0);
+    let their_hit = if o.power_until == NO_BUFF { their_shot } else { their_shot * 3 / 2 };
+    // Who is nearer to a pad that is there or back within 15 ticks: 1 when we are 3 or more nearer.
+    let (mut race_power, mut race_health) = (0.0f32, 0.0f32);
+    for (pi, def) in e.map.pads.iter().enumerate() {
+        if !(s.pads[pi].available || s.pads[pi].respawn_tick - s.tick <= 15) {
+            continue;
+        }
+        let lead = (chebyshev(o.pos, def.pos) - chebyshev(f.pos, def.pos)).clamp(0, 3) as f32 / 3.0;
+        match def.kind {
+            PadKind::Power if f.power_until == NO_BUFF => race_power = race_power.max(lead),
+            PadKind::Health => race_health = race_health.max(lead * (1.0 - hp)),
+            _ => {}
+        }
+    }
+    out[BASIC..].copy_from_slice(&[
+        // a wall slam on us is there for the taking, or one dash away
+        b(pinned && d <= 2 && their_burst <= 1 && o.state == FState::Idle && f.state != FState::Stunned),
+        b(pinned && (3..=5).contains(&d) && their_burst <= 2 && o.cd_dash <= 1),
+        // our shot is ready and the opponent cannot get out of its way
+        b(shot == 0 && sees && (o.state != FState::Idle || (o.cd_move >= flight && o.cd_dash >= flight))),
+        b(shot == 0 && sees && d >= 5),
+        // one or two of their shots from dead
+        b(f.hp <= their_hit),
+        b(f.hp <= 2 * their_hit),
+        race_power,
+        race_health,
+    ]);
+    out
 }
 
 /// The difference of the two fighters' vectors, from `x`'s point of view.
 pub fn diff(e: &Engine, s: &State, x: usize) -> [f32; NV] {
-    let (a, b) = (phi(e, s, x), phi(e, s, 1 - x));
+    diff_with(e, s, x, true)
+}
+
+fn diff_with(e: &Engine, s: &State, x: usize, extended: bool) -> [f32; NV] {
+    let (a, b) = (phi(e, s, x, extended), phi(e, s, 1 - x, extended));
     let mut out = [0.0; NV];
     for i in 0..NV {
         out[i] = a[i] - b[i];
@@ -96,5 +146,6 @@ pub fn diff(e: &Engine, s: &State, x: usize) -> [f32; NV] {
 
 /// The judgment of the position for fighter `x`, in hp.
 pub fn value(e: &Engine, s: &State, x: usize, w: &[f32; NV]) -> f32 {
-    diff(e, s, x).iter().zip(w.iter()).map(|(a, b)| a * b).sum()
+    let extended = w[BASIC..].iter().any(|v| *v != 0.0);
+    diff_with(e, s, x, extended).iter().zip(w.iter()).map(|(a, b)| a * b).sum()
 }

@@ -147,6 +147,15 @@ pub struct Playbook {
     pub tree_lead: bool,
     /// the tree search's play-out at a leaf also plays a wall slam that is there for the taking
     pub tree_slam: bool,
+    /// the tree search's priors come from its own choices instead of the ladder bots'
+    pub tree_own_priors: bool,
+    /// tree search settings, for tuning offline: ticks of quiet play-out at a leaf (6),
+    /// the exploration constant (1.5), the share of the prior spread evenly (0.25)
+    pub tree_quiet: u32,
+    /// searches run side by side on this many threads, their visits added (1 = one search)
+    pub tree_threads: u32,
+    pub tree_c: f64,
+    pub tree_even: f64,
     /// weight (hp per unit of log probability) of the learned movement prior: how likely
     /// a strong bot is to hold, step toward, away, sideways or dash in our situation
     /// (`movemodel`, fitted on 922 replay games; it predicts 50% of their moves in unseen
@@ -287,6 +296,11 @@ impl Default for Playbook {
             tree_gen: 0,
             tree_lead: false,
             tree_slam: false,
+            tree_own_priors: false,
+            tree_quiet: 6,
+            tree_threads: 1,
+            tree_c: 1.5,
+            tree_even: 0.25,
             move_prior_weight: 0.0,
             attack_prior_weight: 0.0,
             rollout_punish: false,
@@ -338,6 +352,8 @@ impl Playbook {
         f("frost_wait_cost", &mut p.frost_wait_cost);
         f("move_prior_weight", &mut p.move_prior_weight);
         f("tree_value", &mut p.tree_value);
+        f("tree_c", &mut p.tree_c);
+        f("tree_even", &mut p.tree_even);
         f("pad_bonus", &mut p.pad_bonus);
         f("attack_prior_weight", &mut p.attack_prior_weight);
         f("dash_cost_frosted", &mut p.dash_cost_frosted);
@@ -384,7 +400,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -394,6 +410,12 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_fog").and_then(Value::as_i64) {
             p.tree_fog = x as i32;
+        }
+        if let Some(x) = v.get("tree_threads").and_then(Value::as_u64) {
+            p.tree_threads = x as u32;
+        }
+        if let Some(x) = v.get("tree_quiet").and_then(Value::as_u64) {
+            p.tree_quiet = x as u32;
         }
         if let Some(x) = v.get("tree_gen").and_then(Value::as_u64) {
             p.tree_gen = x as u32;
@@ -1200,22 +1222,58 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     // exact engine for `tree_ms`, and we play our most visited turn. Only with `search` on:
     // the gateway's quick fallback calls us with `search` off and wants the plain heuristic.
     let guessed = pb.tree_fog > 0 && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_fog).unwrap_or(s.tick <= pb.tree_fog);
-    if pb.tree_ms > 0 && pb.search && (visible || guessed) {
-        let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, ..Default::default() };
+    if pb.tree_ms > 0 && pb.search && (visible || guessed) && t.think_cap_ms(pb.tree_ms) >= 20 {
+        let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
         if pb.tree_value != 0.0 {
             cfg.buff_value = 0.0;
         }
-        let mut search = victris_engine::mcts::Search::new(e, cfg);
-        search.start();
-        let mut done = 0u32;
-        loop {
-            search.iterate(&s, [None, None], 1000);
-            done += 1000;
-            if started.elapsed().as_millis() as u64 >= pb.tree_ms {
-                break;
+        // The think time, cut down when the match budget could not carry it to the tick limit.
+        let deadline = t.think_cap_ms(pb.tree_ms);
+        let run = |cfg: victris_engine::mcts::Config| {
+            let mut search = victris_engine::mcts::Search::new(e, cfg);
+            search.start();
+            let mut done = 0u32;
+            loop {
+                search.iterate(&s, [None, None], 1000);
+                done += 1000;
+                if started.elapsed().as_millis() as u64 >= deadline {
+                    break;
+                }
             }
-        }
-        let root = search.result();
+            (search.result(), done)
+        };
+        let (root, done) = if pb.tree_threads <= 1 {
+            run(cfg)
+        } else {
+            // Several searches side by side, each with its own jitter on the root priors;
+            // the root's turns come out in the same order in each, so visits add up.
+            let results: Vec<_> = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..pb.tree_threads)
+                    .map(|k| {
+                        let mut c = cfg;
+                        c.noise_seed = if k == 0 { 0 } else { 0x9e3779b97f4a7c15u64.wrapping_mul(k as u64 + 1) ^ (s.tick as u64) };
+                        let run = &run;
+                        scope.spawn(move || run(c))
+                    })
+                    .collect();
+                handles.into_iter().filter_map(|h| h.join().ok()).collect()
+            });
+            let mut it = results.into_iter();
+            let Some((mut root, mut done)) = it.next() else { return idle };
+            for (r, d) in it {
+                done += d;
+                for x in 0..2 {
+                    for (a, b) in root.acts[x].iter_mut().zip(r.acts[x].iter()) {
+                        let n = a.1 + b.1;
+                        if n > 0 {
+                            a.2 = (a.2 * a.1 as f64 + b.2 * b.1 as f64) / n as f64;
+                        }
+                        a.1 = n;
+                    }
+                }
+            }
+            (root, done)
+        };
         let best = root.acts[me].iter().max_by_key(|a| a.1).copied();
         return match best {
             Some((turn, _, q)) => Decision { turn, sims: done, score: q, note: "tree" },

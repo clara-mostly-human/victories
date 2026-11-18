@@ -44,6 +44,20 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
     // as the value features (fighter 0 minus fighter 1) and the discounted hp fighter 0
     // went on to gain or lose from there (discount 0.98 a tick, 40 for a kill).
     let dumping = std::env::var_os("ARENA_DUMP").is_some();
+    // ARENA_REPLAYS=dir: every game is written there as a replay in the ladder's format
+    // (header, a line per tick with both turns, result), so the replay tools can read the
+    // search's own games. Plain .jsonl; gzip them afterwards for tools that expect .gz.
+    let mut replay: Option<String> = std::env::var_os("ARENA_REPLAYS").map(|_| {
+        let which = victris_engine::shipped::MAP_NAMES.iter().position(|n| *n == engine.map.name).unwrap_or(0);
+        let rules: Value = serde_json::from_str(victris_engine::shipped::RULES_JSON).unwrap_or(Value::Null);
+        let map: Value = serde_json::from_str(victris_engine::shipped::MAPS_JSON[which]).unwrap_or(Value::Null);
+        let name = |i: usize| books[i].map(|b| b.name.clone()).unwrap_or_else(|| "clone".to_string());
+        let header = serde_json::json!({
+            "type": "header", "replay_format": 1, "engine": victris_engine::ENGINE_VERSION, "rules": rules, "map_data": map,
+            "rules_hash": engine.rules.hash, "seed": seed, "bots": [{ "name": name(0) }, { "name": name(1) }],
+        });
+        format!("{header}\n")
+    });
     let mut trace: Vec<([f32; victris_engine::valuefeat::NV], f64)> = Vec::new();
     while s.result.is_none() {
         let before = (s.fighters[0].hp, s.fighters[1].hp);
@@ -103,6 +117,11 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
             turns[i] = d.turn;
             prev[i] = Some(d.turn);
         }
+        if let Some(text) = replay.as_mut() {
+            let line = serde_json::json!({ "type": "tick", "tick": s.tick, "turns": {
+                "1": crate::session::turn_json(s.tick, &turns[0], engine), "2": crate::session::turn_json(s.tick, &turns[1], engine) } });
+            text.push_str(&format!("{line}\n"));
+        }
         engine.step_events(&mut s, &turns, &mut events);
         if let Some(f) = feats {
             let mut r = ((s.fighters[0].hp.max(0) - before.0) - (s.fighters[1].hp.max(0) - before.1)) as f64;
@@ -156,6 +175,14 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
         }
     }
     let r = s.result.unwrap();
+    if let (Some(mut text), Some(dir)) = (replay, std::env::var_os("ARENA_REPLAYS")) {
+        static WRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        text.push_str(&format!("{}\n", serde_json::json!({ "type": "result", "winner": r.winner, "reason": format!("{:?}", r.reason).to_lowercase(), "final_tick": r.final_tick })));
+        let path = std::path::Path::new(&dir).join(format!("{}-{:04}-{}-{}.jsonl", std::process::id(), n, engine.map.name, seed));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(path, text);
+    }
     out.winner = r.winner.map(|w| (w - 1) as usize);
     out.ticks = r.final_tick + 1;
     out

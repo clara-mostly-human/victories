@@ -16,6 +16,7 @@
 
 use crate::geom::{add, chebyshev, DIR_VEC, P};
 use crate::models::{move_probs, yes_prob, BURST_WEIGHTS, FROST_WEIGHTS, SHOT_WEIGHTS, SPENT_WEIGHTS};
+use crate::models_own as own;
 use crate::movefeat::features;
 use crate::observe::can_see;
 use crate::rules::AttackKind;
@@ -45,6 +46,11 @@ pub struct Config {
     pub lead: bool,
     /// the quiet play-out at a leaf also plays a wall slam that is there for the taking
     pub quiet_slam: bool,
+    /// the priors come from the search's own choices (`models_own`) instead of the ladder bots'
+    pub own_priors: bool,
+    /// not 0: the priors at the root are jittered from this seed, so that several searches
+    /// run side by side on separate threads grow different trees (their visits are added)
+    pub noise_seed: u64,
     /// nodes fewer than this many ticks below the root order forcing turns first
     /// (0 = off: at 150 ms a move it scored 8 of 18 against 10 of 18 without, so it is
     /// off until it earns its place)
@@ -53,7 +59,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, lead: false, quiet_slam: false, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, lead: false, quiet_slam: false, own_priors: false, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -79,7 +85,7 @@ struct Node {
 /// hurt or stun the opponent at once if it stands still are tried first, the way a chess
 /// engine tries captures and checks first; this costs one engine step per turn, so it is
 /// used only near the root.
-pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: bool) -> Vec<Act> {
+pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: bool, own: bool) -> Vec<Act> {
     let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
     let idle = vec![Act { turn: RawTurn::IDLE, prior: 1.0, n: 0, w: 0.0 }];
     if f.state != FState::Idle || !f.alive || !o.alive {
@@ -108,9 +114,9 @@ pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: 
     let class_p: [f32; 5] = if !seen {
         [0.3, 0.4, 0.1, 0.15, 0.05]
     } else if f.cd_move == 0 {
-        move_probs(&feat)
+        if own { crate::models::move_probs_with(&own::MOVE_OWN, &feat) } else { move_probs(&feat) }
     } else {
-        let dash = yes_prob(&SPENT_WEIGHTS, &feat);
+        let dash = yes_prob(if own { &own::SPENT_OWN } else { &SPENT_WEIGHTS }, &feat);
         [1.0 - dash, 0.0, 0.0, 0.0, dash]
     };
     let mut count = [0usize; 5];
@@ -130,9 +136,10 @@ pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: 
         }).map(|(i, _)| i as u8)
     };
     let (shot, frost, burst) = (ready(0), ready(1), ready(2));
-    let ps = if shot.is_some() { yes_prob(&SHOT_WEIGHTS, &feat) } else { 0.0 };
-    let pb = if burst.is_some() { yes_prob(&BURST_WEIGHTS, &feat) } else { 0.0 };
-    let pf = if frost.is_some() { yes_prob(&FROST_WEIGHTS, &feat) } else { 0.0 };
+    let (ws, wb, wf) = if own { (&own::SHOT_OWN, &own::BURST_OWN, &own::FROST_OWN) } else { (&SHOT_WEIGHTS, &BURST_WEIGHTS, &FROST_WEIGHTS) };
+    let ps = if shot.is_some() { yes_prob(ws, &feat) } else { 0.0 };
+    let pb = if burst.is_some() { yes_prob(wb, &feat) } else { 0.0 };
+    let pf = if frost.is_some() { yes_prob(wf, &feat) } else { 0.0 };
     let attack_p = [(1.0 - ps) * (1.0 - pb) * (1.0 - pf), ps, (1.0 - ps) * pb, (1.0 - ps) * (1.0 - pb) * pf];
     let mut out: Vec<Act> = Vec::with_capacity(moves.len() * 4);
     for (mv, c) in &moves {
@@ -218,6 +225,14 @@ pub fn quiet_turn(e: &Engine, s: &State, x: usize, slam: bool) -> RawTurn {
                 turn = turn.with_attack(a as u8, o.pos);
             }
         }
+    }
+    // Nothing can hurt us this tick with the opponent idle unless one of its shots or bursts
+    // is out, or we stand outside the zone: skip the probes then (most ticks).
+    let threatened = s.projectiles().iter().any(|p| p.owner as usize != x)
+        || s.areas().iter().any(|a| a.owner as usize != x)
+        || chebyshev(f.pos, e.map.center) > s.zone_radius;
+    if !threatened {
+        return turn;
     }
     let pair = |mine: RawTurn| if x == 0 { [mine, RawTurn::IDLE] } else { [RawTurn::IDLE, mine] };
     let mut probe = *s;
@@ -355,12 +370,25 @@ impl<'a> Search<'a> {
                     for x in 0..2 {
                         self.nodes[node].acts[x] = match (depth, fixed[x]) {
                             (0, Some(t)) => vec![Act { turn: t, prior: 1.0, n: 0, w: 0.0 }],
-                            _ => actions(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead),
+                            _ => actions(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead, self.cfg.own_priors),
                         };
                     }
                     if depth > 0 {
                         leaf = leaf_value(self.e, &s, &self.cfg);
                         break;
+                    }
+                    if self.cfg.noise_seed != 0 {
+                        let mut rng = self.cfg.noise_seed | 1;
+                        for x in 0..2 {
+                            let acts = &mut self.nodes[node].acts[x];
+                            for a in acts.iter_mut() {
+                                a.prior *= 0.5 + crate::clone::next(&mut rng);
+                            }
+                            let sum: f32 = acts.iter().map(|a| a.prior).sum();
+                            for a in acts.iter_mut() {
+                                a.prior /= sum.max(1e-6);
+                            }
+                        }
                     }
                 }
                 let (i0, i1) = (self.select(node, 0), self.select(node, 1));

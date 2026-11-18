@@ -38,9 +38,14 @@ fn dot(w: &[f32; N], f: &[f32; N]) -> f32 {
 
 /// Probabilities of hold, toward, away, sideways, dash for a fighter whose step is ready.
 pub fn move_probs(f: &[f32; N]) -> [f32; CLASSES] {
+    move_probs_with(&MOVE_WEIGHTS, f)
+}
+
+/// As `move_probs`, with the weights given.
+pub fn move_probs_with(w: &[[f32; N]; CLASSES], f: &[f32; N]) -> [f32; CLASSES] {
     let mut z = [0.0f32; CLASSES];
     for c in 0..CLASSES {
-        z[c] = dot(&MOVE_WEIGHTS[c], f);
+        z[c] = dot(&w[c], f);
     }
     let m = z.iter().cloned().fold(f32::MIN, f32::max);
     let mut sum = 0.0;
@@ -71,13 +76,19 @@ pub fn move_probs_for(e: &Engine, s: &State, x: usize) -> [f32; CLASSES] {
 ///   1: 60 games of the plain search against itself at 60 ms a move (7,713 recorded
 ///      ticks); explains 21% of the outcome on held-out ticks; beat the plain search
 ///      26-3-1 and the matrix search 23-7 at 100 ms a move.
-pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 3] = [
-    [68.107, 8.515, 0.214, -0.175, 0.018, -2.188, 1.827, 0.474, 0.275, -1.223, -1.617, -3.328, 0.397, 4.701, -3.262, 3.726, 66.527, -1.036, 4.400, -1.397, 1.688, 2.439, -47.270],
+pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 5] = [
+    [68.107, 8.515, 0.214, -0.175, 0.018, -2.188, 1.827, 0.474, 0.275, -1.223, -1.617, -3.328, 0.397, 4.701, -3.262, 3.726, 66.527, -1.036, 4.400, -1.397, 1.688, 2.439, -47.270, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     // candidate 2: generation 0 and generation 1 self-play together (18,686 ticks; 23% held out)
-    [97.288, 8.504, 0.080, -0.270, -0.897, -2.520, 0.848, 0.840, 0.046, -2.435, -2.950, -3.410, 0.407, 4.994, -4.795, 5.348, 67.236, -2.006, 5.476, -1.142, 1.334, 3.055, -70.162],
+    [97.288, 8.504, 0.080, -0.270, -0.897, -2.520, 0.848, 0.840, 0.046, -2.435, -2.950, -3.410, 0.407, 4.994, -4.795, 5.348, 67.236, -2.006, 5.476, -1.142, 1.334, 3.055, -70.162, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     // candidate 3: both self-play sets and 48 games of generation 1 against the matrix
     // search (24,405 ticks; 22% held out)
-    [94.744, 8.624, -0.460, -0.819, -0.874, -3.256, 1.830, 0.855, 0.034, -1.848, -2.937, -3.787, 0.244, 5.477, -6.521, 5.484, 60.476, -2.517, 5.526, -1.171, 1.392, 3.227, -67.231],
+    [94.744, 8.624, -0.460, -0.819, -0.874, -3.256, 1.830, 0.855, 0.034, -1.848, -2.937, -3.787, 0.244, 5.477, -6.521, 5.484, 60.476, -2.517, 5.526, -1.171, 1.392, 3.227, -67.231, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    // candidate 4: all 31 features, fitted on the ladder replay corpus (2,181 games of
+    // every bot, 143,137 ticks; 19.5% on held-out games, 17.3% with the first 23 only)
+    [76.410, 16.295, -3.042, -2.009, 0.025, -6.961, 1.573, -1.244, 0.780, -0.572, -2.158, -5.206, -1.402, 2.125, -7.216, 2.487, 27.285, 3.150, 7.714, -2.349, 3.700, 3.863, -36.614, -7.476, -0.930, 5.753, 1.420, -1.479, -2.145, 6.429, 20.729],
+    // candidate 5: the same on the 598 corpus games between the ladder's top twenty
+    // (39,824 ticks; 18.4% on held-out games, 16.0% with the first 23 only)
+    [68.490, 13.161, -3.068, -2.987, -1.043, -6.870, 4.402, 0.354, 0.990, -0.503, -3.246, -5.923, -0.314, 1.565, -10.883, 6.253, 21.532, -0.318, 5.082, -1.599, 2.452, 4.149, -39.805, -5.800, 0.181, 4.517, 1.393, -4.482, -0.995, 5.079, 23.797],
 ];
 
 /// The weights of generation `gen` (1 is the first); 0 or a number past the end gives the latest.

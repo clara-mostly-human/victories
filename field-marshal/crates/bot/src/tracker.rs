@@ -110,6 +110,8 @@ pub struct Tracker {
     /// our own estimate of match budget spent, in ms: think time plus a network allowance
     /// per tick. The server charges both; this keeps long thinks from exhausting the match.
     spent_ms: std::cell::Cell<u64>,
+    /// the server's own figure for the match budget left, in ms, when the session passes it on
+    budget_left_ms: std::cell::Cell<Option<u64>>,
 }
 
 /// What a reply costs on top of thinking: network and server handling, as measured from
@@ -209,6 +211,7 @@ impl Tracker {
             dealt: [0, 0],
             enemy_dashes: 0,
             spent_ms: std::cell::Cell::new(0),
+            budget_left_ms: std::cell::Cell::new(None),
         })
     }
 
@@ -229,6 +232,7 @@ impl Tracker {
             dealt: [0, 0],
             enemy_dashes: 0,
             spent_ms: std::cell::Cell::new(0),
+            budget_left_ms: std::cell::Cell::new(None),
         }
     }
 
@@ -242,12 +246,20 @@ impl Tracker {
         self.spent_ms.set(self.spent_ms.get() + took.as_millis() as u64 + TICK_OVERHEAD_MS);
     }
 
+    /// Takes the server's `budget_ms_left` from the latest observation, so the think cap
+    /// follows what the server really charges.
+    pub fn note_budget_left(&self, ms: i64) {
+        self.budget_left_ms.set(Some(ms.max(0) as u64));
+    }
+
     /// The think cap for this tick: the playbook's, cut down when the match budget could
     /// not sustain it for the ticks that may remain.
     pub fn think_cap_ms(&self, wanted: u64) -> u64 {
         let rules = &self.engine.rules;
         let budget = rules.limits.match_budget_ms.max(0) as u64;
-        let left = budget.saturating_sub(self.spent_ms.get()).saturating_sub(BUDGET_RESERVE_MS);
+        // The server's figure when we have it: on a slow connection it charges far more a
+        // tick than our own estimate allows for.
+        let left = self.budget_left_ms.get().unwrap_or_else(|| budget.saturating_sub(self.spent_ms.get())).saturating_sub(BUDGET_RESERVE_MS);
         let tick = self.belief.map(|s| s.tick).unwrap_or(0).max(0);
         let ticks_left = (rules.max_ticks - tick).max(1) as u64;
         let sustainable = (left / ticks_left).saturating_sub(TICK_OVERHEAD_MS);
