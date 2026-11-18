@@ -172,6 +172,29 @@ CREATE TABLE IF NOT EXISTS sockets (
   replaced_socket INTEGER
 );
 CREATE INDEX IF NOT EXISTS sockets_bot ON sockets (bot, opened_ms);
+CREATE TABLE IF NOT EXISTS fights (
+  match_id TEXT NOT NULL,
+  bot TEXT NOT NULL,
+  source TEXT NOT NULL,
+  path TEXT NOT NULL,
+  bytes INTEGER,
+  raw_bytes INTEGER,
+  frames_in INTEGER,
+  frames_out INTEGER,
+  ticks INTEGER,
+  started_ms INTEGER,
+  ended_ms INTEGER,
+  result TEXT,
+  reason TEXT,
+  how TEXT,
+  lost_turns INTEGER,
+  sockets TEXT,
+  label TEXT,
+  release TEXT,
+  complete INTEGER,
+  PRIMARY KEY (match_id, bot, source)
+);
+CREATE INDEX IF NOT EXISTS fights_ended ON fights (ended_ms);
 CREATE TABLE IF NOT EXISTS gateway_state (
   bot TEXT PRIMARY KEY,
   ts_ms INTEGER NOT NULL,

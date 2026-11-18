@@ -8,6 +8,7 @@
 //!   fleet stop <bot> | resume <bot> | restart <bot>
 //!   fleet deploy <bot> <release> [--version vN] [--force "<reason>"]
 //!   fleet label <bot> <vN> [--release r]          the version label the gateway queues a bot under
+//!   fleet fights [--since 24h] | fights backfill [--day YYYY-MM-DD]   the fight records (data/fights)
 //!
 //!   fleet stats [--by opponent|version|release|playbook|arm|arm-tier|arm-remote|remote|connection|map|seat|bot|cell] [--bot b]
 //!               [--opponent o] [--version v] [--release r] [--experiment e] [--since 24h]
@@ -989,6 +990,41 @@ fn main_inner() -> Result<i32, String> {
             let id = a.word(2, "the release id")?;
             let version = release::deploy(&root, &store, &cfg, bot, id, a.get("--version"), a.get("--force"))?;
             println!("{bot} is set to run {id} as {version}");
+        }
+        "fights" => {
+            // The fight records: every match as the gateway saw it (and, for matches before
+            // it recorded them, an index into the bots' own logs).
+            match a.words.get(1).map(String::as_str) {
+                Some("backfill") => {
+                    let day = a.get("--day").map(str::to_string).unwrap_or_else(|| fleet::online::utc_stamp()[..10].to_string());
+                    let (added, seen) = fleet::fights::backfill(&root, &store, &cfg.names(), &day)?;
+                    println!("{seen} matches in the bots' logs for {day}; {added} indexed from the logs (the rest already had a record)");
+                }
+                _ => {
+                    let since = a.get("--since").map(since).transpose()?.unwrap_or(now_ms() - 86_400_000);
+                    let mut q = store
+                        .conn
+                        .prepare(
+                            "SELECT source, COUNT(*), SUM(complete), COALESCE(SUM(bytes), 0), COALESCE(SUM(raw_bytes), 0), COALESCE(SUM(ticks), 0), COALESCE(SUM(lost_turns), 0)
+                             FROM fights WHERE COALESCE(ended_ms, started_ms) >= ?1 GROUP BY source",
+                        )
+                        .map_err(e)?;
+                    let rows: Vec<(String, i64, i64, i64, i64, i64, i64)> =
+                        q.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))).map_err(e)?.filter_map(|r| r.ok()).collect();
+                    for (src, n, complete, bytes, raw, ticks, lost) in rows {
+                        let per = if n > 0 { bytes / n } else { 0 };
+                        println!(
+                            "{src:<9} {n:>5} matches ({complete} complete), {ticks} ticks, {lost} turns lost; {:.1} MB on disk, {:.0} KB a match{}",
+                            bytes as f64 / 1e6,
+                            per as f64 / 1e3,
+                            if raw > 0 { format!(", {:.0}x compressed", raw as f64 / bytes.max(1) as f64) } else { String::new() }
+                        );
+                    }
+                    if let Some(free) = fleet::fights::disk_free(&data_dir(&root)) {
+                        println!("disk free: {:.1} GB (records stop below {:.1} GB)", free as f64 / 1e9, fleet::fights::MIN_FREE_BYTES as f64 / 1e9);
+                    }
+                }
+            }
         }
         "label" => {
             // The gateway owns every bot's version label on the ladder and takes it from the

@@ -20,6 +20,7 @@
 pub mod autopilot;
 pub mod collect;
 pub mod config;
+pub mod fights;
 pub mod gateway;
 pub mod ingest;
 pub mod mock;

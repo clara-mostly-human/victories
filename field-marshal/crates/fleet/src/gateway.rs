@@ -827,6 +827,8 @@ struct Flow {
     /// the last tick seen before the connection dropped mid-match (to count the turns the
     /// ladder played idle for us until the match resumed)
     dropped_at_tick: Option<i64>,
+    /// the match as it passes, written to `data/fights` (see `fights`)
+    record: Option<crate::fights::FightRecord>,
 }
 
 /// Runs one bot until asked to stop: its connection to the ladder, the bot process attached
@@ -1132,6 +1134,17 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                 match kind.as_str() {
                     "hello" => {
                         let id = msg.get("match_id").and_then(Value::as_str).unwrap_or("").to_string();
+                        if flow.match_id.as_deref() == Some(id.as_str()) {
+                            if let Some(r) = flow.record.as_mut() {
+                                r.note("connected", json!({ "socket": this, "resumed": true, "remote": remote.to_string() }));
+                            }
+                        } else {
+                            if let Some(r) = flow.record.take() {
+                                r.finish("superseded by the next match", None);
+                            }
+                            let release = engine.as_ref().map(|e| e.release.clone()).unwrap_or_default();
+                            flow.record = crate::fights::FightRecord::open(root, name, &id, label.as_deref().unwrap_or("?"), &release, Some(this));
+                        }
                         if flow.match_id.as_deref() != Some(id.as_str()) || !flow.in_match {
                             if flow.match_id.as_deref() != Some(id.as_str()) {
                                 flow.dropped_at_tick = None;
@@ -1178,6 +1191,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         forward = Some((t, false));
                         if engine.is_none() {
                             // Nobody to say ready: say it, and play idle until a process attaches.
+                            if let Some(r) = flow.record.as_mut() {
+                                r.frame_out("gateway", r#"{"type":"ready"}"#);
+                            }
                             if let Err(why) = send(&mut ws, shared, json!({ "type": "ready" }).to_string()) {
                                 why_closed = why;
                                 break 'conn;
@@ -1200,14 +1216,14 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                                     tel().point(this, "wire_ms", (charge - took).max(0.0));
                                     if charge >= 1000.0 && took < 600.0 {
                                         lost += 1;
-                                        event(root, name, "turn_lost", json!({ "cause": "wire", "socket": this, "match": flow.match_id, "tick": t - 1, "turns": 1, "charge_ms": charge, "answer_ms": took.round() }));
+                                        { let d = json!({ "cause": "wire", "socket": this, "match": flow.match_id, "tick": t - 1, "turns": 1, "charge_ms": charge, "answer_ms": took.round() }); if let Some(r) = flow.record.as_mut() { r.note("turn_lost", d.clone()); } event(root, name, "turn_lost", d); }
                                     }
                                 }
                             }
                         }
                         if let (Some(old), Some(t)) = (flow.dropped_at_tick.take(), tick) {
                             if t - old > 1 {
-                                event(root, name, "turn_lost", json!({ "cause": "reset", "socket": this, "match": flow.match_id, "tick": old + 1, "turns": t - old - 1 }));
+                                { let d = json!({ "cause": "reset", "socket": this, "match": flow.match_id, "tick": old + 1, "turns": t - old - 1 }); if let Some(r) = flow.record.as_mut() { r.note("turn_lost", d.clone()); } event(root, name, "turn_lost", d); }
                             }
                         }
                         last_budget = budget;
@@ -1311,6 +1327,14 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     }
                     _ => {}
                 }
+                if let Some(r) = flow.record.as_mut() {
+                    r.frame_in(this, &text, msg.get("tick").and_then(Value::as_i64));
+                }
+                if kind == "end" {
+                    if let Some(r) = flow.record.take() {
+                        r.finish("end", Some(&msg));
+                    }
+                }
                 // The bot process sees every frame, so its own log and tracker stay whole.
                 if let Some((frame, is_obs)) = forward {
                     let gone = match engine.as_mut() {
@@ -1351,6 +1375,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     Some("ready") => {
                         if flow.in_match && !ready_sent {
                             ready_sent = true;
+                            if let Some(r) = flow.record.as_mut() {
+                                r.frame_out("process", &line);
+                            }
                             if let Err(why) = send(&mut ws, shared, line) {
                                 why_closed = why;
                                 break 'conn;
@@ -1399,6 +1426,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     }
                     // A turn for a tick already answered, or a stale one: never sent.
                     _ => continue,
+                }
+                if let Some(r) = flow.record.as_mut() {
+                    r.frame_out("process", &line);
                 }
                 if let Err(why) = send(&mut ws, shared, line) {
                     why_closed = why;
@@ -1467,7 +1497,10 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         _ => (json!({ "tick": tick }).to_string(), "idle_turn"),
                     };
                     // The turn was not the bot's own: its process was late, or there was none.
-                    event(root, name, "turn_lost", json!({ "cause": if engine.is_none() { "no process" } else { "late answer" }, "sent": kind, "socket": this, "match": flow.match_id, "tick": tick, "turns": 1, "waited_ms": waited.round() }));
+                    { let d = json!({ "cause": if engine.is_none() { "no process" } else { "late answer" }, "sent": kind, "socket": this, "match": flow.match_id, "tick": tick, "turns": 1, "waited_ms": waited.round() }); if let Some(r) = flow.record.as_mut() { r.note("turn_lost", d.clone()); } event(root, name, "turn_lost", d); }
+                    if let Some(r) = flow.record.as_mut() {
+                        r.frame_out("gateway", &frame);
+                    }
                     if let Err(why) = send(&mut ws, shared, frame) {
                         why_closed = why;
                         break 'conn;
@@ -1492,7 +1525,10 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                 if !ready_sent && at.elapsed() >= opt.ready_deadline {
                     // The process has not said ready; the ladder must not wait for it.
                     ready_sent = true;
-                    if let Err(why) = send(&mut ws, shared, json!({ "type": "ready" }).to_string()) {
+                    if let Some(r) = flow.record.as_mut() {
+                                r.frame_out("gateway", r#"{"type":"ready"}"#);
+                            }
+                            if let Err(why) = send(&mut ws, shared, json!({ "type": "ready" }).to_string()) {
                         why_closed = why;
                         break 'conn;
                     }
@@ -1504,6 +1540,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                     // The match did not come back: it ended while the connection was down.
                     resume_until = None;
                     event(root, name, "match_not_resumed", json!({ "match": flow.match_id, "tick": flow.tick }));
+                    if let Some(r) = flow.record.take() {
+                        r.finish("not resumed: the match ended while the connection was down", None);
+                    }
                     flow.in_match = false;
                     flow.last_hello = None;
                     flow.last_obs = None;
@@ -1763,6 +1802,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
         }
         if flow.in_match {
             flow.dropped_at_tick = flow.tick.or(flow.dropped_at_tick);
+            if let Some(r) = flow.record.as_mut() {
+                r.note("disconnected", json!({ "socket": this, "why": why_closed, "tick": flow.tick }));
+            }
         }
         if !voluntary {
             shared.note_reset();
@@ -1813,6 +1855,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
     }
     if let Some(s) = sid.take() {
         tel().socket_closed(s, "the gateway stopped");
+    }
+    if let Some(r) = flow.record.take() {
+        r.finish("the gateway stopped during the match", None);
     }
     shared.cancel_rotation(name);
     shared.set_active(name, 0);
