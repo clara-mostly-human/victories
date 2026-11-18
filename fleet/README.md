@@ -14,7 +14,15 @@ builds, `data/run/` pid files. Per-bot settings are in `fleet/bots.json` (in git
 ## Where to look
 
 - `fleet status` and `fleet online`: every bot, the live release, experiments, load and think times.
-- `data/status.html`: the same as a page, rewritten every five minutes on the Mac.
+- `http://Claras-Mac-mini.local:8787/` (or the Mac's address on the home network, port 8787):
+  the status page, live. `com.victris.fleet-status` (`fleet serve`) builds it from the store
+  on every request, so it is never older than the last finished game, and it reloads itself
+  every 20 seconds. It only reads the store and talks to nothing outside the Mac.
+- `data/status.html`: the same page as a file, rewritten every five minutes.
+- The hosted page (a claude.ai artifact) shows the same numbers from one document, written
+  by `fleet report` to `data/status/state.json` and pushed by a Claude session every ten
+  minutes. It deliberately does not ask the ladder for anything: a browser on the home
+  network loading ladder data is the leading suspect for the bots' dropped connections.
 - `fleet digest`: the last 24 hours in a few lines. A scheduled task in the Claude app
   (`victris-fleet-daily-digest`, every morning at about 08:10 local) runs it and pushes the
   first line to the phone.

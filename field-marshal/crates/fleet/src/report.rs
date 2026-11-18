@@ -472,3 +472,79 @@ pub fn write_csv(s: &Snapshot, dir: &Path) -> std::io::Result<()> {
     std::fs::write(dir.join("alerts.csv"), csv(&["n", "line"], s.alerts.iter().enumerate().map(|(i, l)| vec![(i + 1).to_string(), l.clone()]).collect()))?;
     Ok(())
 }
+
+/// The snapshot as one JSON document: the hosted status page reads it from its store.
+pub fn state_json(s: &Snapshot) -> serde_json::Value {
+    let up = s.bots.iter().filter(|b| state(b).1 != "bad").count();
+    let games: i64 = s.bots.iter().map(|b| b.day.games()).sum();
+    let pct = |r: &Record| if r.games() > 0 { serde_json::json!((100.0 * r.score()).round()) } else { serde_json::Value::Null };
+    serde_json::json!({
+        "as_of": s.at,
+        "summary": [{
+            "as_of": s.at, "bots_up": up, "bots": s.bots.len(), "games_24h": games, "alerts_24h": s.alerts_day,
+            "replays": s.corpus_ok, "replays_24h": s.corpus_day, "replays_2400": s.corpus_strong, "replays_waiting": s.corpus_queued,
+            "load": format!("{:.1}", s.load), "batch": if s.paused.is_some() { "paused" } else { "may run" }, "live_release": s.live,
+        }],
+        "bots": s.bots.iter().map(|b| serde_json::json!({
+            "bot": b.name, "role": b.role, "state": state(b).0, "release": b.release, "version": b.version,
+            "rating": b.rating.map(|r| r.round()), "rating_change_24h": b.rating_day.round(), "games_24h": b.day.games(), "games_last_hour": b.hour_games,
+            "wins": b.day.wins, "losses": b.day.losses, "draws": b.day.draws, "score_pct": pct(&b.day), "think_p99_ms": b.think_p99_ms.map(|p| p.round()),
+        })).collect::<Vec<_>>(),
+        "arms": s.arms.iter().map(|a| {
+            let (lo, hi) = a.record.interval();
+            serde_json::json!({
+                "experiment": a.experiment, "arm": a.arm, "games": a.record.games(), "target": a.target,
+                "wins": a.record.wins, "losses": a.record.losses, "draws": a.record.draws, "score_pct": pct(&a.record),
+                "low_pct": if a.record.games() > 0 { serde_json::json!((100.0 * lo).round()) } else { serde_json::Value::Null },
+                "high_pct": if a.record.games() > 0 { serde_json::json!((100.0 * hi).round()) } else { serde_json::Value::Null },
+            })
+        }).collect::<Vec<_>>(),
+        "releases": s.releases.iter().map(|r| serde_json::json!({ "release": r.id, "status": r.status, "arena_gate": r.gate, "ladder_evidence": r.evidence, "note": r.note })).collect::<Vec<_>>(),
+    })
+}
+
+/// A page served straight from the store: built for each request, so it is never older
+/// than the last finished game, and it reloads itself every 20 seconds.
+pub fn serve(root: &Path, port: u16, stop: &dyn Fn() -> bool) -> std::io::Result<()> {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind(("0.0.0.0", port))?;
+    listener.set_nonblocking(true)?;
+    eprintln!("{} status page on port {port}", utc_stamp());
+    while !stop() {
+        let (mut stream, _) = match listener.accept() {
+            Ok(x) => x,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            Err(_) => continue,
+        };
+        let _ = stream.set_nonblocking(false);
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+        let mut buf = [0u8; 2048];
+        let n = stream.read(&mut buf).unwrap_or(0);
+        let request = String::from_utf8_lossy(&buf[..n]);
+        let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+        // Only two things are served, both read-only views of the store. Nothing is taken
+        // from the request but its path.
+        let built = (|| -> Result<(String, &'static str), String> {
+            let cfg = Config::load(root)?;
+            let store = Store::open(&crate::store::default_db(root), std::time::Duration::from_secs(2)).map_err(|e| e.to_string())?;
+            let snap = snapshot(root, &store, &cfg);
+            Ok(match path.as_str() {
+                "/" | "/index.html" | "/status.html" => (html(&snap).replacen("<meta charset=\"utf-8\">", "<meta charset=\"utf-8\">\n<meta http-equiv=\"refresh\" content=\"20\">", 1), "text/html; charset=utf-8"),
+                "/state.json" => (state_json(&snap).to_string(), "application/json"),
+                _ => return Err("not found".into()),
+            })
+        })();
+        let (status, body, kind) = match built {
+            Ok((body, kind)) => ("200 OK", body, kind),
+            Err(e) if e == "not found" => ("404 Not Found", "not found\n".to_string(), "text/plain"),
+            Err(e) => ("503 Service Unavailable", format!("the status page could not be built: {e}\n"), "text/plain"),
+        };
+        let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", body.len());
+        let _ = stream.write_all(body.as_bytes());
+    }
+    Ok(())
+}

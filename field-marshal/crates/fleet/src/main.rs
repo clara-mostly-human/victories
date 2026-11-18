@@ -2,8 +2,8 @@
 //!
 //!   fleet status                                  every bot: running? which release? today's record
 //!   fleet run <bot>                               the supervisor (launchd runs this)
-//!   fleet install <bot> | watch | collector | online | autopilot      install a launchd agent
-//!   fleet uninstall <bot> | watch | collector | online | autopilot
+//!   fleet install <bot> | watch | collector | online | autopilot | status      install a launchd agent
+//!   fleet uninstall <bot> | watch | collector | online | autopilot | status
 //!   fleet stop <bot> | resume <bot> | restart <bot>
 //!   fleet deploy <bot> <release> [--version vN] [--force "<reason>"]
 //!
@@ -31,6 +31,7 @@
 //!   fleet watch                                   one health pass (launchd runs this every 5 minutes)
 //!   fleet online [run]                            is each bot online on the ladder? `run` is the offline watchdog
 //!   fleet autopilot [run]                         one step of the automatic pipeline; `run` keeps going
+//!   fleet serve [--port 8787]                     the status page, live: built from the store on every request
 //!   fleet report                                  write the status page to data/status.html
 //!   fleet digest                                  the last 24 hours in a few lines (first line fits a notification)
 //!   fleet alerts [N]                              the last N lines of the alert log
@@ -422,7 +423,7 @@ fn watch(root: &Path, store: &Store, cfg: &Config) -> Result<(), String> {
 }
 
 /// Agents that are not bots.
-const SERVICES: [&str; 4] = ["watch", "collector", "online", "autopilot"];
+const SERVICES: [&str; 5] = ["watch", "collector", "online", "autopilot", "status"];
 
 /// Once a day: a snapshot of the store, and old tick logs of the bots we run compressed.
 /// Nothing is deleted except our own snapshots beyond the newest seven.
@@ -473,6 +474,7 @@ fn agent_spec(root: &Path, what: &str) -> (String, Vec<String>, std::path::PathB
         "watch" => ("com.victris.fleet-watch".into(), vec![bin, "watch".into()], root.join("logs").join("fleet-watch.log"), Some(300)),
         "collector" => ("com.victris.fleet-collector".into(), vec![bin, "collect".into(), "run".into()], root.join("logs").join("fleet-collector.log"), None),
         "autopilot" => ("com.victris.fleet-autopilot".into(), vec![bin, "autopilot".into(), "run".into()], root.join("logs").join("fleet-autopilot.log"), None),
+        "status" => ("com.victris.fleet-status".into(), vec![bin, "serve".into()], root.join("logs").join("fleet-status.log"), None),
         "online" => ("com.victris.fleet-online".into(), vec![bin, "online".into(), "run".into()], root.join("logs").join("fleet-online.log"), None),
         bot => (label(bot), vec![bin, "run".into(), bot.to_string()], root.join("logs").join(bot).join("run.log"), None),
     }
@@ -721,7 +723,17 @@ fn main_inner() -> Result<i32, String> {
             // The same numbers as tables, for the hosted page.
             let dir = data_dir(&root).join("status");
             fleet::report::write_csv(&snap, &dir).map_err(e)?;
+            std::fs::write(dir.join("state.json"), fleet::report::state_json(&snap).to_string()).map_err(e)?;
             println!("{}", dir.display());
+        }
+        "serve" => {
+            unsafe {
+                libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+                libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+            }
+            drop(store);
+            let port: u16 = a.num("--port")?.unwrap_or(8787);
+            fleet::report::serve(&root, port, &|| STOP.load(Ordering::Relaxed)).map_err(|x| format!("cannot serve on port {port}: {x}"))?;
         }
         "digest" => print!("{}", fleet::report::digest(&fleet::report::snapshot(&root, &store, &cfg))),
         "alerts" => {
