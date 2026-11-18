@@ -585,7 +585,7 @@ pub fn html(s: &Snapshot) -> String {
 }}
 * {{ box-sizing: border-box; }}
 body {{ margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }}
-main {{ max-width: 1080px; margin: 0 auto; padding: 28px 16px 48px; }}
+main {{ max-width: min(96vw, 2600px); margin: 0 auto; padding: 28px 24px 48px; }}
 header {{ display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 20px; }}
 h1 {{ font-size: 26px; margin: 0; letter-spacing: -0.01em; }}
 h2 {{ font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 28px 0 8px; }}
