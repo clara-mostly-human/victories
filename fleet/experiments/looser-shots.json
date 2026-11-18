@@ -1,0 +1,10 @@
+{
+  "name": "looser-shots",
+  "note": "Top bots fire far more freely than we do: of about 1,500 shots by StuartSutcliffe and Shelbot4 in the replay corpus only one in five is guaranteed, and in their positions matrix-5 takes about 40% of the shots they take. This arm removes the cost of firing and values each turn 70% against a plain opponent that stands still 70% of the time (prior_weight, prior_hold) instead of only against a perfect dodger. In StuartSutcliffe's positions it takes 58% of his shots. Needs a release at or after the commit that adds prior_weight. Every opponent, balanced by opponent, map and seat.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "looser-shots": { "fire_cost": 0, "prior_weight": 0.7, "prior_hold": 0.7 }
+  }
+}

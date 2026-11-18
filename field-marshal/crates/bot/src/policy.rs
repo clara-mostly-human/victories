@@ -109,6 +109,15 @@ pub struct Playbook {
     /// value of closing in while the opponent's shot is on cooldown and ours is ready,
     /// per tile gained: the proactive half of the tempo game
     pub press_bonus: f64,
+    /// search: how much of each turn's value comes from a plain opponent (stands still
+    /// `prior_hold` of the time, otherwise steps at random, never attacks) instead of the
+    /// solved one. 0 = pure game solution.
+    pub prior_weight: f64,
+    pub prior_hold: f64,
+    /// search: what a dash costs the opponent in our model of it. We value our own dash
+    /// highly (`dash_cost`), but the ladder's best spend theirs freely to dash in and
+    /// fire, so their price can be set lower.
+    pub their_dash_cost: f64,
     /// search: weight of the fitted tempo evaluation at the leaves (0 = off)
     pub tempo_weight: f64,
     /// cost of ending a step (so with no step next tick) within `stuck_range` tiles of an
@@ -167,6 +176,9 @@ impl Default for Playbook {
             think_ms: 0,
             threads: 1,
             hard_ms: 250,
+            their_dash_cost: 10.0,
+            prior_weight: 0.0,
+            prior_hold: 0.5,
             rollout_punish: false,
             press_bonus: 0.0,
             tempo_weight: 1.0,
@@ -208,6 +220,9 @@ impl Playbook {
         f("stuck_penalty", &mut p.stuck_penalty);
         f("tempo_weight", &mut p.tempo_weight);
         f("press_bonus", &mut p.press_bonus);
+        f("prior_weight", &mut p.prior_weight);
+        f("their_dash_cost", &mut p.their_dash_cost);
+        f("prior_hold", &mut p.prior_hold);
         let u = |k: &str| v.get(k).and_then(Value::as_u64);
         if let Some(x) = u("depth") {
             p.depth = x as u32;
@@ -555,7 +570,7 @@ fn subgame_value(e: &Engine, s: &State, me: usize, pb: &Playbook, k: &Kit, depth
                 theirs.push((RawTurn::step(d), 0.0));
             }
             if en.cd_dash == 0 {
-                theirs.push((RawTurn::dash(d), pb.dash_cost));
+                theirs.push((RawTurn::dash(d), pb.their_dash_cost));
             }
         }
         let plain = theirs.len();
@@ -1003,7 +1018,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         let mut theirs: Vec<(RawTurn, f64)> = Vec::new(); // (turn, what it costs them)
         let en_frost = k.frost.filter(|(a, range)| en.state == FState::Idle && en.cd_attack[*a as usize] == 0 && dist_now <= *range);
         for r in &replies {
-            let moved = if matches!(r.dash, victris_engine::turn::DirIn::Dir(_)) { pb.dash_cost } else { 0.0 };
+            let moved = if matches!(r.dash, victris_engine::turn::DirIn::Dir(_)) { pb.their_dash_cost } else { 0.0 };
             theirs.push((*r, moved));
             if en_ranged && (pb.model_attacks || pb.model_shots) {
                 theirs.push((r.with_attack(k.ranged.unwrap(), my.pos), moved + pb.fire_cost));
@@ -1029,7 +1044,9 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 payoff[m * cols + c] = cell_value(e, &s, me, &turns(*mine, *reply), pb, &mut sims) + merit + their_cost;
             }
         }
-        let (mut mix, _, mut value) = solve_matrix(&payoff, rows, cols, 300);
+        let (mut mix, mut their_mix, mut value) = solve_matrix(&payoff, rows, cols, 300);
+        let mut final_rows: Vec<usize> = (0..rows).collect();
+        let mut final_payoff: Vec<f64> = payoff.clone();
         // Deepening: the turns the first solve likes best are played out one tick further,
         // with the next tick itself solved as a game, and the choice is made among them.
         if pb.deepen > 0 && dist_now <= pb.deep_range && rows > 1 {
@@ -1089,7 +1106,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             }
             order.truncate(reached);
             deep.truncate(reached * cols);
-            let (mut deep_mix, _, mut deep_value) = solve_matrix(&deep, order.len(), cols, 300);
+            let (mut deep_mix, mut deep_their, mut deep_value) = solve_matrix(&deep, order.len(), cols, 300);
             // With time left, the turns still in contention get a third tick, best first,
             // until the clock runs out. Rows are replaced whole, so a row is never half deep.
             if pb.depth >= 3 {
@@ -1112,6 +1129,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 if done > 0 {
                     let solved = solve_matrix(&deep, order.len(), cols, 300);
                     deep_mix = solved.0;
+                    deep_their = solved.1;
                     deep_value = solved.2;
                 }
             }
@@ -1120,6 +1138,41 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 mix[m] = deep_mix[i];
             }
             value = deep_value;
+            their_mix = deep_their;
+            final_rows = order.clone();
+            final_payoff = deep.clone();
+        }
+        // Real opponents are not perfect dodgers. With `prior_weight` on, each of our turns
+        // is valued partly against the solved opponent and partly against a plain one that
+        // stands still half the time and otherwise steps at random, and the best is played.
+        let mut prior_pick: Option<usize> = None;
+        if pb.prior_weight > 0.0 && !final_rows.is_empty() {
+            let plain = |t: &RawTurn| t.attack == victris_engine::turn::AttackIn::None && t.dash == victris_engine::turn::DirIn::None;
+            let steps = theirs.iter().filter(|(t, _)| plain(t) && t.mv != victris_engine::turn::DirIn::None).count();
+            let prior: Vec<f64> = theirs
+                .iter()
+                .map(|(t, _)| {
+                    if !plain(t) {
+                        0.0
+                    } else if t.mv == victris_engine::turn::DirIn::None {
+                        if steps == 0 { 1.0 } else { pb.prior_hold }
+                    } else {
+                        (1.0 - pb.prior_hold) / steps as f64
+                    }
+                })
+                .collect();
+            let mut best = f64::MIN;
+            for (i, &m) in final_rows.iter().enumerate() {
+                let row = &final_payoff[i * cols..(i + 1) * cols];
+                let solved: f64 = row.iter().zip(&their_mix).map(|(v, p)| v * p).sum();
+                let naive: f64 = row.iter().zip(&prior).map(|(v, p)| v * p).sum();
+                let blended = (1.0 - pb.prior_weight) * solved + pb.prior_weight * naive;
+                if blended > best {
+                    best = blended;
+                    prior_pick = Some(m);
+                }
+            }
+            value = best;
         }
         // Play from the mixed strategy, ignoring the tail regret matching leaves behind.
         let top = mix.iter().cloned().fold(0.0, f64::max);
@@ -1141,6 +1194,9 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             }
         } else {
             pick = (0..rows).max_by(|a, b| mix[*a].partial_cmp(&mix[*b]).unwrap()).unwrap_or(0);
+        }
+        if let Some(m) = prior_pick {
+            pick = m;
         }
         return Decision { turn: cands[pick].0, sims, score: value, note: cands[pick].2 };
     }

@@ -141,6 +141,12 @@ fn main() {
                                 bump("A  attack agrees".into(), ta == oa);
                                 bump(format!("B  they {tm:<5} we {om}"), false);
                                 bump(format!("C  they {ta:<8} we {oa}"), false);
+                                if ta == "shot" {
+                                    // Where do they shoot? And do we, there?
+                                    let target = if o.state != FState::Idle || o.cd_move > 0 { "target stuck   " } else { "target can step" };
+                                    let dash = if o.state == FState::Idle && o.cd_dash == 0 { "dash ready" } else { "no dash   " };
+                                    bump(format!("F  they shot at {band:<3} | {target} | {dash} : we shot too"), oa == "shot");
+                                }
                                 if f.cd_move == 0 {
                                     bump(format!("D  {ctx} : they stepped"), tm == "step");
                                     bump(format!("E  {ctx} : we stepped"), om == "step");
@@ -170,6 +176,7 @@ fn main() {
         match &k[..1] {
             "A" => println!("  {:<24} {:>5.1}%", &k[3..], 100.0 * v[1] as f64 / v[0] as f64),
             "B" | "C" => println!("  {:<28} {:>6}  ({:.1}%)", &k[3..], v[0], 100.0 * v[0] as f64 / ticks as f64),
+            "F" => println!("  {:<62} {:>5.0}%  of {}", &k[3..], 100.0 * v[1] as f64 / v[0] as f64, v[0]),
             _ => {
                 if v[0] >= 60 {
                     println!("  {:<62} {:>5.0}%  of {}", &k[3..], 100.0 * v[1] as f64 / v[0] as f64, v[0])
