@@ -118,6 +118,17 @@ pub struct Playbook {
     /// highly (`dash_cost`), but the ladder's best spend theirs freely to dash in and
     /// fire, so their price can be set lower.
     pub their_dash_cost: f64,
+    /// plan search: ticks looked ahead along our own plans against the opponent model
+    /// (0 or 1 = off)
+    pub plan_depth: u32,
+    /// plan search: plans kept at each depth
+    pub plan_width: usize,
+    /// plan search: only turns within this many hp of the game solve's best are eligible
+    pub plan_margin: f64,
+    /// plan search: how much the game solve's value still counts when ranking eligible turns
+    pub plan_solve_weight: f64,
+    /// plan search: cost of each shot inside a plan
+    pub plan_fire_cost: f64,
     /// search: weight of the fitted tempo evaluation at the leaves (0 = off)
     pub tempo_weight: f64,
     /// cost of ending a step (so with no step next tick) within `stuck_range` tiles of an
@@ -176,6 +187,11 @@ impl Default for Playbook {
             think_ms: 0,
             threads: 1,
             hard_ms: 250,
+            plan_depth: 0,
+            plan_width: 12,
+            plan_margin: 2.0,
+            plan_solve_weight: 1.0,
+            plan_fire_cost: 1.0,
             their_dash_cost: 10.0,
             prior_weight: 0.0,
             prior_hold: 0.5,
@@ -222,6 +238,15 @@ impl Playbook {
         f("press_bonus", &mut p.press_bonus);
         f("prior_weight", &mut p.prior_weight);
         f("their_dash_cost", &mut p.their_dash_cost);
+        f("plan_margin", &mut p.plan_margin);
+        f("plan_solve_weight", &mut p.plan_solve_weight);
+        f("plan_fire_cost", &mut p.plan_fire_cost);
+        if let Some(x) = v.get("plan_depth").and_then(Value::as_u64) {
+            p.plan_depth = x as u32;
+        }
+        if let Some(x) = v.get("plan_width").and_then(Value::as_u64) {
+            p.plan_width = x as usize;
+        }
         f("prior_hold", &mut p.prior_hold);
         let u = |k: &str| v.get(k).and_then(Value::as_u64);
         if let Some(x) = u("depth") {
@@ -500,6 +525,164 @@ fn quick_turn(e: &Engine, s: &State, x: usize) -> RawTurn {
         }
     }
     RawTurn::IDLE
+}
+
+/// The opponent as the plan search imagines it: it takes the hit we cannot avoid, walks
+/// out of our frostburst while it can, steps out of anything else about to hit it, and
+/// otherwise keeps its step in hand. Simple on purpose; the plan search is only trusted
+/// among turns the game solve already rates as safe.
+fn model_turn(e: &Engine, s: &State, x: usize, sims: &mut u32) -> RawTurn {
+    let mut t = quick_turn(e, s, x);
+    let f = &s.fighters[x];
+    if f.state != FState::Idle || f.cd_move != 0 || t.mv != victris_engine::turn::DirIn::None {
+        return t;
+    }
+    // Standing in the opponent's area: leave by the shortest way out.
+    let inside = |p: P| s.areas().iter().any(|b| b.owner as usize != x && e.map.in_blast(b.pos, b.radius, p));
+    if inside(f.pos) {
+        let mut best: Option<(i32, u8)> = None;
+        for d in 0..8u8 {
+            if e.map.step_blocked(f.pos, d) {
+                continue;
+            }
+            let q = add(f.pos, DIR_VEC[d as usize]);
+            if q == s.fighters[1 - x].pos {
+                continue;
+            }
+            let score = if inside(q) { 1 } else { 0 };
+            if best.map(|(b, _)| score < b).unwrap_or(true) {
+                best = Some((score, d));
+            }
+        }
+        if let Some((_, d)) = best {
+            t.mv = victris_engine::turn::DirIn::Dir(d);
+            return t;
+        }
+    }
+    // About to be hit by something in flight: step aside if a step avoids it.
+    let turns = |mine: RawTurn| if x == 0 { [mine, RawTurn::IDLE] } else { [RawTurn::IDLE, mine] };
+    let mut probe = *s;
+    let hit = e.step(&mut probe, &turns(t)).hp_lost[x] > 0;
+    *sims += 1;
+    if hit {
+        for d in 0..8u8 {
+            if e.map.step_blocked(f.pos, d) {
+                continue;
+            }
+            let mut trial = *s;
+            let mut alt = t;
+            alt.mv = victris_engine::turn::DirIn::Dir(d);
+            let lost = e.step(&mut trial, &turns(alt)).hp_lost[x];
+            *sims += 1;
+            if lost == 0 {
+                return alt;
+            }
+        }
+    }
+    t
+}
+
+/// Our options at a node of the plan search: stay or step, alone or with the attack that
+/// fits. Dashes are left out: they are for emergencies, which the game solve handles.
+fn plan_options(e: &Engine, s: &State, me: usize, k: &Kit, pb: &Playbook, out: &mut Vec<(RawTurn, f64)>) {
+    out.clear();
+    let (f, o) = (&s.fighters[me], &s.fighters[1 - me]);
+    if f.state != FState::Idle {
+        out.push((RawTurn::IDLE, 0.0));
+        return;
+    }
+    let shot = k.ranged.filter(|a| f.cd_attack[*a as usize] == 0);
+    let burst = k.repulsor.filter(|a| f.cd_attack[*a as usize] == 0);
+    let frost = k.frost.filter(|(a, _)| f.cd_attack[*a as usize] == 0);
+    let add_move = |mv: RawTurn, dest: P, out: &mut Vec<(RawTurn, f64)>| {
+        out.push((mv, 0.0));
+        let d = chebyshev(dest, o.pos);
+        if let Some(a) = shot {
+            if d <= 4 {
+                out.push((mv.with_attack(a, o.pos), pb.plan_fire_cost));
+            }
+        }
+        if let Some(a) = burst {
+            if d <= 1 {
+                out.push((mv.with_burst(a), pb.repulsor_cost));
+            }
+        }
+    };
+    add_move(RawTurn::IDLE, f.pos, out);
+    if let Some((a, range)) = frost {
+        let d = chebyshev(f.pos, o.pos);
+        if d >= 2 && d <= range && can_see(&e.rules, &e.map, f.pos, o.pos) {
+            out.push((RawTurn::IDLE.with_attack(a, o.pos), pb.frost_cost));
+        }
+    }
+    if f.cd_move == 0 {
+        for d in 0..8u8 {
+            if e.map.step_blocked(f.pos, d) {
+                continue;
+            }
+            let dest = add(f.pos, DIR_VEC[d as usize]);
+            if dest != o.pos {
+                add_move(RawTurn::step(d), dest, out);
+            }
+        }
+    }
+}
+
+/// The plan search: after our first turn (and the opponent's modelled reply), a beam
+/// search over our next turns against the opponent model, `plan_depth` ticks deep.
+/// Returns the best total found: hp taken minus hp lost, a kill bonus, and the tempo
+/// value where the plan ends. This is where lines that take several ticks to pay off,
+/// such as a frostburst that forces a step and sets up the sure shot, get their value.
+fn plan_value(e: &Engine, s: &State, me: usize, first: RawTurn, pb: &Playbook, k: &Kit, sims: &mut u32) -> f64 {
+    let turns = |mine: RawTurn, theirs: RawTurn| if me == 0 { [mine, theirs] } else { [theirs, mine] };
+    let (my0, en0) = (s.fighters[me].hp, s.fighters[1 - me].hp);
+    let score = |st: &State, cost: f64| -> f64 {
+        let mut v = (en0 - st.fighters[1 - me].hp) as f64 - (my0 - st.fighters[me].hp) as f64 - cost;
+        if !st.fighters[1 - me].alive {
+            v += 1000.0;
+        }
+        if !st.fighters[me].alive {
+            v -= 1000.0;
+        }
+        if st.result.is_none() && pb.tempo_weight != 0.0 {
+            v += pb.tempo_weight * victris_engine::tempo::value(e, st, me, &victris_engine::tempo::WEIGHTS) as f64;
+        }
+        v
+    };
+    let mut first_state = *s;
+    let reply = model_turn(e, s, 1 - me, sims);
+    e.step(&mut first_state, &turns(first, reply));
+    *sims += 1;
+    let mut beam: Vec<(f64, f64, State)> = vec![(score(&first_state, 0.0), 0.0, first_state)]; // (score, cost so far, state)
+    let mut best = beam[0].0;
+    let mut options: Vec<(RawTurn, f64)> = Vec::with_capacity(32);
+    let mut next: Vec<(f64, f64, State)> = Vec::with_capacity(512);
+    for _ in 1..pb.plan_depth {
+        next.clear();
+        for (_, cost, st) in &beam {
+            if st.result.is_some() {
+                next.push((score(st, *cost), *cost, *st));
+                continue;
+            }
+            let reply = model_turn(e, st, 1 - me, sims);
+            plan_options(e, st, me, k, pb, &mut options);
+            for (mine, c) in &options {
+                let mut child = *st;
+                e.step(&mut child, &turns(*mine, reply));
+                *sims += 1;
+                let total = cost + c;
+                next.push((score(&child, total), total, child));
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        next.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        next.truncate(pb.plan_width.max(1));
+        std::mem::swap(&mut beam, &mut next);
+        best = beam[0].0;
+    }
+    best
 }
 
 fn cell_value(e: &Engine, before: &State, me: usize, turns: &[RawTurn; 2], pb: &Playbook, sims: &mut u32) -> f64 {
@@ -1197,6 +1380,27 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         }
         if let Some(m) = prior_pick {
             pick = m;
+        }
+        // The plan search chooses among the turns the game solve rates within
+        // `plan_margin` hp of its best: safe by the solve, then best by the plan.
+        if pb.plan_depth >= 2 && !final_rows.is_empty() && started.elapsed().as_millis() < pb.hard_ms as u128 {
+            let solved_value = |i: usize| -> f64 {
+                final_payoff[i * cols..(i + 1) * cols].iter().zip(&their_mix).map(|(v, p)| v * p).sum()
+            };
+            let values: Vec<f64> = (0..final_rows.len()).map(solved_value).collect();
+            let top = values.iter().cloned().fold(f64::MIN, f64::max);
+            let mut best_plan = f64::MIN;
+            for (i, &m) in final_rows.iter().enumerate() {
+                if values[i] < top - pb.plan_margin {
+                    continue;
+                }
+                let (mine, merit, _) = cands[m];
+                let v = plan_value(e, &s, me, mine, pb, &k, &mut sims) + merit + pb.plan_solve_weight * values[i];
+                if v > best_plan {
+                    best_plan = v;
+                    pick = m;
+                }
+            }
         }
         return Decision { turn: cands[pick].0, sims, score: value, note: cands[pick].2 };
     }

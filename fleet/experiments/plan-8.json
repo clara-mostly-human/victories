@@ -1,0 +1,10 @@
+{
+  "name": "plan-8",
+  "note": "matrix-5 with the plan search on: after the two-tick game solve, a beam search eight ticks deep along our own turns against a simple opponent model (takes the hit we cannot avoid, walks out of our frostburst, dodges, otherwise holds), choosing only among turns the solve rates within 2 hp of its best. In StuartSutcliffe's positions it steps on 55 to 67% of ticks when the opponent's shot is on cooldown at 3 to 4 tiles (matrix-5: 41 to 47%, he: 70 to 74%). Arena against matrix-5 is even (29 to 31), local gauntlet 12 of 12, slowest decision 153 ms. Needs a release at or after the commit that adds plan_depth. Every opponent, balanced by opponent, map and seat.",
+  "opponents": ["*"],
+  "games_per_arm": 150,
+  "arms": {
+    "control": {},
+    "plan-8": { "plan_depth": 8 }
+  }
+}
