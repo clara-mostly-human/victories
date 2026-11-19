@@ -15,7 +15,7 @@
       "managed": true,
       "experiments": true,
       "note": "The fleet's canary since 2026-11-18: the Rust bot under the fleet supervisor. Gated releases meet the ladder here first, so it takes no experiment arms: its record is the record of one release. The TypeScript bot it replaced (foot-soldier/, v1 and v2) is retired.",
-      "expect_online": true,
+      "expect_online": false,
       "owner": "the fleet (infrastructure thread)"
     },
     "shock-trooper": {
@@ -24,7 +24,7 @@
       "managed": true,
       "experiments": true,
       "note": "Scout: runs the current release and takes arms from the experiment plan.",
-      "expect_online": true,
+      "expect_online": false,
       "owner": "the fleet (infrastructure thread)"
     },
     "quarter-master": {
@@ -32,7 +32,7 @@
       "managed": true,
       "experiments": true,
       "note": "Scout, and the first bot behind the gateway (trial since 2026-11-18): the gateway holds its connection, its engine runs as a child.",
-      "expect_online": true,
+      "expect_online": false,
       "owner": "the fleet (infrastructure thread)",
       "gateway": true
     },
@@ -42,12 +42,12 @@
       "managed": true,
       "experiments": true,
       "note": "Scout: runs the current release and takes arms from the experiment plan.",
-      "expect_online": true,
+      "expect_online": false,
       "owner": "the fleet (infrastructure thread)"
     }
   },
   "guard": {
-    "load": 8,
+    "load": 12,
     "think_p99_ms": 300
   },
   "prefer_addresses": ["172.67.157.96"],
