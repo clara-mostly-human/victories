@@ -131,10 +131,30 @@ pub fn hp_equiv(e: &Engine, s: &State, x: usize, w: &[f32], hp_per_logit: f32) -
     logit(e, s, x, w) * hp_per_logit
 }
 
+/// Inputs the hp-to-come network does not see: the tactics of the moment (readiness of shot, dash,
+/// frostburst, repulsor and step, shots and bursts in the air, slam threats, being one or two hits
+/// from dead). With them the search fired a third fewer ready shots and doubled its repulsors;
+/// the network judges the position (hp, buffs, pads, zone, place on the map, time) and the
+/// tactics stay with the search, its play-out and the linear judgment.
+pub const HP_DROP: [usize; 0] = [];
+
+/// One fighter's inputs for the hp-to-come network (`HP_DROP` zeroed).
+pub fn own_hp(e: &Engine, s: &State, x: usize) -> [f32; OWN] {
+    let mut v = own(e, s, x);
+    for i in HP_DROP {
+        v[i] = 0.0;
+    }
+    v
+}
+
 /// The hp fighter `x` is expected to gain or lose from here (discounted 0.98 a tick, 40 for a
-/// kill), by weights trained with `winlab --target hp` (the network's output is in units of 32 hp).
+/// kill), by weights trained with `winlab --target hp --drop-ready` (output in units of 32 hp).
 pub fn hp_to_come(e: &Engine, s: &State, x: usize, w: &[f32]) -> f32 {
-    32.0 * logit(e, s, x, w)
+    if w.len() != NW {
+        return 0.0;
+    }
+    let (a, b, c) = (own_hp(e, s, x), own_hp(e, s, 1 - x), ctx(e, s));
+    32.0 * (g(w, &a, &b, &c) - g(w, &b, &a, &c))
 }
 
 /// Fighter `x`'s chance of winning from this position, by the weights given.

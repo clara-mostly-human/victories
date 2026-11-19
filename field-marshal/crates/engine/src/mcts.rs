@@ -115,7 +115,55 @@ struct Node {
 /// Ticks a plan chosen at the root commits a side to (the root's tick included).
 pub const PLAN_TICKS: u8 = 6;
 /// Prior of each plan at the root, before the root's priors are scaled back to one.
-const PLAN_PRIOR: f32 = 0.08;
+const PLAN_PRIOR: f32 = 0.05;
+
+/// The step a plan takes now: down its distance map, when the fighter can step (None: no step).
+fn plan_step(e: &Engine, s: &State, x: usize, dist: &[u16]) -> Option<u8> {
+    let f = &s.fighters[x];
+    if f.state != FState::Idle || f.cd_move != 0 {
+        return None;
+    }
+    let w = e.map.w;
+    let at = |p: P| dist.get((p[1] * w + p[0]) as usize).cloned().unwrap_or(u16::MAX);
+    let mut best = (at(f.pos), None);
+    for dir in 0..8u8 {
+        let p = add(f.pos, DIR_VEC[dir as usize]);
+        if e.map.step_blocked(f.pos, dir) || !e.map.in_bounds(p) {
+            continue;
+        }
+        if at(p) < best.0 {
+            best = (at(p), Some(dir));
+        }
+    }
+    best.1
+}
+
+/// Does `turn` move the way the plan does (its step, or no step and no dash)? Attacks are free.
+fn follows(turn: &RawTurn, step: Option<u8>) -> bool {
+    matches!(turn.dash, DirIn::None)
+        && match step {
+            Some(d) => matches!(turn.mv, DirIn::Dir(m) if m == d),
+            None => matches!(turn.mv, DirIn::None),
+        }
+}
+
+/// A side's turns under a plan: those of `all` that move the plan's way, or dodge the way the
+/// quiet play-out would; every attack stays open. Falls back to the plan's own turn.
+fn plan_acts(e: &Engine, s: &State, x: usize, dist: &[u16], slam: bool, all: Vec<Act>) -> Vec<Act> {
+    let step = plan_step(e, s, x, dist);
+    let q = quiet_turn(e, s, x, slam);
+    let dodge = !matches!(q.mv, DirIn::None) || !matches!(q.dash, DirIn::None);
+    let mut keep: Vec<Act> = all.into_iter().filter(|a| follows(&a.turn, step) || (dodge && a.turn.mv == q.mv && a.turn.dash == q.dash)).collect();
+    if keep.is_empty() {
+        return vec![Act { turn: plan_turn(e, s, x, dist, slam), prior: 1.0, n: 0, w: 0.0 }];
+    }
+    let sum: f32 = keep.iter().map(|a| a.prior).sum();
+    for a in keep.iter_mut() {
+        a.prior /= sum.max(1e-6);
+    }
+    keep.shrink_to_fit();
+    keep
+}
 
 /// Steps from every tile to `target` (u16::MAX where it cannot be reached).
 fn dist_map(e: &Engine, target: P) -> Vec<u16> {
@@ -724,13 +772,25 @@ impl<'a> Search<'a> {
             if fixed[x].is_some() {
                 continue;
             }
+            let plain = self.nodes[0].acts[x].len();
             for (kind, target) in plan_targets(self.e, s, x) {
                 let dist = dist_map(self.e, target);
-                let turn = plan_turn(self.e, s, x, &dist, self.cfg.quiet_slam);
+                // the plan's root turns: copies of the plain turns that move its way (each with its
+                // attack), sharing the plan's prior in proportion to their own
+                let step = plan_step(self.e, s, x, &dist);
+                let mut copies: Vec<Act> = self.nodes[0].acts[x][..plain].iter().filter(|a| follows(&a.turn, step)).map(|a| Act { turn: a.turn, prior: a.prior, n: 0, w: 0.0 }).collect();
+                if copies.is_empty() {
+                    copies.push(Act { turn: plan_turn(self.e, s, x, &dist, self.cfg.quiet_slam), prior: 1.0, n: 0, w: 0.0 });
+                }
+                let sum: f32 = copies.iter().map(|a| a.prior).sum();
                 self.plans.push(dist);
                 self.plan_kind.push(kind);
-                self.nodes[0].acts[x].push(Act { turn, prior: PLAN_PRIOR, n: 0, w: 0.0 });
-                self.root_plan[x].push(self.plans.len() as u8);
+                let pid = self.plans.len() as u8;
+                for mut a in copies {
+                    a.prior = PLAN_PRIOR * a.prior / sum.max(1e-6);
+                    self.nodes[0].acts[x].push(a);
+                    self.root_plan[x].push(pid);
+                }
             }
             let sum: f32 = self.nodes[0].acts[x].iter().map(|a| a.prior).sum();
             for a in self.nodes[0].acts[x].iter_mut() {
@@ -789,7 +849,14 @@ impl<'a> Search<'a> {
                         let pid = self.nodes[node].plan[x];
                         self.nodes[node].acts[x] = match (depth, fixed[x]) {
                             (0, Some(t)) => vec![Act { turn: t, prior: 1.0, n: 0, w: 0.0 }],
-                            _ if pid != 0 => vec![Act { turn: plan_turn(self.e, &s, x, &self.plans[pid as usize - 1], self.cfg.quiet_slam), prior: 1.0, n: 0, w: 0.0 }],
+                            _ if pid != 0 => plan_acts(
+                                self.e,
+                                &s,
+                                x,
+                                &self.plans[pid as usize - 1],
+                                self.cfg.quiet_slam,
+                                actions_with(self.e, &s, x, self.cfg.even, false, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst),
+                            ),
                             _ => actions_with(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst),
                         };
                     }

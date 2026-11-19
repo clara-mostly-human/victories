@@ -405,16 +405,26 @@ fn logloss(p: f32, y: f32) -> f64 {
 }
 
 /// The two inputs of the antisymmetric network for example `i`: (mine = fighter 0) and the swap.
+/// --drop-ready: the hp-to-come network does not see readiness (`valuenet::HP_DROP`)
+static DROP_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn inputs(st: &Store, i: usize, skill: Option<(f32, f32)>, sel_own: &[usize], sel_ctx: &[usize], xa: &mut Vec<f32>, xb: &mut Vec<f32>) {
     let r = st.row(i);
     let f = |v: i16| v as f32 / Q;
+    let drop = DROP_READY.load(std::sync::atomic::Ordering::Relaxed);
     let a = &r[2..2 + OWN];
     let b = &r[2 + OWN..2 + 2 * OWN];
     let c = &r[2 + 2 * OWN..2 + 2 * OWN + CTX];
     let o = 2 + 2 * OWN + CTX;
     let (ea, eb, ec) = (&r[o..o + EXO], &r[o + EXO..o + 2 * EXO], &r[o + 2 * EXO..o + 2 * EXO + EXC]);
     let side = |x: &mut Vec<f32>, mine: &[i16], ex: &[i16], sk: Option<f32>| {
+        let at = x.len();
         x.extend(mine.iter().map(|v| f(*v)));
+        if drop {
+            for k in victris_engine::valuenet::HP_DROP {
+                x[at + k] = 0.0;
+            }
+        }
         x.extend(sel_own.iter().map(|k| f(ex[*k])));
         if let Some(v) = sk {
             x.push(v);
@@ -629,6 +639,7 @@ fn main() {
     // the winner, the way the search's linear judgment does; the teacher's value then counts as
     // the deep search's expected gain from here
     let hp_mode = opt("--target").as_deref() == Some("hp");
+    DROP_READY.store(args.iter().any(|a| a == "--drop-ready"), std::sync::atomic::Ordering::Relaxed);
     let hpc_of = |i: usize| st.row(i)[HPC_COL] as f32 / Q;
     let lead32 = |i: usize| hp_of(i) * 130.0 / 32.0;
     // the linear judgment alone (row `--gen`), / 32 hp, and its one-weight fit to the hp to come
@@ -767,6 +778,48 @@ fn main() {
             let var = ys[c].iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / n;
             let label = if c < 4 { format!("stage {}/4", c + 1) } else { "all".into() };
             println!("{label:<10} {:>6}  network {:>7.1} ({:>5.1}%)  judgment {:>7.1} ({:>5.1}%)  zero {:>7.1}", cells[c][0] as usize, cells[c][2] / n, 100.0 * (1.0 - cells[c][2] / n / var.max(1e-9)), cells[c][3] / n, 100.0 * (1.0 - cells[c][3] / n / var.max(1e-9)), var);
+        }
+        // who goes on to win, read from the hp lead plus each predictor's hp to come (one fitted
+        // scale each): the winner accuracy of the leaf the search would use
+        {
+            let pred: Vec<(usize, f32, f32)> = train.iter().step_by(3).map(|&i| (i, raw(&w, i, &mut xa, &mut xb, &mut a) + base_of(i), kj * jud(i))).collect();
+            let fitk = |x: &dyn Fn(&(usize, f32, f32)) -> f32| -> f32 {
+                let mut k = 0.0f64;
+                for _ in 0..60 {
+                    let (mut g, mut h) = (0.0f64, 1e-9f64);
+                    for r in &pred {
+                        let v = x(r) as f64;
+                        let p = 1.0 / (1.0 + (-(k * v)).exp());
+                        g += (p - y_of(r.0) as f64) * v;
+                        h += p * (1.0 - p) * v * v;
+                    }
+                    k -= g / h;
+                }
+                k as f32
+            };
+            let kn = fitk(&|r| lead32(r.0) + r.1);
+            let kjj = fitk(&|r| lead32(r.0) + r.2);
+            let kh = fitk(&|r| lead32(r.0));
+            let mut acc = [[0.0f64; 4]; 5];
+            for &i in &test {
+                let g = &st.games[st.game[i] as usize];
+                let stage = ((st.tick[i] as f32 / g.last.max(1) as f32) * 4.0).floor().clamp(0.0, 3.0) as usize;
+                let pn = raw(&w, i, &mut xa, &mut xb, &mut a) + base_of(i);
+                let y = g.y > 0.5;
+                let hit = |z: f32| if z.abs() < 1e-6 { 0.5 } else { ((z > 0.0) == y) as i32 as f64 };
+                for c in [stage, 4] {
+                    acc[c][0] += 1.0;
+                    acc[c][1] += hit(kn * (lead32(i) + pn));
+                    acc[c][2] += hit(kjj * (lead32(i) + kj * jud(i)));
+                    acc[c][3] += hit(kh * lead32(i));
+                }
+            }
+            println!("who goes on to win, from hp lead + hp to come: accuracy");
+            for c in 0..5 {
+                let n = acc[c][0].max(1.0);
+                let label = if c < 4 { format!("stage {}/4", c + 1) } else { "all".into() };
+                println!("{label:<10} {:>6}  network {:>5.1}%  judgment {:>5.1}%  hp alone {:>5.1}%", acc[c][0] as usize, 100.0 * acc[c][1] / n, 100.0 * acc[c][2] / n, 100.0 * acc[c][3] / n);
+            }
         }
         if let Some(path) = emit {
             if use_skill || !chosen.is_empty() || h1 != victris_engine::valuenet::H1 || h2 != victris_engine::valuenet::H2 {

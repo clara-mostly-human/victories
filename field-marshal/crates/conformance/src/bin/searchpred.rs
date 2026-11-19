@@ -60,9 +60,11 @@ fn main() {
         dash_burst: args.iter().any(|a| a == "--dash-burst"),
         max_nodes: 60_000,
         plans: args.iter().any(|a| a == "--plans"),
+        own_priors: args.iter().any(|a| a == "--own-priors"),
+        net_value: num("--net-value", 0.0),
         ..Default::default()
     };
-    let valued = ["--net-hp", "--every", "--max", "--iters", "--lin", "--gen", "--net", "--depth", "--quiet", "--out"];
+    let valued = ["--net-value", "--net-hp", "--every", "--max", "--iters", "--lin", "--gen", "--net", "--depth", "--quiet", "--out"];
     let mut files = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -89,6 +91,8 @@ fn main() {
     let mut plan_top = [0usize; 5];
     let mut plan_share = [0.0f64; 5];
     let mut sides = 0usize;
+    // how often the most visited turn fires a ready shot, a frostburst, a repulsor; and dashes
+    let (mut ready, mut fired, mut decisions, mut frosts, mut bursts, mut dashes) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
     let t0 = std::time::Instant::now();
     for (gi, path) in files.iter().enumerate() {
         if rows.len() >= max {
@@ -119,6 +123,40 @@ fn main() {
                 let mut search = Search::new(e, cfg);
                 search.start();
                 search.iterate(&s, [None, None], iters);
+                {
+                    let res = search.result();
+                    for x in 0..2 {
+                        let f = &s.fighters[x];
+                        if f.state != victris_engine::state::FState::Idle {
+                            continue;
+                        }
+                        let Some(best) = res.acts[x].iter().max_by_key(|a| a.1) else { continue };
+                        decisions += 1;
+                        let shot_i = e.rules.attacks.iter().position(|a| matches!(a.kind, victris_engine::rules::AttackKind::Projectile { .. }));
+                        let kind = |t: &victris_engine::turn::RawTurn| match t.attack {
+                            victris_engine::turn::AttackIn::Named { attack, .. } => Some(attack as usize),
+                            _ => None,
+                        };
+                        if let Some(si) = shot_i {
+                            if f.cd_attack[si] == 0 {
+                                ready += 1;
+                                if kind(&best.0) == Some(si) {
+                                    fired += 1;
+                                }
+                            }
+                        }
+                        if let Some(a) = kind(&best.0) {
+                            match e.rules.attacks[a].kind {
+                                victris_engine::rules::AttackKind::Area { .. } => frosts += 1,
+                                victris_engine::rules::AttackKind::Burst { .. } => bursts += 1,
+                                _ => {}
+                            }
+                        }
+                        if !matches!(best.0.dash, victris_engine::turn::DirIn::None) {
+                            dashes += 1;
+                        }
+                    }
+                }
                 if cfg.plans {
                     let res = search.result();
                     let stats = search.plan_stats();
@@ -141,6 +179,7 @@ fn main() {
         }
     }
     eprintln!("{} positions from held-out games in {:.0}s", rows.len(), t0.elapsed().as_secs_f64());
+    println!("chosen turns: fires a ready shot {:.1}% of {} ready decisions; frostburst {:.1}%, repulsor {:.1}%, dash {:.1}% of {} decisions", 100.0 * fired as f64 / ready.max(1) as f64, ready, 100.0 * frosts as f64 / decisions.max(1) as f64, 100.0 * bursts as f64 / decisions.max(1) as f64, 100.0 * dashes as f64 / decisions.max(1) as f64, decisions);
     if cfg.plans {
         for k in 0..5 {
             println!("plan {:<16} most visited at {:>5.1}% of decisions, {:>5.1}% of root visits", victris_engine::mcts::PLAN_NAMES[k], 100.0 * plan_top[k] as f64 / sides.max(1) as f64, 100.0 * plan_share[k] / sides.max(1) as f64);
