@@ -293,7 +293,7 @@ pub struct Shared {
     /// which of our bots are queued (1) or in a match (2)
     active: Mutex<HashMap<String, u8>>,
     /// bots the ladder holds back from a match because our match limit is reached
-    held: Mutex<std::collections::HashSet<String>>,
+    held: Mutex<HashMap<String, Instant>>,
     /// the rotation queue: bots on a slow socket, waiting for their turn to get a new one
     rotation: Mutex<Vec<Waiting>>,
     /// when the ladder last dropped our connections (not counting the ones we closed)
@@ -336,7 +336,7 @@ impl Shared {
             attach: Mutex::new(HashMap::new()),
             health: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
-            held: Mutex::new(std::collections::HashSet::new()),
+            held: Mutex::new(HashMap::new()),
         }
     }
 
@@ -490,15 +490,19 @@ impl Shared {
     fn set_held(&self, bot: &str, held: bool) {
         let mut h = self.held.lock().unwrap_or_else(|p| p.into_inner());
         if held {
-            h.insert(bot.to_string());
+            h.entry(bot.to_string()).or_insert_with(Instant::now);
         } else {
             h.remove(bot);
         }
     }
 
     /// How many of our other bots the ladder is holding back from a match right now.
+    /// Only a bot held in the last ten minutes counts: a mark left behind (a bot halted while it
+    /// was held, 2026-11-19 13:59Z) must not keep the flagship waiting forever.
     fn others_held(&self, bot: &str) -> usize {
-        self.held.lock().unwrap_or_else(|p| p.into_inner()).iter().filter(|n| n.as_str() != bot).count()
+        let mut h = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        h.retain(|_, since| since.elapsed() < Duration::from_secs(600));
+        h.keys().filter(|n| n.as_str() != bot).count()
     }
 
     fn set_active(&self, bot: &str, state: u8) {
@@ -1568,6 +1572,11 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                             note(format!("not running: {why}"));
                             let _ = send(&mut ws, shared, json!({ "type": "leave" }).to_string());
                             let _ = ws.close(None);
+                            // It no longer waits for a match slot: nothing should wait behind it
+                            // (2026-11-19: four scouts halted while held kept the flagship waiting
+                            // two minutes before every queue, and its idle socket was reset).
+                            shared.set_held(name, false);
+                            shared.set_active(name, 0);
                             down_why = why;
                             continue 'outer;
                         }
