@@ -1,9 +1,9 @@
 {
   "default": {
-    "name": "tree-buffwin-reuse",
+    "name": "loop-gen1",
     "tree_ms": 150,
     "tree_value": 1.0,
-    "tree_gen": 6,
+    "tree_gen": 13,
     "tree_dash_burst": true,
     "tree_depth_buff": 24,
     "tree_quiet_buff": 10,
