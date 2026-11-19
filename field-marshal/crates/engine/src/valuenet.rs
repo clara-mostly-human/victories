@@ -15,8 +15,10 @@ use crate::state::State;
 use crate::valuefeat::{phi, NV};
 use crate::Engine;
 
-/// Inputs for one fighter: `phi` plus four.
-pub const OWN: usize = NV + 4;
+/// Inputs for one fighter: `phi` plus ten (centre distances, walls next to it, and the
+/// tactics in motion: shots flying at it and how soon the nearest lands, a frostburst about
+/// to go off on it and how soon, its stun or other non-idle ticks left, its move cooldown).
+pub const OWN: usize = NV + 10;
 /// Inputs for the position.
 pub const CTX: usize = 7;
 /// Inputs of `g`.
@@ -37,6 +39,29 @@ pub fn own(e: &Engine, s: &State, x: usize) -> [f32; OWN] {
     v[NV + 2] = chebyshev(f.pos, c) as f32 / 10.0;
     let walls = (0..8u8).filter(|d| e.map.step_blocked(f.pos, *d) || e.map.is_wall(add(f.pos, DIR_VEC[*d as usize]))).count();
     v[NV + 3] = walls as f32 / 8.0;
+    // shots of the other fighter heading at this one (within 8 tiles), and the soonest
+    let mut shots = 0.0f32;
+    let mut soonest = 8i32;
+    for p in s.projectiles().iter().filter(|p| p.owner as usize != x) {
+        let d = chebyshev(p.pos, f.pos);
+        if d <= 8 && chebyshev(p.target, f.pos) <= 1 {
+            shots += 1.0;
+            soonest = soonest.min((d + p.speed.max(1) - 1) / p.speed.max(1));
+        }
+    }
+    v[NV + 4] = shots.min(3.0) / 3.0;
+    v[NV + 5] = if shots > 0.0 { 1.0 - soonest as f32 / 8.0 } else { 0.0 };
+    // a frostburst of the other fighter that will catch this one, and how soon
+    let mut burst_soon = 0.0f32;
+    for a in s.areas().iter().filter(|a| a.owner as usize != x) {
+        if e.map.in_blast(a.pos, a.radius, f.pos) {
+            burst_soon = burst_soon.max(1.0 - ((a.explodes_tick - s.tick).clamp(0, 8) as f32) / 8.0);
+        }
+    }
+    v[NV + 6] = (burst_soon > 0.0) as i32 as f32;
+    v[NV + 7] = burst_soon;
+    v[NV + 8] = if f.state == crate::state::FState::Idle { 0.0 } else { ((f.state_end - s.tick).clamp(0, 8)) as f32 / 8.0 };
+    v[NV + 9] = f.cd_move.clamp(0, 4) as f32 / 4.0;
     v
 }
 
