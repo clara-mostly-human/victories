@@ -1,7 +1,7 @@
 //! winfit: trains the win-probability judgment (`victris_engine::valuenet`) on replays.
 //!
 //!   winfit --bots A,B,... [--epochs 12] [--every 3] [--from 20] [--lr 0.001]
-//!          [--emit path.rs] <replay dir>...
+//!          [--emit path.rs] [--teach file --mix 0.5 --scale 15] <replay dir>...
 //!
 //! Every `--every`-th tick from tick `--from` of every game whose two bots are both in
 //! `--bots` becomes one example: the network's inputs for fighter 0 and fighter 1 and the
@@ -116,6 +116,12 @@ fn main() {
     let from: i32 = opt("--from").and_then(|s| s.parse().ok()).unwrap_or(20);
     let lr: f32 = opt("--lr").and_then(|s| s.parse().ok()).unwrap_or(0.001);
     let emit = opt("--emit");
+    // --teach file...: teacher lines from `teachdump --net` ("N <winner> <deep value> <inputs>").
+    // Their target blends the game's result with the deep search's verdict, read as a win
+    // chance: (1 - mix) * winner + mix * sigmoid(value / scale).
+    let teach: Vec<String> = args.iter().enumerate().filter(|(i, _)| *i > 0 && args[i - 1] == "--teach").map(|(_, a)| a.clone()).collect();
+    let mix: f32 = opt("--mix").and_then(|s| s.parse().ok()).unwrap_or(0.5);
+    let scale: f32 = opt("--scale").and_then(|s| s.parse().ok()).unwrap_or(15.0);
     let mut files = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -123,7 +129,7 @@ fn main() {
             skip = false;
             continue;
         }
-        if ["--bots", "--epochs", "--every", "--from", "--lr", "--emit"].contains(&a.as_str()) {
+        if ["--bots", "--epochs", "--every", "--from", "--lr", "--emit", "--teach", "--mix", "--scale"].contains(&a.as_str()) {
             skip = true;
             continue;
         }
@@ -166,7 +172,34 @@ fn main() {
             if held { test.push(ex) } else { train.push(ex) }
         }
     }
-    println!("{games} games; {} training positions, {} held out", train.len(), test.len());
+    let mut taught = 0usize;
+    for path in &teach {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        for (li, line) in text.lines().enumerate() {
+            let mut it = line.split_whitespace();
+            if it.next() != Some("N") {
+                continue;
+            }
+            let v: Vec<f32> = it.filter_map(|x| x.parse().ok()).collect();
+            if v.len() != 2 + 2 * OWN + CTX {
+                continue;
+            }
+            let (winner, value) = (v[0], v[1]);
+            let y = (1.0 - mix) * winner + mix / (1.0 + (-value / scale).exp());
+            let mut a = [0.0f32; OWN];
+            let mut b = [0.0f32; OWN];
+            let mut c = [0.0f32; CTX];
+            a.copy_from_slice(&v[2..2 + OWN]);
+            b.copy_from_slice(&v[2 + OWN..2 + 2 * OWN]);
+            c.copy_from_slice(&v[2 + 2 * OWN..]);
+            let hp = a[0] - b[0];
+            // hold out by blocks of 300 lines (about ten games)
+            let ex = Ex { a, b, c, hp, y };
+            if (li / 300) % 5 == 4 { test.push(ex) } else { train.push(ex) }
+            taught += 1;
+        }
+    }
+    println!("{games} games and {taught} teacher positions; {} training positions, {} held out", train.len(), test.len());
     if train.is_empty() {
         return;
     }

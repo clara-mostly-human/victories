@@ -1,6 +1,11 @@
 //! visitfit: trains the search's move model on its own visit counts (the AlphaZero recipe).
 //!
 //!   visitfit --target move|shot|frost|burst [--epochs 10] [--emit] <visits file>...
+//!            [--replays dir --bots A,B,... --replay-weight 1]
+//!
+//! The move model of part 3: the deep search's choices (visits files from `teachdump --net`,
+//! `<out>.visits`) and, with --replays, what the named strong bots actually played in the
+//! replays (one-hot targets, by `movefeat::labels`, counted `--replay-weight` times).
 //!
 //! A visits file comes from `ARENA_VISITS=file arena ...`: per tree decision, the shares of
 //! the root's visits by move class (hold, toward, away, sideways, dash) and the shares spent
@@ -10,7 +15,10 @@
 //! out; the tool reports cross-entropy against the targets for the fit and for a constant.
 //! With --emit it prints the weights as the Rust constant `movefit --emit` would.
 
-use victris_engine::movefeat::{CLASSES, N};
+use flate2::read::GzDecoder;
+use std::io::Read;
+use victris_engine::movefeat::{features, labels, CLASSES, N, TARGETS};
+use victris_engine::replay::parse_replay;
 
 fn softmax(w: &[[f32; N]; CLASSES], x: &[f32; N], k: usize) -> Vec<f32> {
     let mut z = vec![0.0f32; k];
@@ -33,6 +41,8 @@ fn main() {
     let epochs: usize = opt("--epochs").and_then(|s| s.parse().ok()).unwrap_or(10);
     let emit = args.iter().any(|a| a == "--emit");
     let k = if target == "move" { CLASSES } else { 2 };
+    // --search-weight: how many times a decision of the search counts (its records are few)
+    let search_weight = opt("--search-weight").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).max(1);
     let mut rows: Vec<([f32; N], Vec<f32>)> = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -40,7 +50,7 @@ fn main() {
             skip = false;
             continue;
         }
-        if a == "--target" || a == "--epochs" {
+        if ["--target", "--epochs", "--replays", "--bots", "--replay-weight", "--search-weight"].contains(&a.as_str()) {
             skip = true;
             continue;
         }
@@ -66,7 +76,52 @@ fn main() {
             };
             let mut f = [0.0f32; N];
             f.copy_from_slice(&v[8..]);
-            rows.push((f, y));
+            for _ in 0..search_weight {
+                rows.push((f, y.clone()));
+            }
+        }
+    }
+    let searched = rows.len() / search_weight;
+    // the strong bots' own moves, one-hot
+    let mut played = 0usize;
+    if let Some(dir) = opt("--replays") {
+        let bots: Vec<String> = opt("--bots").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
+        let weight = opt("--replay-weight").and_then(|s| s.parse::<usize>().ok()).unwrap_or(1).max(1);
+        let which = TARGETS.iter().position(|n| *n == target.as_str()).unwrap_or(0);
+        let k_idx = match target.as_str() { "move" => 0, "shot" => 2, "frost" => 3, "burst" => 4, _ => which };
+        let mut files: Vec<_> = std::fs::read_dir(&dir).map(|d| d.flatten().map(|e| e.path()).collect()).unwrap_or_default();
+        files.sort();
+        for path in files {
+            let mut text = String::new();
+            if std::fs::File::open(&path).map(|f| GzDecoder::new(f).read_to_string(&mut text)).is_err() {
+                continue;
+            }
+            let Ok(replay) = parse_replay(&text) else { continue };
+            let e = &replay.engine;
+            let counted: Vec<bool> = (0..2).map(|i| replay.bots.get(i).map(|n| bots.contains(n)).unwrap_or(false)).collect();
+            if !counted.iter().any(|c| *c) {
+                continue;
+            }
+            let mut st = e.new_match(replay.seed);
+            for t in &replay.ticks {
+                if st.result.is_some() {
+                    break;
+                }
+                for x in 0..2 {
+                    if !counted[x] {
+                        continue;
+                    }
+                    let Some(label) = labels(e, &st, x, &t.turns[x])[k_idx] else { continue };
+                    let mut y = vec![0.0f32; k];
+                    y[label.min(k - 1)] = 1.0;
+                    let f = features(e, &st, x);
+                    for _ in 0..weight {
+                        rows.push((f, y.clone()));
+                    }
+                    played += 1;
+                }
+                e.step(&mut st, &t.turns);
+            }
         }
     }
     let (mut train, mut test) = (Vec::new(), Vec::new());
@@ -112,7 +167,7 @@ fn main() {
     }
     let n = test.len().max(1) as f64;
     if !emit {
-        println!("{} training decisions, {} held out; cross-entropy against the visit shares: fit {:.4}, constant {:.4}", train.len(), test.len(), fit / n, base / n);
+        println!("{} training decisions, {} held out ({searched} from the search, {played} strong-bot moves); cross-entropy against the targets: fit {:.4}, constant {:.4}", train.len(), test.len(), fit / n, base / n);
         return;
     }
     if target == "move" {

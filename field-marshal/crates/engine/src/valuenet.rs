@@ -116,6 +116,21 @@ pub fn g(w: &[f32], mine: &[f32; OWN], theirs: &[f32; OWN], c: &[f32; CTX]) -> f
     out
 }
 
+/// The network's log-odds of fighter `x` winning.
+pub fn logit(e: &Engine, s: &State, x: usize, w: &[f32]) -> f32 {
+    if w.len() != NW {
+        return 0.0;
+    }
+    let (a, b, c) = (own(e, s, x), own(e, s, 1 - x), ctx(e, s));
+    g(w, &a, &b, &c) - g(w, &b, &a, &c)
+}
+
+/// The network's verdict for fighter `x` read as an hp lead: the lead that alone would give
+/// the same chance of winning (`hp_per_logit` from the trainer's hp-alone fit).
+pub fn hp_equiv(e: &Engine, s: &State, x: usize, w: &[f32], hp_per_logit: f32) -> f32 {
+    logit(e, s, x, w) * hp_per_logit
+}
+
 /// Fighter `x`'s chance of winning from this position, by the weights given.
 pub fn win_prob(e: &Engine, s: &State, x: usize, w: &[f32]) -> f32 {
     if w.len() != NW {

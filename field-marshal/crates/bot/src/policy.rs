@@ -163,12 +163,20 @@ pub struct Playbook {
     pub tree_solve: u32,
     /// weight of the win-probability judgment at the tree's leaves (hp per unit of 2p - 1)
     pub tree_net: f64,
+    /// The win-probability network as the whole leaf, in hp (`mcts::Config::net_hp`): 1.0 replaces
+    /// the hp count and the judgment at the end of the play-out with the network's verdict.
+    pub tree_net_hp: f64,
     /// not 0: while either fighter holds the power buff, the tree searches this deep and plays
     /// out `tree_quiet_buff` ticks at its leaves, so it sees the buff's 50 ticks run out
     pub tree_depth_buff: u32,
     /// keep the search tree between ticks: the branch the game went into seeds the next
     /// tick's search (one thread, in view only)
     pub tree_reuse: bool,
+    /// Plans as moves in the search (`mcts::Config::plans`, part 4); a kept tree is not reused with it.
+    pub tree_plans: bool,
+    /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
+    /// the book's tile then (written by `openbook`); off the line, the search decides.
+    pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
     pub tree_quiet_buff: u32,
     /// tree search settings, for tuning offline: ticks of quiet play-out at a leaf (6),
     /// the exploration constant (1.5), the share of the prior spread evenly (0.25)
@@ -327,8 +335,11 @@ impl Default for Playbook {
             tree_max_nodes: 0,
             tree_solve: 0,
             tree_net: 0.0,
+            tree_net_hp: 0.0,
             tree_depth_buff: 0,
             tree_reuse: false,
+            tree_plans: false,
+            book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
             tree_threads: 1,
@@ -355,6 +366,25 @@ impl Playbook {
     /// The default playbook with any fields in `v` replaced.
     pub fn from_json(name: &str, v: &Value) -> Playbook {
         let mut p = Playbook { name: name.to_string(), ..Playbook::default() };
+        // "book": {"<map>/<seat>": {"book": [{"tick", "pos", "turn"}, ...]} or [...] }
+        if let Some(books) = v.get("book").and_then(Value::as_object) {
+            for (key, b) in books {
+                let list = b.get("book").unwrap_or(b);
+                let line: Vec<(i32, P, Value)> = list
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| {
+                                let tick = x.get("tick")?.as_i64()? as i32;
+                                let pos = x.get("pos")?.as_array()?;
+                                Some((tick, [pos.first()?.as_i64()? as i32, pos.get(1)?.as_i64()? as i32], x.get("turn")?.clone()))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                p.book.insert(key.clone(), line);
+            }
+        }
         let f = |k: &str, slot: &mut f64| {
             if let Some(x) = v.get(k).and_then(Value::as_f64) {
                 *slot = x;
@@ -388,6 +418,7 @@ impl Playbook {
         f("tree_value", &mut p.tree_value);
         f("tree_c", &mut p.tree_c);
         f("tree_net", &mut p.tree_net);
+        f("tree_net_hp", &mut p.tree_net_hp);
         f("tree_even", &mut p.tree_even);
         f("pad_bonus", &mut p.pad_bonus);
         f("attack_prior_weight", &mut p.attack_prior_weight);
@@ -435,7 +466,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them), ("tree_reuse", &mut p.tree_reuse)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them), ("tree_reuse", &mut p.tree_reuse), ("tree_plans", &mut p.tree_plans)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -1323,6 +1354,12 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     if my.state != FState::Idle {
         return idle;
     }
+    // The opening book, while we are on its line.
+    if let Some(line) = pb.book.get(&format!("{}/{}", e.map.name, me + 1)) {
+        if let Some((_, _, turn)) = line.iter().find(|(tick, pos, _)| *tick == s.tick && *pos == my.pos) {
+            return Decision { turn: RawTurn::from_json(Some(turn), &e.rules), sims: 0, score: 0.0, note: "book" };
+        }
+    }
     let k = kit(e);
     let visible = view.enemy.is_some();
     // The tree search as the whole brain: both sides search for their best move on the
@@ -1331,10 +1368,12 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     let guessed = pb.tree_fog > 0 && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_fog).unwrap_or(s.tick <= pb.tree_fog);
     if pb.tree_ms > 0 && pb.search && (visible || guessed) && t.think_cap_ms(pb.tree_ms) >= 20 {
         let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, lead_mask: if pb.tree_lead_them { 1u8 << (1 - me) } else { 0 }, expand_at: pb.tree_expand_at, max_nodes: pb.tree_max_nodes, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
-        if pb.tree_value != 0.0 || pb.tree_net != 0.0 {
+        if pb.tree_value != 0.0 || pb.tree_net != 0.0 || pb.tree_net_hp != 0.0 {
             cfg.buff_value = 0.0;
         }
         cfg.net_weight = pb.tree_net;
+        cfg.net_hp = pb.tree_net_hp;
+        cfg.plans = pb.tree_plans;
         if pb.tree_depth_buff > 0 && s.fighters.iter().any(|f| f.power_until != NO_BUFF && f.power_until > s.tick) {
             cfg.depth = pb.tree_depth_buff;
             if pb.tree_quiet_buff > 0 {

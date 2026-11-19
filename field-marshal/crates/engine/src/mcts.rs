@@ -21,7 +21,8 @@ use crate::movefeat::features;
 use crate::observe::can_see;
 use crate::rules::AttackKind;
 use crate::state::{FState, State, NO_BUFF};
-use crate::turn::RawTurn;
+use crate::map::PadKind;
+use crate::turn::{DirIn, RawTurn};
 use crate::Engine;
 use std::collections::HashMap;
 
@@ -44,6 +45,15 @@ pub struct Config {
     pub value_gen: usize,
     /// hp per unit of (2p - 1) of the win-probability judgment (`valuenet`) at a leaf; 0 = off
     pub net_weight: f64,
+    /// The win-probability network as the whole leaf: at the end of the play-out the hp count
+    /// gives way to the network's verdict read as an hp lead (`valuenet::hp_equiv`). With 1.0
+    /// a leaf is worth the network's hp-equivalent minus the root's lead.
+    pub net_hp: f64,
+    /// Plans as moves (part 4): at the root each side may also commit to a plan for
+    /// `PLAN_TICKS` ticks (go to the nearest power pad, to the nearest health pad when hurt,
+    /// to the centre, or at the opponent), its steps forced in the subtree below and carried
+    /// on through the leaf's play-out, so the search can value goals farther than it branches.
+    pub plans: bool,
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
     /// fighters (bit 0 = fighter 0, bit 1 = fighter 1) whose standing shots may lead, in
@@ -72,7 +82,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, plans: false, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -92,6 +102,105 @@ pub struct Act {
 struct Node {
     acts: [Vec<Act>; 2],
     n: u32,
+    /// the plan each side follows here (1-based index into the search's plans; 0 for none)
+    plan: [u8; 2],
+    /// the forced plan ticks left from here
+    left: [u8; 2],
+}
+
+/// Ticks a plan chosen at the root commits a side to (the root's tick included).
+pub const PLAN_TICKS: u8 = 6;
+/// Prior of each plan at the root, before the root's priors are scaled back to one.
+const PLAN_PRIOR: f32 = 0.08;
+
+/// Steps from every tile to `target` (u16::MAX where it cannot be reached).
+fn dist_map(e: &Engine, target: P) -> Vec<u16> {
+    let w = e.map.w;
+    let mut d = vec![u16::MAX; (w * e.map.h) as usize];
+    if !e.map.in_bounds(target) || e.map.is_wall(target) {
+        return d;
+    }
+    let idx = |p: P| (p[1] * w + p[0]) as usize;
+    let mut q = std::collections::VecDeque::new();
+    d[idx(target)] = 0;
+    q.push_back(target);
+    while let Some(p) = q.pop_front() {
+        let dp = d[idx(p)];
+        for dir in 0..8u8 {
+            // the tile from which a step in `dir` lands on `p`
+            let from = add(p, DIR_VEC[((dir + 4) % 8) as usize]);
+            if !e.map.in_bounds(from) || e.map.is_wall(from) || e.map.step_blocked(from, dir) {
+                continue;
+            }
+            if d[idx(from)] == u16::MAX {
+                d[idx(from)] = dp + 1;
+                q.push_back(from);
+            }
+        }
+    }
+    d
+}
+
+/// A turn that follows a plan: the quiet play-out's sure shot, slam or dodge, and otherwise
+/// a step down the plan's distance map.
+fn plan_turn(e: &Engine, s: &State, x: usize, dist: &[u16], slam: bool) -> RawTurn {
+    let mut t = quiet_turn(e, s, x, slam);
+    let f = &s.fighters[x];
+    if f.state != FState::Idle || f.cd_move != 0 || !matches!(t.mv, DirIn::None) || !matches!(t.dash, DirIn::None) {
+        return t;
+    }
+    let w = e.map.w;
+    let at = |p: P| dist.get((p[1] * w + p[0]) as usize).cloned().unwrap_or(u16::MAX);
+    let mut best = (at(f.pos), None);
+    for dir in 0..8u8 {
+        let p = add(f.pos, DIR_VEC[dir as usize]);
+        if e.map.step_blocked(f.pos, dir) || !e.map.in_bounds(p) {
+            continue;
+        }
+        if at(p) < best.0 {
+            best = (at(p), Some(dir));
+        }
+    }
+    if let Some(dir) = best.1 {
+        t.mv = RawTurn::step(dir).mv;
+    }
+    t
+}
+
+/// The plans side `x` may commit to here: the nearest power pad (without a long buff) and,
+/// when hurt, the nearest health pad, each there or back by the time it arrives; the centre;
+/// the opponent's tile.
+fn plan_targets(e: &Engine, s: &State, x: usize) -> Vec<P> {
+    let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
+    let mut out = Vec::new();
+    for kind in [PadKind::Power, PadKind::Health] {
+        if kind == PadKind::Health && f.hp >= e.rules.max_hp - 10 {
+            continue;
+        }
+        if kind == PadKind::Power && f.power_until != NO_BUFF && f.power_until > s.tick + 10 {
+            continue;
+        }
+        let best = e
+            .map
+            .pads
+            .iter()
+            .enumerate()
+            .filter(|(i, def)| {
+                let d = chebyshev(f.pos, def.pos);
+                def.kind == kind && d > 0 && (s.pads[*i].available || s.pads[*i].respawn_tick - s.tick <= d + 4)
+            })
+            .min_by_key(|(_, def)| chebyshev(f.pos, def.pos));
+        if let Some((_, def)) = best {
+            out.push(def.pos);
+        }
+    }
+    if chebyshev(f.pos, e.map.center) >= 2 {
+        out.push(e.map.center);
+    }
+    if o.alive && chebyshev(f.pos, o.pos) >= 3 {
+        out.push(o.pos);
+    }
+    out
 }
 
 /// The turns a fighter can take, with priors that sum to 1. With `forcing`, turns that
@@ -313,14 +422,18 @@ fn reward(s: &State, before: (i32, i32)) -> f64 {
 }
 
 /// The value of a position beyond the hp already counted, for fighter 0.
-pub fn leaf_value(e: &Engine, s: &State, cfg: &Config) -> f64 {
+pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2]) -> f64 {
     let mut st = *s;
     let mut v = 0.0;
+    let pick = |st: &State, x: usize| match plans[x] {
+        Some(d) => plan_turn(e, st, x, d, cfg.quiet_slam),
+        None => quiet_turn(e, st, x, cfg.quiet_slam),
+    };
     for _ in 0..cfg.quiet {
         if st.result.is_some() {
             break;
         }
-        let turns = [quiet_turn(e, &st, 0, cfg.quiet_slam), quiet_turn(e, &st, 1, cfg.quiet_slam)];
+        let turns = [pick(&st, 0), pick(&st, 1)];
         let before = (st.fighters[0].hp, st.fighters[1].hp);
         e.step(&mut st, &turns);
         v += reward(&st, before);
@@ -331,6 +444,11 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config) -> f64 {
         // the win-probability judgment, as hp: net_weight * (2p - 1) for fighter 0
         let p = crate::valuenet::win_prob(e, &st, 0, &crate::valuenet_weights::VALUE_NET) as f64;
         v += cfg.net_weight * (2.0 * p - 1.0);
+    }
+    if cfg.net_hp != 0.0 && st.result.is_none() {
+        let lead = (st.fighters[0].hp - st.fighters[1].hp) as f64;
+        let equiv = crate::valuenet::hp_equiv(e, &st, 0, &crate::valuenet_weights::VALUE_NET, crate::valuenet_weights::VALUE_NET_HP) as f64;
+        v += cfg.net_hp * (equiv - lead);
     }
     if cfg.value_weight != 0.0 && st.result.is_none() {
         v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, crate::models::value_weights(cfg.value_gen)) as f64;
@@ -347,6 +465,10 @@ pub struct Search<'a> {
     done: u32,
     /// joint results at the root: (our turn index, their turn index) -> (visits, sum for fighter 0)
     pairs: HashMap<(u16, u16), (u32, f64)>,
+    /// distance maps of the plans offered at the root (`Config::plans`)
+    plans: Vec<Vec<u16>>,
+    /// per side, the plan of each root turn (1-based; 0 for a plain turn)
+    root_plan: [Vec<u8>; 2],
 }
 
 /// A search tree kept between ticks: the positions below a root, with their statistics.
@@ -374,7 +496,7 @@ pub struct RootResult {
 
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, cfg: Config) -> Search<'a> {
-        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0, pairs: HashMap::new() }
+        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0, pairs: HashMap::new(), plans: Vec::new(), root_plan: [Vec::new(), Vec::new()] }
     }
 
     fn select(&self, node: usize, side: usize) -> usize {
@@ -401,7 +523,8 @@ impl<'a> Search<'a> {
     /// Starts from a tree kept from the previous tick (see `reroot`).
     pub fn start_from(&mut self, tree: Tree) {
         self.start();
-        if !tree.nodes.is_empty() {
+        // plans are offered afresh at every root: a kept tree would carry the old ones
+        if !tree.nodes.is_empty() && !self.cfg.plans {
             self.nodes = tree.nodes;
             self.children = tree.children;
         }
@@ -476,6 +599,8 @@ impl<'a> Search<'a> {
         self.nodes.clear();
         self.children.clear();
         self.pairs.clear();
+        self.plans.clear();
+        self.root_plan = [Vec::new(), Vec::new()];
         self.nodes.push(Node::default());
         self.total = 0.0;
         self.done = 0;
@@ -553,6 +678,12 @@ impl<'a> Search<'a> {
             + self.nodes.capacity() * std::mem::size_of::<Node>()
     }
 
+    /// The distance maps of the plans in `ids` (1-based; 0 for none).
+    fn dists(&self, ids: [u8; 2]) -> [Option<&[u16]>; 2] {
+        let get = |id: u8| if id == 0 { None } else { self.plans.get(id as usize - 1).map(|v| v.as_slice()) };
+        [get(ids[0]), get(ids[1])]
+    }
+
     /// What the tree holds at the root now.
     pub fn result(&self) -> RootResult {
         let list = |x: usize| self.nodes[0].acts[x].iter().map(|a| (a.turn, a.n, if a.n > 0 { a.w / a.n as f64 } else { 0.0 })).collect();
@@ -567,23 +698,46 @@ impl<'a> Search<'a> {
             let mut node = 0usize;
             let mut path: Vec<(usize, usize, usize, f64)> = Vec::with_capacity(self.cfg.depth as usize);
             let mut leaf = 0.0;
+            // the plans the two sides took at the root in this iteration, carried into the play-out
+            let mut took = [0u8; 2];
             for depth in 0..self.cfg.depth {
                 if self.nodes[node].acts[0].is_empty() {
                     // With `expand_at`, a new position is first only judged; it gets its
                     // move lists (the costly part, in time and memory) once visited again.
                     if depth > 0 && self.nodes[node].n < self.cfg.expand_at {
                         self.nodes[node].n += 1;
-                        leaf = leaf_value(self.e, &s, &self.cfg);
+                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took));
                         break;
                     }
                     for x in 0..2 {
+                        let pid = self.nodes[node].plan[x];
                         self.nodes[node].acts[x] = match (depth, fixed[x]) {
                             (0, Some(t)) => vec![Act { turn: t, prior: 1.0, n: 0, w: 0.0 }],
+                            _ if pid != 0 => vec![Act { turn: plan_turn(self.e, &s, x, &self.plans[pid as usize - 1], self.cfg.quiet_slam), prior: 1.0, n: 0, w: 0.0 }],
                             _ => actions_with(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst),
                         };
                     }
+                    if depth == 0 && self.cfg.plans {
+                        for x in 0..2 {
+                            self.root_plan[x] = vec![0; self.nodes[0].acts[x].len()];
+                            if fixed[x].is_some() {
+                                continue;
+                            }
+                            for target in plan_targets(self.e, &s, x) {
+                                let dist = dist_map(self.e, target);
+                                let turn = plan_turn(self.e, &s, x, &dist, self.cfg.quiet_slam);
+                                self.plans.push(dist);
+                                self.nodes[0].acts[x].push(Act { turn, prior: PLAN_PRIOR, n: 0, w: 0.0 });
+                                self.root_plan[x].push(self.plans.len() as u8);
+                            }
+                            let sum: f32 = self.nodes[0].acts[x].iter().map(|a| a.prior).sum();
+                            for a in self.nodes[0].acts[x].iter_mut() {
+                                a.prior /= sum.max(1e-6);
+                            }
+                        }
+                    }
                     if depth > 0 && self.cfg.expand_at == 0 {
-                        leaf = leaf_value(self.e, &s, &self.cfg);
+                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took));
                         break;
                     }
                     if depth == 0 && self.cfg.noise_seed != 0 {
@@ -601,6 +755,9 @@ impl<'a> Search<'a> {
                     }
                 }
                 let (i0, i1) = (self.select(node, 0), self.select(node, 1));
+                if node == 0 && self.cfg.plans {
+                    took = [self.root_plan[0].get(i0).cloned().unwrap_or(0), self.root_plan[1].get(i1).cloned().unwrap_or(0)];
+                }
                 let turns = [self.nodes[node].acts[0][i0].turn, self.nodes[node].acts[1][i1].turn];
                 let before = (s.fighters[0].hp, s.fighters[1].hp);
                 self.e.step(&mut s, &turns);
@@ -609,7 +766,7 @@ impl<'a> Search<'a> {
                     break;
                 }
                 if depth + 1 == self.cfg.depth {
-                    leaf = leaf_value(self.e, &s, &self.cfg);
+                    leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took));
                     break;
                 }
                 let key = ((node as u64) << 32) | ((i0 as u64) << 16) | i1 as u64;
@@ -617,11 +774,26 @@ impl<'a> Search<'a> {
                     Some(c) => *c as usize,
                     None if self.cfg.max_nodes > 0 && self.nodes.len() >= self.cfg.max_nodes as usize => {
                         // The tree is as big as it may grow: judge this position as a leaf.
-                        leaf = leaf_value(self.e, &s, &self.cfg);
+                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took));
                         break;
                     }
                     None => {
-                        self.nodes.push(Node::default());
+                        let mut child = Node::default();
+                        if self.cfg.plans {
+                            // a plan taken at the root, or one still running here, goes on below
+                            for x in 0..2 {
+                                let (pid, left) = if node == 0 {
+                                    (self.root_plan[x].get(if x == 0 { i0 } else { i1 }).cloned().unwrap_or(0), PLAN_TICKS)
+                                } else {
+                                    (self.nodes[node].plan[x], self.nodes[node].left[x])
+                                };
+                                if pid != 0 && left > 1 {
+                                    child.plan[x] = pid;
+                                    child.left[x] = left - 1;
+                                }
+                            }
+                        }
+                        self.nodes.push(child);
                         let c = self.nodes.len() - 1;
                         self.children.insert(key, c as u32);
                         c
