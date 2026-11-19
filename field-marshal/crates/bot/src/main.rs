@@ -276,7 +276,20 @@ fn run_connection(session: &mut Session, url: &str, token: &str, stop: &AtomicBo
     }
 }
 
+// The highest scheduling class an ordinary process may ask for on a Mac: ahead of any batch
+// work at the default class, kept on the performance cores. Threads started later (the
+// search's) inherit it. 2026-11-19: under load from other work the bots lost turns.
+#[cfg(target_os = "macos")]
+extern "C" {
+    fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+}
+
 fn main() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        // QOS_CLASS_USER_INTERACTIVE
+        pthread_set_qos_class_self_np(0x21, 0);
+    }
     let args = match parse_args() {
         Ok(a) => a,
         Err(e) => {

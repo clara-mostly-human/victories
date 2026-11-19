@@ -136,7 +136,11 @@ impl Telemetry {
     pub fn start(root: &Path) -> Telemetry {
         let (tx, rx) = std::sync::mpsc::channel();
         let root = root.to_path_buf();
-        let started = std::thread::Builder::new().name("telemetry".into()).spawn(move || writer(root, rx));
+        let started = std::thread::Builder::new().name("telemetry".into()).spawn(move || {
+            // Disk writes wait behind the sockets, never the other way round.
+            crate::machine::set_thread_class(false);
+            writer(root, rx)
+        });
         match started {
             Ok(_) => Telemetry { tx: Some(Mutex::new(tx)) },
             Err(e) => {

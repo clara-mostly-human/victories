@@ -2065,6 +2065,8 @@ pub fn verdict(health: &HashMap<String, Value>, expected: &[String]) -> (String,
 /// Runs every bot that is set to go through the gateway, each on its own thread, and
 /// starts a thread for any bot that is switched over while it runs.
 pub fn run(root: &Path, stop: Arc<dyn Fn() -> bool + Send + Sync>) {
+    // Every thread started from here (the bots' socket threads, the listener) inherits this.
+    crate::machine::set_thread_class(true);
     let cfg = Config::load(root).unwrap_or_default();
     let shared = Arc::new(Shared::new(Options::load(root), &cfg));
     let _ = TEL.set(Telemetry::start(root));

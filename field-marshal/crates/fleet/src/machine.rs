@@ -141,6 +141,21 @@ pub fn last_worst_stall() -> u64 {
     LAST_WINDOW_STALL_MS.load(Ordering::Relaxed)
 }
 
+/// This thread's scheduling class on a Mac. `interactive`: the highest an ordinary process may
+/// ask for, ahead of batch work at the default class and kept on the performance cores;
+/// otherwise utility (below the default). New threads inherit their creator's class.
+/// 2026-11-19 (Mike): "if you push the mac ... the sockets get fucked": the gateway and the
+/// bots must win every contest for the CPU against whatever else runs.
+pub fn set_thread_class(interactive: bool) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let class = if interactive { libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE } else { libc::qos_class_t::QOS_CLASS_UTILITY };
+        libc::pthread_set_qos_class_self_np(class, 0);
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = interactive;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
