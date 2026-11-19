@@ -49,6 +49,8 @@ pub struct Config {
     pub guard_max_swap_used_gb: f64,
     /// ... or when the kernel's memory level (`kern.memorystatus_level`, percent) is under this
     pub guard_min_memory_level: f64,
+    /// ... or when a process had to wait longer than this for the CPU in the last 15 s, in ms
+    pub guard_max_cpu_wait_ms: f64,
     /// the strong bots each new build is compared with by the habits yardstick
     pub habits_bots: Vec<String>,
     /// pull replays from the repository's `corpus` branch (filled by the GitHub workflow)
@@ -77,7 +79,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0, guard_min_disk_gb: 10.0, guard_max_swap_used_gb: 10.0, guard_min_memory_level: 20.0, habits_bots: vec!["StuartSutcliffe".into(), "Shelbot4".into()], corpus_branch: false, prefer_addresses: Vec::new(), queue_gap_ms: 1000,
+        Config { bots: Vec::new(), guard_load: 8.0, guard_think_p99_ms: 300.0, guard_min_disk_gb: 10.0, guard_max_swap_used_gb: 10.0, guard_min_memory_level: 20.0, guard_max_cpu_wait_ms: 100.0, habits_bots: vec!["StuartSutcliffe".into(), "Shelbot4".into()], corpus_branch: false, prefer_addresses: Vec::new(), queue_gap_ms: 1000,
             // The ladder's own quotas are 20,000 matches a day per owner and one match start
             // per bot every 300 ms; these sit well inside them.
             comms_connects_per_minute: 20, comms_queues_per_minute: 90, comms_matches_per_day: 15_000, ladder_refresh_minutes: 0, baseline_playbooks: vec!["matrix-5".into()], autopilot_moves_bots: true, stall_restarts: false }
@@ -117,7 +119,7 @@ impl Config {
         let guard = |k: &str, dflt: f64| v.get("guard").and_then(|g| g.get(k)).and_then(Value::as_f64).unwrap_or(dflt);
         let comms = |k: &str, dflt: usize| v.get("comms").and_then(|c| c.get(k)).and_then(Value::as_u64).map(|n| n as usize).unwrap_or(dflt);
         let habits_bots = v.get("habits_bots").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or(d.habits_bots);
-        Config { bots, guard_load: guard("load", d.guard_load), guard_think_p99_ms: guard("think_p99_ms", d.guard_think_p99_ms), guard_min_disk_gb: guard("min_disk_gb", d.guard_min_disk_gb), guard_max_swap_used_gb: guard("max_swap_used_gb", d.guard_max_swap_used_gb), guard_min_memory_level: guard("min_memory_level", d.guard_min_memory_level), habits_bots, corpus_branch: v.get("corpus_branch").and_then(Value::as_bool).unwrap_or(false),
+        Config { bots, guard_load: guard("load", d.guard_load), guard_think_p99_ms: guard("think_p99_ms", d.guard_think_p99_ms), guard_min_disk_gb: guard("min_disk_gb", d.guard_min_disk_gb), guard_max_swap_used_gb: guard("max_swap_used_gb", d.guard_max_swap_used_gb), guard_min_memory_level: guard("min_memory_level", d.guard_min_memory_level), guard_max_cpu_wait_ms: guard("max_cpu_wait_ms", d.guard_max_cpu_wait_ms), habits_bots, corpus_branch: v.get("corpus_branch").and_then(Value::as_bool).unwrap_or(false),
             prefer_addresses: v.get("prefer_addresses").and_then(Value::as_array).map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect()).unwrap_or_default(),
             queue_gap_ms: v.get("queue_gap_ms").and_then(Value::as_u64).unwrap_or(d.queue_gap_ms),
             comms_connects_per_minute: comms("connects_per_minute", d.comms_connects_per_minute),

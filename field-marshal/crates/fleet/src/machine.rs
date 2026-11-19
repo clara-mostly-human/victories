@@ -128,8 +128,17 @@ pub fn start_stall_probe() {
         .ok();
 }
 
+/// The worst wait of the last 15-second window, kept for the batch guard.
+static LAST_WINDOW_STALL_MS: AtomicU64 = AtomicU64::new(0);
+
 pub fn take_worst_stall() -> u64 {
-    WORST_STALL_MS.swap(0, Ordering::Relaxed)
+    let w = WORST_STALL_MS.swap(0, Ordering::Relaxed);
+    LAST_WINDOW_STALL_MS.store(w, Ordering::Relaxed);
+    w
+}
+
+pub fn last_worst_stall() -> u64 {
+    LAST_WINDOW_STALL_MS.load(Ordering::Relaxed)
 }
 
 #[cfg(test)]

@@ -275,6 +275,11 @@ pub fn overload(root: &Path, cfg: &Config) -> Option<String> {
     if let Some(p) = crate::machine::read(root).problems(cfg).into_iter().next() {
         return Some(p);
     }
+    // A process kept waiting for the CPU is the harm itself, whatever caused it.
+    let wait = crate::machine::last_worst_stall();
+    if wait as f64 > cfg.guard_max_cpu_wait_ms {
+        return Some(format!("a process waited {wait} ms for the CPU (limit {:.0} ms)", cfg.guard_max_cpu_wait_ms));
+    }
     let load = load_average();
     if load > cfg.guard_load {
         return Some(format!("load average {load:.1} is above {:.0}", cfg.guard_load));
