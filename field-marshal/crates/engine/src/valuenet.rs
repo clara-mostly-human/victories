@@ -131,6 +131,12 @@ pub fn hp_equiv(e: &Engine, s: &State, x: usize, w: &[f32], hp_per_logit: f32) -
     logit(e, s, x, w) * hp_per_logit
 }
 
+/// The hp fighter `x` is expected to gain or lose from here (discounted 0.98 a tick, 40 for a
+/// kill), by weights trained with `winlab --target hp` (the network's output is in units of 32 hp).
+pub fn hp_to_come(e: &Engine, s: &State, x: usize, w: &[f32]) -> f32 {
+    32.0 * logit(e, s, x, w)
+}
+
 /// Fighter `x`'s chance of winning from this position, by the weights given.
 pub fn win_prob(e: &Engine, s: &State, x: usize, w: &[f32]) -> f32 {
     if w.len() != NW {

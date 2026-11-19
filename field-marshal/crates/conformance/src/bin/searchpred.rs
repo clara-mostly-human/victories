@@ -59,6 +59,7 @@ fn main() {
         buff_value: 0.0,
         dash_burst: args.iter().any(|a| a == "--dash-burst"),
         max_nodes: 60_000,
+        plans: args.iter().any(|a| a == "--plans"),
         ..Default::default()
     };
     let valued = ["--net-hp", "--every", "--max", "--iters", "--lin", "--gen", "--net", "--depth", "--quiet", "--out"];
@@ -84,6 +85,10 @@ fn main() {
     files.sort_by_key(|p| fnv(&format!("x{}", p.file_name().unwrap().to_string_lossy())));
     // (game, tick, last, winner for fighter 0, hp lead, root value)
     let mut rows: Vec<(usize, i32, i32, f64, f64, f64)> = Vec::new();
+    // with --plans: how often a plan was the most visited root turn, by kind, and its share of visits
+    let mut plan_top = [0usize; 5];
+    let mut plan_share = [0.0f64; 5];
+    let mut sides = 0usize;
     let t0 = std::time::Instant::now();
     for (gi, path) in files.iter().enumerate() {
         if rows.len() >= max {
@@ -114,6 +119,21 @@ fn main() {
                 let mut search = Search::new(e, cfg);
                 search.start();
                 search.iterate(&s, [None, None], iters);
+                if cfg.plans {
+                    let res = search.result();
+                    let stats = search.plan_stats();
+                    for x in 0..2 {
+                        let total: u32 = res.acts[x].iter().map(|a| a.1).sum();
+                        let top = res.acts[x].iter().map(|a| a.1).max().unwrap_or(0);
+                        sides += 1;
+                        for (kind, n, _) in &stats[x] {
+                            plan_share[*kind as usize] += *n as f64 / total.max(1) as f64;
+                            if *n == top && top > 0 {
+                                plan_top[*kind as usize] += 1;
+                            }
+                        }
+                    }
+                }
                 let lead = (s.fighters[0].hp - s.fighters[1].hp) as f64;
                 rows.push((gi, s.tick, last, y, lead, search.result().value));
             }
@@ -121,6 +141,11 @@ fn main() {
         }
     }
     eprintln!("{} positions from held-out games in {:.0}s", rows.len(), t0.elapsed().as_secs_f64());
+    if cfg.plans {
+        for k in 0..5 {
+            println!("plan {:<16} most visited at {:>5.1}% of decisions, {:>5.1}% of root visits", victris_engine::mcts::PLAN_NAMES[k], 100.0 * plan_top[k] as f64 / sides.max(1) as f64, 100.0 * plan_share[k] / sides.max(1) as f64);
+        }
+    }
     if let Some(out) = opt("--out") {
         let mut f = std::fs::File::create(out).expect("create --out");
         for r in &rows {

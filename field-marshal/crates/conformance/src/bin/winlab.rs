@@ -35,8 +35,13 @@ use victris_engine::valuenet::{ctx, own, CTX, OWN};
 const Q: f32 = 4096.0;
 /// Row layout in the store: hp difference (share of max hp), (hp difference + linear judgment) / 32 in hp, fighter 0's inputs, fighter
 /// 1's inputs, the position's.
-const R: usize = 2 + 2 * OWN + CTX + 2 * EXO + EXC + 1;
-/// The last column: the hp lead plus the teacher's deep-search value for fighter 0, / 32 in hp, or `NO_TEACH`.
+const R: usize = 2 + 2 * OWN + CTX + 2 * EXO + EXC + 2;
+/// Column of the teacher's value (see `NO_TEACH`).
+const TEACH_COL: usize = R - 2;
+/// Last column: the discounted hp fighter 0 went on to gain or lose from here (0.98 a tick,
+/// 40 for a kill), / 32: the target the search's linear judgment is fitted to.
+const HPC_COL: usize = R - 1;
+/// Column `TEACH_COL`: the hp lead plus the teacher's deep-search value for fighter 0, / 32 in hp, or `NO_TEACH`.
 const NO_TEACH: i16 = i16::MIN;
 /// The teacher run's spacing (`teachdump --every`).
 const TEACH_EVERY: usize = 15;
@@ -150,6 +155,8 @@ fn one_game(path: &Path, every: usize, gen: usize, playout: u32, teach: Option<&
     let mut rows = Vec::new();
     let mut hp_hist: Vec<[i32; 2]> = Vec::new();
     let mut taught = 0usize;
+    let mut row_ti: Vec<usize> = Vec::new();
+    let mut reward: Vec<f32> = Vec::new();
     for (ti, t) in replay.ticks.iter().enumerate() {
         if s.result.is_some() {
             break;
@@ -190,15 +197,34 @@ fn one_game(path: &Path, every: usize, gen: usize, playout: u32, teach: Option<&
             row.extend(extra_ctx(e, p).iter().map(|v| q(*v)));
             // the search's value is the hp it expects to gain from here: add the hp lead it starts from
             row.push(tv.map(|v| q(((s.fighters[0].hp - s.fighters[1].hp) as f32 + v) / 32.0)).unwrap_or(NO_TEACH));
+            row.push(0); // hp to come, filled in below
             rows.push((s.tick as i16, row));
+            row_ti.push(ti);
         }
+        let before = (s.fighters[0].hp.max(0), s.fighters[1].hp.max(0));
         e.step(&mut s, &t.turns);
+        let mut r = ((s.fighters[0].hp.max(0) - before.0) - (s.fighters[1].hp.max(0) - before.1)) as f32;
+        if !s.fighters[1].alive {
+            r += 40.0;
+        }
+        if !s.fighters[0].alive {
+            r -= 40.0;
+        }
+        reward.push(r);
+    }
+    // discounted hp to come from each tick (0.98 a tick), as `valuefit` and `ARENA_DUMP` count it
+    let mut to_come = vec![0.0f32; reward.len() + 1];
+    for k in (0..reward.len()).rev() {
+        to_come[k] = reward[k] + 0.98 * to_come[k + 1];
+    }
+    for ((_, r), ti) in rows.iter_mut().zip(&row_ti) {
+        r[HPC_COL] = q(to_come[*ti] / 32.0);
     }
     if let Some(v) = teach {
         if v.len() != taught {
             // the teacher's positions do not line up with this replay: drop its values
             for (_, r) in rows.iter_mut() {
-                r[R - 1] = NO_TEACH;
+                r[TEACH_COL] = NO_TEACH;
             }
         }
     }
@@ -426,7 +452,7 @@ fn main() {
     let list = |name: &str| opt(name).map(|s| s.split(",").filter(|x| !x.is_empty()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
     let top = list("--top");
     let ours = { let o = list("--ours"); if o.is_empty() { vec!["field-marshal".to_string(), "foot-soldier".into(), "shock-trooper".into(), "quarter-master".into(), "spy-master".into()] } else { o } };
-    let valued = ["--playout", "--teach-weight", "--teach", "--mix", "--extra", "--frac", "--cache", "--every", "--gen", "--h1", "--h2", "--epochs", "--lr", "--wd", "--td", "--td-rounds", "--misses", "--emit", "--top", "--ours"];
+    let valued = ["--target", "--playout", "--teach-weight", "--teach", "--mix", "--extra", "--frac", "--cache", "--every", "--gen", "--h1", "--h2", "--epochs", "--lr", "--wd", "--td", "--td-rounds", "--misses", "--emit", "--top", "--ours"];
     let mut dirs = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -598,7 +624,27 @@ fn main() {
         let fan = if i < net.n_in * h1 { net.n_in } else if i < net.n_in * h1 + h1 + h1 * h2 { h1 } else { h2 };
         *v = rnd() * 2.0 * (2.0 / fan as f32).sqrt();
     }
-    let teach_of = |i: usize| -> Option<f32> { let v = st.row(i)[R - 1]; if v == NO_TEACH { None } else { Some(v as f32 / Q) } };
+    let teach_of = |i: usize| -> Option<f32> { let v = st.row(i)[TEACH_COL]; if v == NO_TEACH { None } else { Some(v as f32 / Q) } };
+    // --target hp: the network predicts the discounted hp to come (in units of 32 hp) instead of
+    // the winner, the way the search's linear judgment does; the teacher's value then counts as
+    // the deep search's expected gain from here
+    let hp_mode = opt("--target").as_deref() == Some("hp");
+    let hpc_of = |i: usize| st.row(i)[HPC_COL] as f32 / Q;
+    let lead32 = |i: usize| hp_of(i) * 130.0 / 32.0;
+    // the linear judgment alone (row `--gen`), / 32 hp, and its one-weight fit to the hp to come
+    let jud = |i: usize| (lin_of(i) * 32.0 - hp_of(i) * 130.0) / 32.0;
+    let kj = {
+        let (mut sxy, mut sxx) = (0.0f64, 1e-9f64);
+        for &i in train.iter().step_by(3) {
+            sxy += (jud(i) * hpc_of(i)) as f64;
+            sxx += (jud(i) * jud(i)) as f64;
+        }
+        (sxy / sxx) as f32
+    };
+    // --residual: the network learns what the linear judgment misses (target minus its fit);
+    // its verdict is then the judgment plus the network
+    let residual = args.iter().any(|a| a == "--residual");
+    let base_of = |i: usize| if residual { kj * jud(i) } else { 0.0 };
     let mix = num("--mix", 0.0) as f32;
     // --teach-weight: how much more a position with a teacher value counts in training
     let teach_weight = num("--teach-weight", 1.0) as f32;
@@ -619,12 +665,27 @@ fn main() {
         eprintln!("teacher values on {have} training positions; fitted scale {:.2} per 32 hp", k);
         k as f32
     };
-    let blend = |i: usize, base: f32| -> f32 { match teach_of(i) { Some(v) if mix > 0.0 => (1.0 - mix) * base + mix * sigmoid(k_teach * v), _ => base } };
-    let mut target: Vec<f32> = (0..st.len()).map(|i| blend(i, y_of(i))).collect();
+    let blend = |i: usize, base: f32| -> f32 {
+        match teach_of(i) {
+            Some(v) if mix > 0.0 && hp_mode => (1.0 - mix) * base + mix * (v - lead32(i)),
+            Some(v) if mix > 0.0 => (1.0 - mix) * base + mix * sigmoid(k_teach * v),
+            _ => base,
+        }
+    };
+    let mut target: Vec<f32> = (0..st.len()).map(|i| if hp_mode { blend(i, hpc_of(i)) - base_of(i) } else { blend(i, y_of(i)) }).collect();
+    let raw = |w: &[f32], i: usize, xa: &mut Vec<f32>, xb: &mut Vec<f32>, a: &mut Act| -> f32 {
+        inputs(&st, i, skill_of(i, false), &sel_own, &sel_ctx, xa, xb);
+        let za = net.fwd(w, xa, a);
+        let zb = net.fwd(w, xb, a);
+        za - zb
+    };
     let (mut xa, mut xb) = (Vec::with_capacity(net.n_in), Vec::with_capacity(net.n_in));
     let mut a = net.act();
     let mut ab = net.act();
     let valid_ll = |w: &[f32], xa: &mut Vec<f32>, xb: &mut Vec<f32>, a: &mut Act| -> f64 {
+        if hp_mode {
+            return valid.iter().map(|&i| ((raw(w, i, xa, xb, a) + base_of(i) - hpc_of(i)) as f64).powi(2)).sum::<f64>() / valid.len().max(1) as f64;
+        }
         valid.iter().map(|&i| logloss(prob(w, i, false, xa, xb, a), y_of(i))).sum::<f64>() / valid.len().max(1) as f64
     };
     let mut order = train.clone();
@@ -657,7 +718,8 @@ fn main() {
                     inputs(&st, i, skill_of(i, false), &sel_own, &sel_ctx, &mut xa, &mut xb);
                     let za = net.fwd(&w, &xa, &mut a);
                     let zb = net.fwd(&w, &xb, &mut ab);
-                    let d = (sigmoid(za - zb) - target[i]) * if teach_of(i).is_some() { teach_weight } else { 1.0 };
+                    let out = if hp_mode { za - zb } else { sigmoid(za - zb) };
+                    let d = (out - target[i]) * if teach_of(i).is_some() { teach_weight } else { 1.0 };
                     net.bwd(&w, &xa, &a, d, &mut grad);
                     net.bwd(&w, &xb, &ab, -d, &mut grad);
                 }
@@ -680,6 +742,44 @@ fn main() {
         }
         w = best.1;
         eprintln!("round {round}: kept epoch {} (log loss {:.4})", best.2, best.0);
+    }
+    if hp_mode {
+        // held-out mean squared error (hp^2) and share of variance explained, by stage: the
+        // network, the linear judgment row `--gen` (scaled by one fitted weight), and zero
+        let mut cells = [[0.0f64; 5]; 5]; // n, sum y^2, net err^2, judgment err^2, mean y (for variance)
+        let mut ys: [Vec<f32>; 5] = Default::default();
+        for &i in &test {
+            let g = &st.games[st.game[i] as usize];
+            let stage = ((st.tick[i] as f32 / g.last.max(1) as f32) * 4.0).floor().clamp(0.0, 3.0) as usize;
+            let y = hpc_of(i);
+            let pn = raw(&w, i, &mut xa, &mut xb, &mut a) + base_of(i);
+            for c in [stage, 4] {
+                cells[c][0] += 1.0;
+                cells[c][2] += ((pn - y) * 32.0).powi(2) as f64;
+                cells[c][3] += ((kj * jud(i) - y) * 32.0).powi(2) as f64;
+                ys[c].push(y * 32.0);
+            }
+        }
+        println!("held-out discounted hp to come: mean squared error (hp^2) and share of variance explained (net {h1}x{h2}{}, judgment row {gen} x {kj:.2})", if residual { " on top of the judgment" } else { "" });
+        for c in 0..5 {
+            let n = cells[c][0].max(1.0);
+            let mean = ys[c].iter().map(|v| *v as f64).sum::<f64>() / n;
+            let var = ys[c].iter().map(|v| (*v as f64 - mean).powi(2)).sum::<f64>() / n;
+            let label = if c < 4 { format!("stage {}/4", c + 1) } else { "all".into() };
+            println!("{label:<10} {:>6}  network {:>7.1} ({:>5.1}%)  judgment {:>7.1} ({:>5.1}%)  zero {:>7.1}", cells[c][0] as usize, cells[c][2] / n, 100.0 * (1.0 - cells[c][2] / n / var.max(1e-9)), cells[c][3] / n, 100.0 * (1.0 - cells[c][3] / n / var.max(1e-9)), var);
+        }
+        if let Some(path) = emit {
+            if use_skill || !chosen.is_empty() || h1 != victris_engine::valuenet::H1 || h2 != victris_engine::valuenet::H2 {
+                println!("not written: the engine's network has no strength input or other sizes");
+            } else {
+                let body = w.iter().map(|v| format!("{v:.5}")).collect::<Vec<_>>().join(", ");
+                let n = cells[4][0].max(1.0);
+                let text = format!("// Written by `winlab --target hp` from {} games: discounted hp to come, held-out squared error {:.1} (judgment row {gen}: {:.1}).\npub const VALUE_HP_NET: [f32; crate::valuenet::NW] = [{body}];\n", st.games.len(), cells[4][2] / n, cells[4][3] / n);
+                std::fs::write(&path, text).expect("write the weights");
+                println!("weights written to {path}");
+            }
+        }
+        return;
     }
     // the report
     #[derive(Default, Clone, Copy)]

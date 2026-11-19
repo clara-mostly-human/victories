@@ -166,13 +166,15 @@ pub struct Playbook {
     /// The win-probability network as the whole leaf, in hp (`mcts::Config::net_hp`): 1.0 replaces
     /// the hp count and the judgment at the end of the play-out with the network's verdict.
     pub tree_net_hp: f64,
+    /// The hp-to-come network as the leaf's judgment (`mcts::Config::net_value`), with this weight.
+    pub tree_net_value: f64,
     /// not 0: while either fighter holds the power buff, the tree searches this deep and plays
     /// out `tree_quiet_buff` ticks at its leaves, so it sees the buff's 50 ticks run out
     pub tree_depth_buff: u32,
     /// keep the search tree between ticks: the branch the game went into seeds the next
     /// tick's search (one thread, in view only)
     pub tree_reuse: bool,
-    /// Plans as moves in the search (`mcts::Config::plans`, part 4); a kept tree is not reused with it.
+    /// Plans as moves in the search (`mcts::Config::plans`, part 4); with `tree_reuse` the kept tree loses only positions under old plans.
     pub tree_plans: bool,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
@@ -336,6 +338,7 @@ impl Default for Playbook {
             tree_solve: 0,
             tree_net: 0.0,
             tree_net_hp: 0.0,
+            tree_net_value: 0.0,
             tree_depth_buff: 0,
             tree_reuse: false,
             tree_plans: false,
@@ -419,6 +422,7 @@ impl Playbook {
         f("tree_c", &mut p.tree_c);
         f("tree_net", &mut p.tree_net);
         f("tree_net_hp", &mut p.tree_net_hp);
+        f("tree_net_value", &mut p.tree_net_value);
         f("tree_even", &mut p.tree_even);
         f("pad_bonus", &mut p.pad_bonus);
         f("attack_prior_weight", &mut p.attack_prior_weight);
@@ -1354,8 +1358,9 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     if my.state != FState::Idle {
         return idle;
     }
-    // The opening book, while we are on its line.
-    if let Some(line) = pb.book.get(&format!("{}/{}", e.map.name, me + 1)) {
+    // The opening book, while we are on its line and the opponent is out of sight (it only
+    // places us; once the opponent is seen, the search decides).
+    if let (Some(line), None) = (pb.book.get(&format!("{}/{}", e.map.name, me + 1)), view.enemy.as_ref()) {
         if let Some((_, _, turn)) = line.iter().find(|(tick, pos, _)| *tick == s.tick && *pos == my.pos) {
             return Decision { turn: RawTurn::from_json(Some(turn), &e.rules), sims: 0, score: 0.0, note: "book" };
         }
@@ -1368,11 +1373,12 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     let guessed = pb.tree_fog > 0 && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_fog).unwrap_or(s.tick <= pb.tree_fog);
     if pb.tree_ms > 0 && pb.search && (visible || guessed) && t.think_cap_ms(pb.tree_ms) >= 20 {
         let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, lead_mask: if pb.tree_lead_them { 1u8 << (1 - me) } else { 0 }, expand_at: pb.tree_expand_at, max_nodes: pb.tree_max_nodes, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
-        if pb.tree_value != 0.0 || pb.tree_net != 0.0 || pb.tree_net_hp != 0.0 {
+        if pb.tree_value != 0.0 || pb.tree_net != 0.0 || pb.tree_net_hp != 0.0 || pb.tree_net_value != 0.0 {
             cfg.buff_value = 0.0;
         }
         cfg.net_weight = pb.tree_net;
         cfg.net_hp = pb.tree_net_hp;
+        cfg.net_value = pb.tree_net_value;
         cfg.plans = pb.tree_plans;
         if pb.tree_depth_buff > 0 && s.fighters.iter().any(|f| f.power_until != NO_BUFF && f.power_until > s.tick) {
             cfg.depth = pb.tree_depth_buff;
