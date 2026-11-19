@@ -42,6 +42,8 @@ pub struct Config {
     pub value_weight: f64,
     /// which generation of the judgment (1 is the first; 0 = the latest)
     pub value_gen: usize,
+    /// hp per unit of (2p - 1) of the win-probability judgment (`valuenet`) at a leaf; 0 = off
+    pub net_weight: f64,
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
     /// fighters (bit 0 = fighter 0, bit 1 = fighter 1) whose standing shots may lead, in
@@ -70,7 +72,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -325,6 +327,11 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config) -> f64 {
     }
     let buff = |i: usize| if st.fighters[i].power_until == NO_BUFF { 0 } else { (st.fighters[i].power_until - st.tick).max(0) };
     v += cfg.buff_value * (buff(0) - buff(1)) as f64;
+    if cfg.net_weight != 0.0 && st.result.is_none() {
+        // the win-probability judgment, as hp: net_weight * (2p - 1) for fighter 0
+        let p = crate::valuenet::win_prob(e, &st, 0, &crate::valuenet_weights::VALUE_NET) as f64;
+        v += cfg.net_weight * (2.0 * p - 1.0);
+    }
     if cfg.value_weight != 0.0 && st.result.is_none() {
         v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, crate::models::value_weights(cfg.value_gen)) as f64;
     }

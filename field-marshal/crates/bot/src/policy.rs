@@ -161,6 +161,8 @@ pub struct Playbook {
     /// not 0: our turn comes from solving the root as a matrix game over each side's this
     /// many most visited turns (one search thread only), instead of the most visited turn
     pub tree_solve: u32,
+    /// weight of the win-probability judgment at the tree's leaves (hp per unit of 2p - 1)
+    pub tree_net: f64,
     /// tree search settings, for tuning offline: ticks of quiet play-out at a leaf (6),
     /// the exploration constant (1.5), the share of the prior spread evenly (0.25)
     pub tree_quiet: u32,
@@ -317,6 +319,7 @@ impl Default for Playbook {
             tree_expand_at: 0,
             tree_max_nodes: 0,
             tree_solve: 0,
+            tree_net: 0.0,
             tree_quiet: 6,
             tree_threads: 1,
             tree_fog_samples: 1,
@@ -374,6 +377,7 @@ impl Playbook {
         f("move_prior_weight", &mut p.move_prior_weight);
         f("tree_value", &mut p.tree_value);
         f("tree_c", &mut p.tree_c);
+        f("tree_net", &mut p.tree_net);
         f("tree_even", &mut p.tree_even);
         f("pad_bonus", &mut p.pad_bonus);
         f("attack_prior_weight", &mut p.attack_prior_weight);
@@ -1257,9 +1261,10 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     let guessed = pb.tree_fog > 0 && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_fog).unwrap_or(s.tick <= pb.tree_fog);
     if pb.tree_ms > 0 && pb.search && (visible || guessed) && t.think_cap_ms(pb.tree_ms) >= 20 {
         let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, lead_mask: if pb.tree_lead_them { 1u8 << (1 - me) } else { 0 }, expand_at: pb.tree_expand_at, max_nodes: pb.tree_max_nodes, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
-        if pb.tree_value != 0.0 {
+        if pb.tree_value != 0.0 || pb.tree_net != 0.0 {
             cfg.buff_value = 0.0;
         }
+        cfg.net_weight = pb.tree_net;
         // The think time, cut down when the match budget could not carry it to the tick limit.
         let deadline = t.think_cap_ms(pb.tree_ms);
         // Out of sight, each search gets its own guess at where the opponent stands: the

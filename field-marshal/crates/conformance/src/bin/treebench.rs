@@ -40,6 +40,7 @@ fn main() {
         ("expand on the second visit", Config { expand_at: 1, ..base }),
         ("expand on the second visit, dash + repulsor", Config { expand_at: 1, dash_burst: true, ..base }),
         ("dash + repulsor", Config { dash_burst: true, ..base }),
+        ("win-probability judgment only (40)", Config { value_weight: 0.0, net_weight: 40.0, dash_burst: true, ..base }),
     ];
     for (name, cfg) in variants {
         let mut search = Search::new(e, cfg);

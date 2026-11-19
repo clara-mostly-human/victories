@@ -25,6 +25,8 @@ pub mod step;
 pub mod tempo;
 pub mod turn;
 pub mod valuefeat;
+pub mod valuenet;
+pub mod valuenet_weights;
 
 pub use geom::P;
 pub use map::MapData;
