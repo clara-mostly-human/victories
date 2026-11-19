@@ -121,6 +121,12 @@ pub struct Options {
     pub replace_gap: Duration,
     /// at most this many of our bots in a match or queued at once (the flagship always may)
     pub max_concurrent: usize,
+    /// the flagship waits this long at most before queueing while a scout is held back by the
+    /// ladder's match limit, so the scouts get the slot that frees first (Mike, 2026-11-19:
+    /// "push the scouts up in priority. The flagship is just the control"); 0: no waiting
+    pub flagship_yield: Duration,
+    /// give up a socket in a match once it has lost three turns on the wire there (once a match)
+    pub swap_in_match: bool,
     /// a bot queued this long without a match is reported as stalled
     pub stall_after: Duration,
     /// at most this many sockets are given up for a better one in any ten minutes, across
@@ -143,6 +149,8 @@ impl Default for Options {
             ping_reject_ms: 0.0,
             replace_gap: Duration::from_secs(90),
             max_concurrent: 5,
+            flagship_yield: Duration::from_secs(120),
+            swap_in_match: true,
             stall_after: Duration::from_secs(120),
             replacements_per_10min: 8,
         }
@@ -166,6 +174,8 @@ impl Options {
         o.replace_gap = ms("replace_gap_ms", o.replace_gap);
         o.max_concurrent = g.get("max_concurrent").and_then(Value::as_u64).map(|n| n.max(1) as usize).unwrap_or(o.max_concurrent);
         o.stall_after = ms("stall_after_ms", o.stall_after);
+        o.flagship_yield = ms("flagship_yield_ms", o.flagship_yield);
+        o.swap_in_match = g.get("swap_in_match").and_then(Value::as_bool).unwrap_or(o.swap_in_match);
         o.replacements_per_10min = g.get("replacements_per_10min").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(o.replacements_per_10min);
         o
     }
@@ -282,6 +292,8 @@ pub struct Shared {
     pub health: Mutex<HashMap<String, Value>>,
     /// which of our bots are queued (1) or in a match (2)
     active: Mutex<HashMap<String, u8>>,
+    /// bots the ladder holds back from a match because our match limit is reached
+    held: Mutex<std::collections::HashSet<String>>,
     /// the rotation queue: bots on a slow socket, waiting for their turn to get a new one
     rotation: Mutex<Vec<Waiting>>,
     /// when the ladder last dropped our connections (not counting the ones we closed)
@@ -324,6 +336,7 @@ impl Shared {
             attach: Mutex::new(HashMap::new()),
             health: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
+            held: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
@@ -472,6 +485,20 @@ impl Shared {
             *self.replace_suspended.lock().unwrap_or_else(|p| p.into_inner()) = Some(Instant::now() + Duration::from_secs(1200));
             log_line(root, "SOCKETS", "the last three replacement sockets were all slow: no socket is replaced for the next 20 minutes");
         }
+    }
+
+    fn set_held(&self, bot: &str, held: bool) {
+        let mut h = self.held.lock().unwrap_or_else(|p| p.into_inner());
+        if held {
+            h.insert(bot.to_string());
+        } else {
+            h.remove(bot);
+        }
+    }
+
+    /// How many of our other bots the ladder is holding back from a match right now.
+    fn others_held(&self, bot: &str) -> usize {
+        self.held.lock().unwrap_or_else(|p| p.into_inner()).iter().filter(|n| n.as_str() != bot).count()
     }
 
     fn set_active(&self, bot: &str, state: u8) {
@@ -883,6 +910,12 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
     let mut down_why = String::from("not connected yet");
     // When the ladder last said another connection took this bot over ("replaced").
     let mut last_replaced: Option<Instant> = None;
+    // A socket that loses turns on the wire in a match is given up once in that match: the
+    // match resumes on a new socket in about two seconds (2026-11-19 01:00Z: one socket cost
+    // quarter-master 38 turns in a game, another the flagship 50, while the rotation waited
+    // for the match to end). The match and how many turns the wire lost in it on this bot.
+    let mut wire_lost_in_match: (Option<String>, u32) = (None, 0);
+    let mut swapped_in_match: Option<String> = None;
     let mut hello_fields_said = false;
 
     // Health as one JSON object; `conn` is the connection's part, when there is one.
@@ -1196,6 +1229,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         queue_due = None;
                         after_end = None;
                         refusal = None;
+                        shared.set_held(name, false);
                         soft_refusals = 0;
                         last_budget = None;
                         answered = None;
@@ -1243,6 +1277,10 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                                     tel().point(this, "wire_ms", (charge - took).max(0.0));
                                     if charge >= 1000.0 && took < 600.0 {
                                         lost += 1;
+                                        if wire_lost_in_match.0 != flow.match_id {
+                                            wire_lost_in_match = (flow.match_id.clone(), 0);
+                                        }
+                                        wire_lost_in_match.1 += 1;
                                         { let d = json!({ "cause": "wire", "socket": this, "match": flow.match_id, "tick": t - 1, "turns": 1, "charge_ms": charge, "answer_ms": took.round() }); if let Some(r) = flow.record.as_mut() { r.note("turn_lost", d.clone()); } event(root, name, "turn_lost", d); }
                                     }
                                 }
@@ -1255,6 +1293,15 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                         }
                         last_budget = budget;
                         answered = None;
+                        if flow.in_match && wire_lost_in_match.0 == flow.match_id && wire_lost_in_match.1 >= 3 && swapped_in_match != flow.match_id && opt.swap_in_match {
+                            swapped_in_match = flow.match_id.clone();
+                            let n = wire_lost_in_match.1;
+                            event(root, name, "rotated", json!({ "socket": this, "remote": remote.to_string(), "wire_ms": wire_ms.map(|x| x.round()), "when": "in a match", "turns_lost": n, "match": flow.match_id }));
+                            let _ = ws.close(None);
+                            voluntary = true;
+                            why_closed = format!("replaced in a match: the wire lost {n} turns on it");
+                            break 'conn;
+                        }
                         flow.tick = tick;
                         flow.last_obs = Some(text.clone());
                         pending = tick.map(|t| (t, Instant::now()));
@@ -1347,6 +1394,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                             // quota allows. Wait; do not queue again, do not reconnect.
                             shared.refusals.fetch_add(1, Ordering::Relaxed);
                             refusal = Some((code.clone(), Instant::now(), json!({ "quota": msg.get("quota"), "limit": msg.get("limit"), "used": msg.get("used"), "retry_after_s": msg.get("retry_after_s") })));
+                            if msg.get("message").and_then(Value::as_str).map(|m| m.contains("concurrent")).unwrap_or(true) {
+                                shared.set_held(name, true);
+                            }
                             queued = true;
                             queued_since.get_or_insert_with(Instant::now);
                         } else if code == "already_queued" {
@@ -1508,8 +1558,9 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                                 why_closed = format!("rotated between matches: {reason}");
                                 break 'conn;
                             }
-                            // Every bot but the flagship leaves the freed match slot alone for a moment.
-                            let gap = if np.bot.role == "flagship" { 0 } else { np.cfg.queue_gap_ms };
+                            // The scouts first (Mike, 2026-11-19): the flagship leaves the freed
+                            // match slot alone for a moment, the scouts ask at once.
+                            let gap = if np.bot.role == "flagship" { np.cfg.queue_gap_ms.max(3000) } else { 0 };
                             queue_due = Some(Instant::now() + Duration::from_millis(gap));
                         }
                         Err(why) => {
@@ -1600,7 +1651,14 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
                 } else if Instant::now() >= at && (engine.is_some() || resume_until.is_some()) && after_end.is_none() {
                     // The match limit is ours to respect: the flagship always asks, the others
                     // only while there is room.
-                    let room = role == "flagship" || resume_until.is_some() || shared.others_active(name) < opt.max_concurrent;
+                    let room = if role == "flagship" {
+                        // The scouts first: while one of them is held back by the ladder's
+                        // match limit, the flagship does not queue for the slot that frees
+                        // next, for up to `flagship_yield`.
+                        resume_until.is_some() || shared.others_held(name) == 0 || Instant::now() >= at + opt.flagship_yield
+                    } else {
+                        resume_until.is_some() || shared.others_active(name) < opt.max_concurrent
+                    };
                     // The label: the store's for a bot the fleet deploys, else the one its
                     // process attached with (the flagship's thread chooses its own).
                     if label.is_none() {
@@ -1872,6 +1930,7 @@ pub fn run_bot(root: &Path, name: &str, shared: &Shared, stop: &dyn Fn() -> bool
             log_line(root, "STALL", &format!("{name}: the connection it was queued on closed ({why_closed}); reconnecting"));
         }
         down_why = why_closed.clone();
+        shared.set_held(name, false);
         // The bot's own log keeps the record of drops, in the form its client wrote them
         // when it held the socket, so everything that counts resets still sees them.
         let version = label.clone().unwrap_or_default();
