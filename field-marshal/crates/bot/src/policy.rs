@@ -163,6 +163,10 @@ pub struct Playbook {
     pub tree_solve: u32,
     /// weight of the win-probability judgment at the tree's leaves (hp per unit of 2p - 1)
     pub tree_net: f64,
+    /// not 0: while either fighter holds the power buff, the tree searches this deep and plays
+    /// out `tree_quiet_buff` ticks at its leaves, so it sees the buff's 50 ticks run out
+    pub tree_depth_buff: u32,
+    pub tree_quiet_buff: u32,
     /// tree search settings, for tuning offline: ticks of quiet play-out at a leaf (6),
     /// the exploration constant (1.5), the share of the prior spread evenly (0.25)
     pub tree_quiet: u32,
@@ -320,6 +324,8 @@ impl Default for Playbook {
             tree_max_nodes: 0,
             tree_solve: 0,
             tree_net: 0.0,
+            tree_depth_buff: 0,
+            tree_quiet_buff: 0,
             tree_quiet: 6,
             tree_threads: 1,
             tree_fog_samples: 1,
@@ -435,6 +441,12 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_fog").and_then(Value::as_i64) {
             p.tree_fog = x as i32;
+        }
+        if let Some(x) = v.get("tree_depth_buff").and_then(Value::as_u64) {
+            p.tree_depth_buff = x as u32;
+        }
+        if let Some(x) = v.get("tree_quiet_buff").and_then(Value::as_u64) {
+            p.tree_quiet_buff = x as u32;
         }
         if let Some(x) = v.get("tree_solve").and_then(Value::as_u64) {
             p.tree_solve = x as u32;
@@ -1265,6 +1277,12 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             cfg.buff_value = 0.0;
         }
         cfg.net_weight = pb.tree_net;
+        if pb.tree_depth_buff > 0 && s.fighters.iter().any(|f| f.power_until != NO_BUFF && f.power_until > s.tick) {
+            cfg.depth = pb.tree_depth_buff;
+            if pb.tree_quiet_buff > 0 {
+                cfg.quiet = pb.tree_quiet_buff;
+            }
+        }
         // The think time, cut down when the match budget could not carry it to the tick limit.
         let deadline = t.think_cap_ms(pb.tree_ms);
         // Out of sight, each search gets its own guess at where the opponent stands: the
