@@ -284,7 +284,7 @@ impl Autopilot {
             let out = dir.join("habits.txt");
             let paused = crate::online::pause_file(root).exists();
             if dir.join("habits").is_file() && !out.exists() && self.habits.is_none() && self.gate.is_none() && !paused && !cfg.habits_bots.is_empty() {
-                let script = r#"out="$1"; bin="$2"; corpus="$3"; shift 3; for b in "$@"; do /usr/bin/nice -n 15 "$bin" --bot "$b" --limit 60 --threads 2 "$corpus"; echo; done > "$out.part" 2>&1; mv "$out.part" "$out""#;
+                let script = r#"out="$1"; bin="$2"; corpus="$3"; shift 3; for b in "$@"; do /usr/sbin/taskpolicy -b /usr/bin/nice -n 15 "$bin" --bot "$b" --limit 60 --threads 2 "$corpus"; echo; done > "$out.part" 2>&1; mv "$out.part" "$out""#;
                 let child = Command::new("/bin/sh")
                     .current_dir(root)
                     .args(["-c", script, "habits"])

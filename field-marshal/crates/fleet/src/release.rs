@@ -95,8 +95,10 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
         // Under launchd the PATH has no ~/.cargo/bin, so cargo is named in full when it is there.
         let home_cargo = PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cargo").join("bin").join("cargo");
         let cargo_bin = if home_cargo.is_file() { home_cargo.display().to_string() } else { "cargo".to_string() };
-        let mut c = Command::new("/usr/bin/nice");
-        c.current_dir(&ws).env("CARGO_TARGET_DIR", &target).env("CARGO_BUILD_JOBS", "2").env("RUST_TEST_THREADS", "2").args(["-n", "15", &cargo_bin]).args(args);
+        // Background priority (efficiency cores, throttled disk): a build never competes with
+        // the bots, which run at the interactive class.
+        let mut c = Command::new("/usr/sbin/taskpolicy");
+        c.current_dir(&ws).env("CARGO_TARGET_DIR", &target).env("CARGO_BUILD_JOBS", "2").env("RUST_TEST_THREADS", "2").args(["-b", "/usr/bin/nice", "-n", "15", &cargo_bin]).args(args);
         if let Some(dir) = Path::new(&cargo_bin).parent().filter(|d| d.is_dir()) {
             // rustc and friends sit beside cargo.
             c.env("PATH", format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default()));
@@ -282,9 +284,9 @@ pub fn gate(root: &Path, store: &Store, id: &str, o: &GateOptions) -> Result<Val
     if workers != o.workers {
         eprintln!("--workers {} reduced to {workers}: live bots share this machine", o.workers);
     }
-    let mut child = Command::new("/usr/bin/nice")
+    let mut child = Command::new("/usr/sbin/taskpolicy")
         .current_dir(root)
-        .args(["-n", "15", "node"])
+        .args(["-b", "/usr/bin/nice", "-n", "15", "node"])
         .arg(root.join("fleet").join("duel.mjs"))
         .arg("--a").arg(Path::new(&cand.path).join("marshal"))
         .arg("--a-playbooks").arg(playbooks(&cand))
