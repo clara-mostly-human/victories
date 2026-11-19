@@ -76,7 +76,7 @@ pub fn move_probs_for(e: &Engine, s: &State, x: usize) -> [f32; CLASSES] {
 ///   1: 60 games of the plain search against itself at 60 ms a move (7,713 recorded
 ///      ticks); explains 21% of the outcome on held-out ticks; beat the plain search
 ///      26-3-1 and the matrix search 23-7 at 100 ms a move.
-pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 11] = [
+pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 12] = [
     [68.107, 8.515, 0.214, -0.175, 0.018, -2.188, 1.827, 0.474, 0.275, -1.223, -1.617, -3.328, 0.397, 4.701, -3.262, 3.726, 66.527, -1.036, 4.400, -1.397, 1.688, 2.439, -47.270, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     // candidate 2: generation 0 and generation 1 self-play together (18,686 ticks; 23% held out)
     [97.288, 8.504, 0.080, -0.270, -0.897, -2.520, 0.848, 0.840, 0.046, -2.435, -2.950, -3.410, 0.407, 4.994, -4.795, 5.348, 67.236, -2.006, 5.476, -1.142, 1.334, 3.055, -70.162, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -111,6 +111,9 @@ pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 11] = [
     // candidate 11, the teacher on all 68 of our ladder games against 2400+ bots: all 31
     // features fitted to the deep search's values (300k iterations, 30 + 10 ticks, row 6)
     [52.646, 6.316, -1.541, -1.586, -0.043, -7.665, 2.838, 1.270, 1.599, -0.248, -3.036, -5.759, -0.738, 0.334, -10.591, 1.978, 44.467, -0.561, 4.095, -2.419, 2.388, 4.721, -36.965, -4.462, 0.912, 3.700, -0.199, -10.381, -1.248, 3.925, 18.243],
+    // candidate 12, teacher round 2: all 31 features fitted to the deep search's values of
+    // 3,880 positions from 99 of our ladder games against bots rated 2250 and up
+    [55.409, 6.209, -1.542, -1.650, -0.325, -6.888, 2.254, 1.079, 1.335, 0.084, -4.032, -5.795, -0.441, -0.127, -10.107, 2.161, 43.269, -0.857, 4.565, -2.652, 2.275, 4.616, -37.700, -7.481, 0.639, 5.468, 0.341, -6.508, -1.860, 4.232, 20.387],
 ];
 
 /// The weights of generation `gen` (1 is the first); 0 or a number past the end gives the latest.

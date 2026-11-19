@@ -166,6 +166,9 @@ pub struct Playbook {
     /// not 0: while either fighter holds the power buff, the tree searches this deep and plays
     /// out `tree_quiet_buff` ticks at its leaves, so it sees the buff's 50 ticks run out
     pub tree_depth_buff: u32,
+    /// keep the search tree between ticks: the branch the game went into seeds the next
+    /// tick's search (one thread, in view only)
+    pub tree_reuse: bool,
     pub tree_quiet_buff: u32,
     /// tree search settings, for tuning offline: ticks of quiet play-out at a leaf (6),
     /// the exploration constant (1.5), the share of the prior spread evenly (0.25)
@@ -325,6 +328,7 @@ impl Default for Playbook {
             tree_solve: 0,
             tree_net: 0.0,
             tree_depth_buff: 0,
+            tree_reuse: false,
             tree_quiet_buff: 0,
             tree_quiet: 6,
             tree_threads: 1,
@@ -431,7 +435,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them), ("tree_reuse", &mut p.tree_reuse)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -1246,6 +1250,60 @@ fn solve_matrix(a: &[f64], rows: usize, cols: usize, iters: usize) -> (Vec<f64>,
     (avg_r, avg_c, value)
 }
 
+/// ARENA_VISITS=file: for every tree decision with the opponent in view, one line with what
+/// the search spent its visits on at the root (shares of hold / toward / away / sideways /
+/// dash, then of the turns with a shot, a frostburst and a repulsor) and the 52 move features,
+/// as targets for training the move model on the search's own visit counts (`movefit --visits`).
+fn dump_visits(e: &victris_engine::Engine, s: &State, me: usize, acts: &[(RawTurn, u32, f64)]) {
+    let Some(path) = std::env::var_os("ARENA_VISITS") else { return };
+    let (f, o) = (&s.fighters[me], &s.fighters[1 - me]);
+    if f.state != FState::Idle || !can_see(&e.rules, &e.map, f.pos, o.pos) {
+        return;
+    }
+    let total: u32 = acts.iter().map(|a| a.1).sum();
+    if total == 0 {
+        return;
+    }
+    let mut mv = [0.0f64; 5];
+    let mut atk = [0.0f64; 3];
+    for (turn, n, _) in acts {
+        let w = *n as f64 / total as f64;
+        mv[victris_engine::movefeat::move_class(s, me, turn)] += w;
+        if let victris_engine::turn::AttackIn::Named { attack, .. } = turn.attack {
+            let k = match e.rules.attacks[attack as usize].kind {
+                AttackKind::Projectile { .. } => 0,
+                AttackKind::Area { .. } => 1,
+                AttackKind::Burst { .. } => 2,
+            };
+            atk[k] += w;
+        }
+    }
+    let feat = victris_engine::movefeat::features(e, s, me);
+    let mut line = String::from("V");
+    for v in mv.iter().chain(atk.iter()) {
+        line.push_str(&format!(" {v:.4}"));
+    }
+    for v in feat.iter() {
+        line.push_str(&format!(" {v:.3}"));
+    }
+    line.push('\n');
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = std::io::Write::write_all(&mut file, line.as_bytes());
+    }
+}
+
+/// A search tree kept between ticks, per match (seed) and seat.
+struct Kept {
+    tick: i32,
+    root: State,
+    ours: RawTurn,
+    tree: victris_engine::mcts::Tree,
+}
+
+thread_local! {
+    static KEPT: std::cell::RefCell<std::collections::HashMap<(i64, usize), Kept>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
     let started = Instant::now();
     let d = decide_inner(t, view, pb, started);
@@ -1325,6 +1383,46 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         };
         // The starting states, made here: the tracker cannot be shared between threads.
         let starts: Vec<victris_engine::State> = (0..pb.tree_threads.max(1) * per_thread).map(root_for).collect();
+        if pb.tree_reuse && pb.tree_threads <= 1 && per_thread == 1 && visible {
+            // One search, seeded with the branch of last tick's tree that the game went into.
+            let key = (t.seed, me);
+            let kept = KEPT.with(|k| k.borrow_mut().remove(&key));
+            let mut search = victris_engine::mcts::Search::new(e, cfg);
+            search.start();
+            let mut reused = 0u32;
+            if let Some(k) = kept {
+                if k.tick + 1 == s.tick {
+                    search.start_from(k.tree);
+                    match search.reroot(&k.root, me, &k.ours, &s) {
+                        Some(sub) => {
+                            reused = sub.visits();
+                            search.start_from(sub);
+                        }
+                        None => search.start(),
+                    }
+                }
+            }
+            let mut done = 0u32;
+            loop {
+                search.iterate(&s, [None, None], 1000);
+                done += 1000;
+                if started.elapsed().as_millis() as u64 >= deadline {
+                    break;
+                }
+            }
+            let root = search.result();
+            dump_visits(e, &s, me, &root.acts[me]);
+            let Some((turn, _, q)) = root.acts[me].iter().max_by_key(|a| a.1).copied() else { return idle };
+            let tree = search.into_tree();
+            KEPT.with(|k| {
+                let mut k = k.borrow_mut();
+                if k.len() > 16 {
+                    k.clear();
+                }
+                k.insert(key, Kept { tick: s.tick, root: s, ours: turn, tree });
+            });
+            return Decision { turn, sims: done + reused, score: q, note: "tree" };
+        }
         let run = |cfg: victris_engine::mcts::Config, thread: u32| {
             let mut solved: Option<RawTurn> = None;
             let mut out: Option<victris_engine::mcts::RootResult> = None;
@@ -1378,6 +1476,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             }
             (root, done, None)
         };
+        dump_visits(e, &s, me, &root.acts[me]);
         let mut best = root.acts[me].iter().max_by_key(|a| a.1).copied();
         if let Some(turn) = solved {
             if let Some(a) = root.acts[me].iter().find(|a| a.0 == turn) {

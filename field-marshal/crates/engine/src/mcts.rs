@@ -88,7 +88,7 @@ pub struct Act {
     pub w: f64,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Node {
     acts: [Vec<Act>; 2],
     n: u32,
@@ -349,6 +349,21 @@ pub struct Search<'a> {
     pairs: HashMap<(u16, u16), (u32, f64)>,
 }
 
+/// A search tree kept between ticks: the positions below a root, with their statistics.
+/// Nodes hold no states (each iteration replays its path from the root), so a subtree can
+/// be carried to the next tick when the root it hangs from is the position reached.
+pub struct Tree {
+    nodes: Vec<Node>,
+    children: HashMap<u64, u32>,
+}
+
+impl Tree {
+    /// Visits at the root.
+    pub fn visits(&self) -> u32 {
+        self.nodes.first().map(|n| n.n).unwrap_or(0)
+    }
+}
+
 /// What the search found at the root, for each side: (turn, visits, average result in hp
 /// from that side's point of view).
 pub struct RootResult {
@@ -381,6 +396,79 @@ impl<'a> Search<'a> {
         self.start();
         self.iterate(root, fixed, self.cfg.iterations);
         self.result()
+    }
+
+    /// Starts from a tree kept from the previous tick (see `reroot`).
+    pub fn start_from(&mut self, tree: Tree) {
+        self.start();
+        if !tree.nodes.is_empty() {
+            self.nodes = tree.nodes;
+            self.children = tree.children;
+        }
+    }
+
+    /// The subtree below the root that the game actually went into: fighter `me` played
+    /// `ours` and the opponent played whichever of its root turns, stepped from `old_root`,
+    /// gives `new_root` (fighters' tiles, hp, states and cooldowns, and the tick). `None`
+    /// when no root turn of the opponent explains the new position (for instance a guess
+    /// under fog that turned out wrong), or when that pair was never searched.
+    pub fn reroot(&self, old_root: &State, me: usize, ours: &RawTurn, new_root: &State) -> Option<Tree> {
+        let root = self.nodes.first()?;
+        let i_me = root.acts[me].iter().position(|a| a.turn == *ours)?;
+        let same = |a: &State, b: &State| {
+            a.tick == b.tick
+                && (0..2).all(|x| {
+                    let (f, g) = (&a.fighters[x], &b.fighters[x]);
+                    f.pos == g.pos && f.hp == g.hp && f.state == g.state && f.cd_move == g.cd_move && f.cd_dash == g.cd_dash && f.cd_attack == g.cd_attack
+                })
+        };
+        for (i_them, a) in root.acts[1 - me].iter().enumerate() {
+            let mut turns = [RawTurn::IDLE; 2];
+            turns[me] = *ours;
+            turns[1 - me] = a.turn;
+            let mut st = *old_root;
+            self.e.step(&mut st, &turns);
+            if !same(&st, new_root) {
+                continue;
+            }
+            let (i0, i1) = if me == 0 { (i_me, i_them) } else { (i_them, i_me) };
+            let key = ((0u64) << 32) | ((i0 as u64) << 16) | i1 as u64;
+            let start = *self.children.get(&key)? as usize;
+            // Copy the subtree, numbering its nodes afresh.
+            let mut map: HashMap<u32, u32> = HashMap::new();
+            let mut nodes: Vec<Node> = Vec::new();
+            let mut order = vec![start as u32];
+            map.insert(start as u32, 0);
+            nodes.push(self.nodes[start].clone());
+            let mut k = 0;
+            let mut by_parent: HashMap<u32, Vec<(u64, u32)>> = HashMap::new();
+            for (key, c) in self.children.iter() {
+                by_parent.entry((key >> 32) as u32).or_default().push((*key & 0xffff_ffff, *c));
+            }
+            let mut children: HashMap<u64, u32> = HashMap::new();
+            while k < order.len() {
+                let old = order[k];
+                let new = map[&old];
+                if let Some(list) = by_parent.get(&old) {
+                    for (low, c) in list {
+                        let nc = *map.entry(*c).or_insert_with(|| {
+                            nodes.push(self.nodes[*c as usize].clone());
+                            order.push(*c);
+                            (nodes.len() - 1) as u32
+                        });
+                        children.insert(((new as u64) << 32) | low, nc);
+                    }
+                }
+                k += 1;
+            }
+            return Some(Tree { nodes, children });
+        }
+        None
+    }
+
+    /// The tree, to keep until the next tick.
+    pub fn into_tree(self) -> Tree {
+        Tree { nodes: self.nodes, children: self.children }
     }
 
     /// Empties the tree for a new root.
