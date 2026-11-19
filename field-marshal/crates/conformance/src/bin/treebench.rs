@@ -49,6 +49,12 @@ fn main() {
         let secs = started.elapsed().as_secs_f64();
         let root = search.result();
         let best = |x: usize| root.acts[x].iter().max_by_key(|a| a.1).map(|a| (a.1, a.2)).unwrap_or((0, 0.0));
+        for x in 0..2 {
+            let mv = root.acts[x].iter().max_by_key(|a| a.1).map(|a| a.0);
+            let sv = search.root_solve(x, 6, 2000);
+            let q = |t: Option<victris_engine::turn::RawTurn>| t.and_then(|t| root.acts[x].iter().find(|a| a.0 == t)).map(|a| (a.1, a.2));
+            println!("      fighter {x}: most visited {:?} -> {:?}; solve -> {:?}", mv.map(|t| (t.mv, t.dash, t.attack)), q(mv), q(sv));
+        }
         println!("  {:<46} {:>7.0} iterations/s, {:>6} nodes, {:>5.1} MB of move lists   root value {:+.1}, top turn share {:.0}% and {:.0}%, {} and {} turns", name, iterations as f64 / secs, search.node_count(), search.list_bytes() as f64 / 1048576.0, root.value,
             100.0 * best(0).0 as f64 / iterations as f64, 100.0 * best(1).0 as f64 / iterations as f64, root.acts[0].len(), root.acts[1].len());
     }

@@ -158,6 +158,9 @@ pub struct Playbook {
     pub tree_expand_at: u32,
     /// the most positions one search's tree may hold (0 = no limit)
     pub tree_max_nodes: u32,
+    /// not 0: our turn comes from solving the root as a matrix game over each side's this
+    /// many most visited turns (one search thread only), instead of the most visited turn
+    pub tree_solve: u32,
     /// tree search settings, for tuning offline: ticks of quiet play-out at a leaf (6),
     /// the exploration constant (1.5), the share of the prior spread evenly (0.25)
     pub tree_quiet: u32,
@@ -313,6 +316,7 @@ impl Default for Playbook {
             tree_lead_them: false,
             tree_expand_at: 0,
             tree_max_nodes: 0,
+            tree_solve: 0,
             tree_quiet: 6,
             tree_threads: 1,
             tree_fog_samples: 1,
@@ -427,6 +431,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_fog").and_then(Value::as_i64) {
             p.tree_fog = x as i32;
+        }
+        if let Some(x) = v.get("tree_solve").and_then(Value::as_u64) {
+            p.tree_solve = x as u32;
         }
         if let Some(x) = v.get("tree_max_nodes").and_then(Value::as_u64) {
             p.tree_max_nodes = x as u32;
@@ -1296,6 +1303,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         // The starting states, made here: the tracker cannot be shared between threads.
         let starts: Vec<victris_engine::State> = (0..pb.tree_threads.max(1) * per_thread).map(root_for).collect();
         let run = |cfg: victris_engine::mcts::Config, thread: u32| {
+            let mut solved: Option<RawTurn> = None;
             let mut out: Option<victris_engine::mcts::RootResult> = None;
             let mut done = 0u32;
             let begun = started.elapsed().as_millis() as u64;
@@ -1313,14 +1321,17 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                     }
                 }
                 let r = search.result();
+                if pb.tree_solve > 0 && per_thread == 1 && pb.tree_threads <= 1 {
+                    solved = search.root_solve(me, pb.tree_solve as usize, 2000);
+                }
                 match out.as_mut() {
                     None => out = Some(r),
                     Some(o) => pool(o, &r),
                 }
             }
-            (out.expect("at least one search"), done)
+            (out.expect("at least one search"), done, solved)
         };
-        let (root, done) = if pb.tree_threads <= 1 {
+        let (root, done, solved) = if pb.tree_threads <= 1 {
             run(cfg, 0)
         } else {
             // Several searches side by side, each with its own jitter on the root priors
@@ -1337,14 +1348,19 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 handles.into_iter().filter_map(|h| h.join().ok()).collect()
             });
             let mut it = results.into_iter();
-            let Some((mut root, mut done)) = it.next() else { return idle };
-            for (r, d) in it {
+            let Some((mut root, mut done, _)) = it.next() else { return idle };
+            for (r, d, _) in it {
                 done += d;
                 pool(&mut root, &r);
             }
-            (root, done)
+            (root, done, None)
         };
-        let best = root.acts[me].iter().max_by_key(|a| a.1).copied();
+        let mut best = root.acts[me].iter().max_by_key(|a| a.1).copied();
+        if let Some(turn) = solved {
+            if let Some(a) = root.acts[me].iter().find(|a| a.0 == turn) {
+                best = Some(*a);
+            }
+        }
         return match best {
             Some((turn, _, q)) => Decision { turn, sims: done, score: q, note: "tree" },
             None => idle,

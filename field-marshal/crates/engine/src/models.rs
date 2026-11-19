@@ -76,7 +76,7 @@ pub fn move_probs_for(e: &Engine, s: &State, x: usize) -> [f32; CLASSES] {
 ///   1: 60 games of the plain search against itself at 60 ms a move (7,713 recorded
 ///      ticks); explains 21% of the outcome on held-out ticks; beat the plain search
 ///      26-3-1 and the matrix search 23-7 at 100 ms a move.
-pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 7] = [
+pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 8] = [
     [68.107, 8.515, 0.214, -0.175, 0.018, -2.188, 1.827, 0.474, 0.275, -1.223, -1.617, -3.328, 0.397, 4.701, -3.262, 3.726, 66.527, -1.036, 4.400, -1.397, 1.688, 2.439, -47.270, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     // candidate 2: generation 0 and generation 1 self-play together (18,686 ticks; 23% held out)
     [97.288, 8.504, 0.080, -0.270, -0.897, -2.520, 0.848, 0.840, 0.046, -2.435, -2.950, -3.410, 0.407, 4.994, -4.795, 5.348, 67.236, -2.006, 5.476, -1.142, 1.334, 3.055, -70.162, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -94,6 +94,11 @@ pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 7] = [
     // the top bots stand next to the pad when it appears at tick 20 (1.2 tiles to our 2.0)
     [68.107, 8.515, 0.214, -0.175, 0.018, -2.188, 1.827, 0.474, 0.275, -1.223, -1.617, -3.328, 0.397, 4.701, -3.262, 3.726, 66.527, -1.036, 4.400, -1.397, 1.688, 2.439, -47.270, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 10.000, 0.000],
     [68.107, 8.515, 0.214, -0.175, 0.018, -2.188, 1.827, 0.474, 0.275, -1.223, -1.617, -3.328, 0.397, 4.701, -3.262, 3.726, 66.527, -1.036, 4.400, -1.397, 1.688, 2.439, -47.270, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 20.000, 0.000],
+    // candidate 8: all 31 features, fitted on 893 ladder games of the search itself (v8 to
+    // v11 and the tree arms, 18 November 16:21Z to 00:30Z, games without a broken
+    // connection): positions our search reaches against real bots, valued by how the games
+    // went (72,273 ticks; 19.4% on held-out games, 16.7% with the first 23 only)
+    [70.072, 11.815, -3.721, -1.287, -1.269, -6.825, 4.157, -0.291, 1.289, 0.947, -2.922, -6.704, -0.554, 1.763, -11.741, 8.118, 35.379, 0.468, 8.973, -1.717, 4.914, 3.176, -35.831, -8.344, -0.646, 3.917, 2.703, -4.263, -2.491, 0.989, 20.340],
 ];
 
 /// The weights of generation `gen` (1 is the first); 0 or a number past the end gives the latest.

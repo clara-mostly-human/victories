@@ -338,6 +338,8 @@ pub struct Search<'a> {
     children: HashMap<u64, u32>,
     total: f64,
     done: u32,
+    /// joint results at the root: (our turn index, their turn index) -> (visits, sum for fighter 0)
+    pairs: HashMap<(u16, u16), (u32, f64)>,
 }
 
 /// What the search found at the root, for each side: (turn, visits, average result in hp
@@ -350,7 +352,7 @@ pub struct RootResult {
 
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, cfg: Config) -> Search<'a> {
-        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0 }
+        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0, pairs: HashMap::new() }
     }
 
     fn select(&self, node: usize, side: usize) -> usize {
@@ -378,9 +380,71 @@ impl<'a> Search<'a> {
     pub fn start(&mut self) {
         self.nodes.clear();
         self.children.clear();
+        self.pairs.clear();
         self.nodes.push(Node::default());
         self.total = 0.0;
         self.done = 0;
+    }
+
+    /// The root as a matrix game: the `k` most visited turns of each side, each cell the
+    /// average result of that pair of turns (or, with fewer than 3 visits, the mean of the
+    /// two turns' own averages), solved by regret matching. Returns fighter `me`'s turn
+    /// with the most weight in the solution. Decoupled visit counts follow each side's
+    /// exploration; the solve answers what the opponent's best mixture against us is.
+    pub fn root_solve(&self, me: usize, k: usize, iters: u32) -> Option<RawTurn> {
+        let root = self.nodes.first()?;
+        let top = |x: usize| -> Vec<usize> {
+            let mut idx: Vec<usize> = (0..root.acts[x].len()).collect();
+            idx.sort_by(|a, b| root.acts[x][*b].n.cmp(&root.acts[x][*a].n));
+            idx.truncate(k.max(1));
+            idx
+        };
+        let (rows, cols) = (top(0), top(1));
+        if rows.is_empty() || cols.is_empty() {
+            return None;
+        }
+        let mean = |x: usize, i: usize| {
+            let a = &root.acts[x][i];
+            let q = if a.n > 0 { a.w / a.n as f64 } else { 0.0 };
+            if x == 0 { q } else { -q }
+        };
+        let (nr, nc) = (rows.len(), cols.len());
+        let mut m = vec![0.0f64; nr * nc];
+        for (r, &i0) in rows.iter().enumerate() {
+            for (c, &i1) in cols.iter().enumerate() {
+                m[r * nc + c] = match self.pairs.get(&(i0 as u16, i1 as u16)) {
+                    Some((n, w)) if *n >= 3 => w / *n as f64,
+                    _ => 0.5 * (mean(0, i0) + mean(1, i1)),
+                };
+            }
+        }
+        // Regret matching: fighter 0 maximises, fighter 1 minimises.
+        let (mut reg_r, mut reg_c) = (vec![0.0f64; nr], vec![0.0f64; nc]);
+        let (mut avg_r, mut avg_c) = (vec![0.0f64; nr], vec![0.0f64; nc]);
+        let strat = |reg: &Vec<f64>| -> Vec<f64> {
+            let pos: f64 = reg.iter().map(|v| v.max(0.0)).sum();
+            if pos > 0.0 { reg.iter().map(|v| v.max(0.0) / pos).collect() } else { vec![1.0 / reg.len() as f64; reg.len()] }
+        };
+        for _ in 0..iters {
+            let (sr, sc) = (strat(&reg_r), strat(&reg_c));
+            let row_vals: Vec<f64> = (0..nr).map(|r| (0..nc).map(|c| sc[c] * m[r * nc + c]).sum()).collect();
+            let col_vals: Vec<f64> = (0..nc).map(|c| (0..nr).map(|r| sr[r] * m[r * nc + c]).sum()).collect();
+            let vr: f64 = (0..nr).map(|r| sr[r] * row_vals[r]).sum();
+            for r in 0..nr {
+                reg_r[r] += row_vals[r] - vr;
+                avg_r[r] += sr[r];
+            }
+            for c in 0..nc {
+                reg_c[c] += vr - col_vals[c];
+                avg_c[c] += sc[c];
+            }
+        }
+        let pick = if me == 0 {
+            rows[(0..nr).max_by(|a, b| avg_r[*a].partial_cmp(&avg_r[*b]).unwrap()).unwrap()]
+        } else {
+            cols[(0..nc).max_by(|a, b| avg_c[*a].partial_cmp(&avg_c[*b]).unwrap()).unwrap()]
+        };
+        Some(root.acts[me][pick].turn)
     }
 
     /// Positions in the tree.
@@ -472,6 +536,11 @@ impl<'a> Search<'a> {
             let mut g = leaf;
             for &(n, i0, i1, r) in path.iter().rev() {
                 g += r;
+                if n == 0 {
+                    let p = self.pairs.entry((i0 as u16, i1 as u16)).or_insert((0, 0.0));
+                    p.0 += 1;
+                    p.1 += g;
+                }
                 let nd = &mut self.nodes[n];
                 nd.n += 1;
                 nd.acts[0][i0].n += 1;
