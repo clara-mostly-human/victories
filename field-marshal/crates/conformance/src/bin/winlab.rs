@@ -462,7 +462,7 @@ fn main() {
     let list = |name: &str| opt(name).map(|s| s.split(",").filter(|x| !x.is_empty()).map(str::to_string).collect::<Vec<_>>()).unwrap_or_default();
     let top = list("--top");
     let ours = { let o = list("--ours"); if o.is_empty() { vec!["field-marshal".to_string(), "foot-soldier".into(), "shock-trooper".into(), "quarter-master".into(), "spy-master".into()] } else { o } };
-    let valued = ["--target", "--playout", "--teach-weight", "--teach", "--mix", "--extra", "--frac", "--cache", "--every", "--gen", "--h1", "--h2", "--epochs", "--lr", "--wd", "--td", "--td-rounds", "--misses", "--emit", "--top", "--ours"];
+    let valued = ["--leaves", "--leaf-weight", "--target", "--playout", "--teach-weight", "--teach", "--mix", "--extra", "--frac", "--cache", "--every", "--gen", "--h1", "--h2", "--epochs", "--lr", "--wd", "--td", "--td-rounds", "--misses", "--emit", "--top", "--ours"];
     let mut dirs = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -699,7 +699,37 @@ fn main() {
         }
         valid.iter().map(|&i| logloss(prob(w, i, false, xa, xb, a), y_of(i))).sum::<f64>() / valid.len().max(1) as f64
     };
+    // --leaves file...: positions the search judged, with a deep search's verdict (`leafteach`,
+    // "L <lead> <judgment> <deep value> <inputs>"); with --target hp they train alongside the
+    // games, counted --leaf-weight times. Only with the engine's own inputs (no extras, no strengths).
+    let leaf_files: Vec<String> = args.iter().enumerate().filter(|(i, _)| *i > 0 && args[i - 1] == "--leaves").map(|(_, a)| a.clone()).collect();
+    let mut leaves: Vec<(Vec<f32>, Vec<f32>, f32)> = Vec::new();
+    for path in &leaf_files {
+        for line in std::fs::read_to_string(path).unwrap_or_default().lines() {
+            let mut it = line.split_whitespace();
+            if it.next() != Some("L") {
+                continue;
+            }
+            let v: Vec<f32> = it.filter_map(|x| x.parse().ok()).collect();
+            if v.len() != 3 + 2 * OWN + CTX || !hp_mode || use_skill || !sel_own.is_empty() || !sel_ctx.is_empty() {
+                continue;
+            }
+            let (jud_hp, deep) = (v[1], v[2]);
+            let (a_in, b_in, c_in) = (&v[3..3 + OWN], &v[3 + OWN..3 + 2 * OWN], &v[3 + 2 * OWN..]);
+            let xa: Vec<f32> = a_in.iter().chain(b_in.iter()).chain(c_in.iter()).cloned().collect();
+            let xb: Vec<f32> = b_in.iter().chain(a_in.iter()).chain(c_in.iter()).cloned().collect();
+            let t = deep / 32.0 - if residual { kj * jud_hp / 32.0 } else { 0.0 };
+            leaves.push((xa, xb, t));
+        }
+    }
+    let leaf_weight = num("--leaf-weight", 1.0) as usize;
+    if !leaves.is_empty() {
+        eprintln!("{} judged leaves with a deep verdict, each counted {} times", leaves.len(), leaf_weight);
+    }
     let mut order = train.clone();
+    for _ in 0..leaf_weight {
+        order.extend(st.len()..st.len() + leaves.len());
+    }
     let rounds = 1 + if td.is_some() { td_rounds } else { 0 };
     let mut step = 0i32;
     for round in 0..rounds {
@@ -726,6 +756,15 @@ fn main() {
             for batch in order.chunks(256) {
                 let mut grad = vec![0.0f32; nw];
                 for &i in batch {
+                    if i >= st.len() {
+                        let (la, lb, t) = &leaves[i - st.len()];
+                        let za = net.fwd(&w, la, &mut a);
+                        let zb = net.fwd(&w, lb, &mut ab);
+                        let d = (za - zb) - t;
+                        net.bwd(&w, la, &a, d, &mut grad);
+                        net.bwd(&w, lb, &ab, -d, &mut grad);
+                        continue;
+                    }
                     inputs(&st, i, skill_of(i, false), &sel_own, &sel_ctx, &mut xa, &mut xb);
                     let za = net.fwd(&w, &xa, &mut a);
                     let zb = net.fwd(&w, &xb, &mut ab);

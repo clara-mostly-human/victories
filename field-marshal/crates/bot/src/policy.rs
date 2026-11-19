@@ -176,6 +176,8 @@ pub struct Playbook {
     pub tree_reuse: bool,
     /// Plans as moves in the search (`mcts::Config::plans`, part 4); with `tree_reuse` the kept tree loses only positions under old plans.
     pub tree_plans: bool,
+    /// Plans in the leaf's play-out instead of the tree (`mcts::Config::plan_playout`, part 4 second design).
+    pub tree_plan_playout: bool,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
     pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
@@ -342,6 +344,7 @@ impl Default for Playbook {
             tree_depth_buff: 0,
             tree_reuse: false,
             tree_plans: false,
+            tree_plan_playout: false,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
@@ -470,7 +473,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them), ("tree_reuse", &mut p.tree_reuse), ("tree_plans", &mut p.tree_plans)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them), ("tree_reuse", &mut p.tree_reuse), ("tree_plans", &mut p.tree_plans), ("tree_plan_playout", &mut p.tree_plan_playout)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -1380,6 +1383,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         cfg.net_hp = pb.tree_net_hp;
         cfg.net_value = pb.tree_net_value;
         cfg.plans = pb.tree_plans;
+        cfg.plan_playout = pb.tree_plan_playout;
         if pb.tree_depth_buff > 0 && s.fighters.iter().any(|f| f.power_until != NO_BUFF && f.power_until > s.tick) {
             cfg.depth = pb.tree_depth_buff;
             if pb.tree_quiet_buff > 0 {

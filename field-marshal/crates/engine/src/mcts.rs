@@ -58,6 +58,11 @@ pub struct Config {
     /// stands against a wall), its steps forced in the subtree below and carried
     /// on through the leaf's play-out, so the search can value goals farther than it branches.
     pub plans: bool,
+    /// Plans in the play-out (part 4, second design): at a leaf each side heads for the goal that
+    /// fits the position (a health pad when hurt and it gets there first, a power pad it reaches
+    /// no later than the opponent, else the centre) while the quiet play-out still dodges and takes
+    /// sure shots, so the leaf's judgment sees where strategic movement leads. The tree is untouched.
+    pub plan_playout: bool,
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
     /// fighters (bit 0 = fighter 0, bit 1 = fighter 1) whose standing shots may lead, in
@@ -86,7 +91,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, plans: false, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, plans: false, plan_playout: false, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -492,12 +497,48 @@ fn reward(s: &State, before: (i32, i32)) -> f64 {
 }
 
 /// The value of a position beyond the hp already counted, for fighter 0.
-pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2]) -> f64 {
+/// The goal a side heads for in a strategic play-out (`Config::plan_playout`), as an index into
+/// `goals` (the pads' and the centre's distance maps), or None to stay put.
+fn strategic_goal(e: &Engine, s: &State, x: usize, goals: &[(P, Vec<u16>)]) -> Option<usize> {
+    let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
+    if !f.alive || !o.alive {
+        return None;
+    }
+    let w = e.map.w;
+    let dist = |g: usize, p: P| goals[g].1.get((p[1] * w + p[0]) as usize).cloned().unwrap_or(u16::MAX) as i32;
+    let goal_of = |pos: P| goals.iter().position(|(gp, _)| *gp == pos);
+    let mut best: Option<(i32, usize)> = None;
+    let hurt = f.hp <= e.rules.max_hp - 30;
+    let buffed = f.power_until != NO_BUFF && f.power_until > s.tick + 10;
+    for (i, def) in e.map.pads.iter().enumerate() {
+        let Some(g) = goal_of(def.pos) else { continue };
+        let (mine, theirs) = (dist(g, f.pos), dist(g, o.pos));
+        let back = if s.pads[i].available { 0 } else { s.pads[i].respawn_tick - s.tick };
+        let wanted = match def.kind {
+            PadKind::Health => hurt && mine <= theirs + 1,
+            PadKind::Power => !buffed && mine <= theirs,
+            #[allow(unreachable_patterns)]
+            _ => false,
+        };
+        if wanted && mine > 0 && back <= 2 * mine + 2 && best.map(|b| mine < b.0).unwrap_or(true) {
+            best = Some((mine, g));
+        }
+    }
+    if let Some((_, g)) = best {
+        return Some(g);
+    }
+    let c = goal_of(e.map.center)?;
+    if dist(c, f.pos) > 2 { Some(c) } else { None }
+}
+
+pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2], goals: &[(P, Vec<u16>)]) -> f64 {
     let mut st = *s;
     let mut v = 0.0;
-    let pick = |st: &State, x: usize| match plans[x] {
-        Some(d) => plan_turn(e, st, x, d, cfg.quiet_slam),
-        None => quiet_turn(e, st, x, cfg.quiet_slam),
+    let strategic: [Option<usize>; 2] = if cfg.plan_playout && !goals.is_empty() { [strategic_goal(e, s, 0, goals), strategic_goal(e, s, 1, goals)] } else { [None, None] };
+    let pick = |st: &State, x: usize| match (plans[x], strategic[x]) {
+        (Some(d), _) => plan_turn(e, st, x, d, cfg.quiet_slam),
+        (None, Some(g)) => plan_turn(e, st, x, &goals[g].1, cfg.quiet_slam),
+        (None, None) => quiet_turn(e, st, x, cfg.quiet_slam),
     };
     for _ in 0..cfg.quiet {
         if st.result.is_some() {
@@ -546,6 +587,13 @@ pub struct Search<'a> {
     plan_kind: Vec<u8>,
     /// a kept tree was loaded: offer the plans at its root on the next iteration
     plans_pending: bool,
+    /// distance maps to every pad and the centre, for strategic play-outs (`Config::plan_playout`)
+    goals: Vec<(P, Vec<u16>)>,
+    /// every `sample_every`-th leaf position judged, kept for training the judgment on the
+    /// positions the search actually judges (0: none)
+    pub sample_every: u32,
+    pub samples: Vec<State>,
+    leaves: u32,
 }
 
 /// A search tree kept between ticks: the positions below a root, with their statistics.
@@ -573,7 +621,7 @@ pub struct RootResult {
 
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, cfg: Config) -> Search<'a> {
-        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0, pairs: HashMap::new(), plans: Vec::new(), root_plan: [Vec::new(), Vec::new()], plan_kind: Vec::new(), plans_pending: false }
+        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0, pairs: HashMap::new(), plans: Vec::new(), root_plan: [Vec::new(), Vec::new()], plan_kind: Vec::new(), plans_pending: false, goals: if cfg.plan_playout { e.map.pads.iter().map(|p| p.pos).chain(std::iter::once(e.map.center)).map(|p| (p, dist_map(e, p))).collect() } else { Vec::new() }, sample_every: 0, samples: Vec::new(), leaves: 0 }
     }
 
     fn select(&self, node: usize, side: usize) -> usize {
@@ -822,7 +870,24 @@ impl<'a> Search<'a> {
 
     /// What the tree holds at the root now.
     pub fn result(&self) -> RootResult {
-        let list = |x: usize| self.nodes[0].acts[x].iter().map(|a| (a.turn, a.n, if a.n > 0 { a.w / a.n as f64 } else { 0.0 })).collect();
+        // Plans add root turns that repeat a plain turn: the same turn's visits and results are
+        // summed, so a good turn is not outvoted because its visits were split between copies.
+        let list = |x: usize| {
+            let mut out: Vec<(RawTurn, u32, f64)> = Vec::new();
+            for a in self.nodes[0].acts[x].iter() {
+                match out.iter_mut().find(|(t, _, _)| *t == a.turn) {
+                    Some(e) => {
+                        e.1 += a.n;
+                        e.2 += a.w;
+                    }
+                    None => out.push((a.turn, a.n, a.w)),
+                }
+            }
+            for e in out.iter_mut() {
+                e.2 = if e.1 > 0 { e.2 / e.1 as f64 } else { 0.0 };
+            }
+            out
+        };
         RootResult { acts: [list(0), list(1)], value: self.total / self.done.max(1) as f64 }
     }
 
@@ -842,7 +907,7 @@ impl<'a> Search<'a> {
                     // move lists (the costly part, in time and memory) once visited again.
                     if depth > 0 && self.nodes[node].n < self.cfg.expand_at {
                         self.nodes[node].n += 1;
-                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took));
+                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took), &self.goals);
                         break;
                     }
                     for x in 0..2 {
@@ -865,7 +930,7 @@ impl<'a> Search<'a> {
                         self.plans_pending = false;
                     }
                     if depth > 0 && self.cfg.expand_at == 0 {
-                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took));
+                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took), &self.goals);
                         break;
                     }
                     if depth == 0 && self.cfg.noise_seed != 0 {
@@ -898,7 +963,7 @@ impl<'a> Search<'a> {
                     break;
                 }
                 if depth + 1 == self.cfg.depth {
-                    leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took));
+                    leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took), &self.goals);
                     break;
                 }
                 let key = ((node as u64) << 32) | ((i0 as u64) << 16) | i1 as u64;
@@ -906,7 +971,7 @@ impl<'a> Search<'a> {
                     Some(c) => *c as usize,
                     None if self.cfg.max_nodes > 0 && self.nodes.len() >= self.cfg.max_nodes as usize => {
                         // The tree is as big as it may grow: judge this position as a leaf.
-                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took));
+                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took), &self.goals);
                         break;
                     }
                     None => {
@@ -931,6 +996,12 @@ impl<'a> Search<'a> {
                         c
                     }
                 };
+            }
+            if self.sample_every > 0 && s.result.is_none() {
+                self.leaves += 1;
+                if self.leaves % self.sample_every == 0 {
+                    self.samples.push(s);
+                }
             }
             let mut g = leaf;
             for &(n, i0, i1, r) in path.iter().rev() {
