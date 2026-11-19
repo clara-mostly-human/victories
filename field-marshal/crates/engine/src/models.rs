@@ -76,7 +76,7 @@ pub fn move_probs_for(e: &Engine, s: &State, x: usize) -> [f32; CLASSES] {
 ///   1: 60 games of the plain search against itself at 60 ms a move (7,713 recorded
 ///      ticks); explains 21% of the outcome on held-out ticks; beat the plain search
 ///      26-3-1 and the matrix search 23-7 at 100 ms a move.
-pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 9] = [
+pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 10] = [
     [68.107, 8.515, 0.214, -0.175, 0.018, -2.188, 1.827, 0.474, 0.275, -1.223, -1.617, -3.328, 0.397, 4.701, -3.262, 3.726, 66.527, -1.036, 4.400, -1.397, 1.688, 2.439, -47.270, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
     // candidate 2: generation 0 and generation 1 self-play together (18,686 ticks; 23% held out)
     [97.288, 8.504, 0.080, -0.270, -0.897, -2.520, 0.848, 0.840, 0.046, -2.435, -2.950, -3.410, 0.407, 4.994, -4.795, 5.348, 67.236, -2.006, 5.476, -1.142, 1.334, 3.055, -70.162, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -104,6 +104,10 @@ pub const VALUE_GENS: [[f32; crate::valuefeat::NV]; 9] = [
     // 2400+ bots, come when the opponent holds the power buff (half the cost, a fifth of
     // the positions): the 18-tick search sees only part of the 50-tick buff.
     [68.107, 17.030, 0.214, -0.175, 0.018, -2.188, 1.827, 0.474, 0.275, -1.223, -1.617, -3.328, 0.397, 4.701, -3.262, 3.726, 66.527, -1.036, 4.400, -1.397, 1.688, 2.439, -47.270, 0.000, 0.000, 0.000, 0.000, 0.000, 0.000, 10.000, 0.000],
+    // candidate 10, the teacher: all 31 features fitted to what a deep, far-looking search
+    // (300k iterations, 30 ticks of tree and 10 of play-out, row 6) says positions are worth:
+    // 1,010 positions from 25 of our ladder games against bots rated 2400 and up
+    [34.292, 6.443, -2.983, -3.566, -0.516, -11.799, 3.557, 0.826, 2.572, 0.692, -2.723, -4.610, -1.836, 2.186, -12.067, 2.029, 44.944, 0.313, 1.843, -3.998, 1.961, 5.460, -25.377, -1.442, 2.551, 6.716, -0.844, -9.924, -4.924, 4.022, 17.468],
 ];
 
 /// The weights of generation `gen` (1 is the first); 0 or a number past the end gives the latest.
