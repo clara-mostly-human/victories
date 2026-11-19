@@ -1,10 +1,12 @@
 {
   "default": {
-    "name": "tree-pads",
+    "name": "tree-buffwin",
     "tree_ms": 150,
     "tree_value": 1.0,
     "tree_gen": 6,
     "tree_dash_burst": true,
+    "tree_depth_buff": 24,
+    "tree_quiet_buff": 10,
     "tree_threads": 1
   },
   "opponents": {}
