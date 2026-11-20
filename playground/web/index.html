@@ -539,10 +539,12 @@ function drawBoard() {
   }
   if (over()) {
     const r = S.pos.result;
-    c.fillStyle = 'rgba(0,0,0,.55)'; c.fillRect(0, m.h * TS / 2 - 34, m.w * TS, 68);
+    // along the edge the fighters are farther from, so it does not cover the end position
+    const top = st.fighters.reduce((n, f) => n + (f.pos[1] < m.h / 2 ? 1 : 0), 0) < 2 && st.fighters.every(f => f.pos[1] > 2) ? 0 : m.h * TS - 56;
+    c.fillStyle = 'rgba(0,0,0,.7)'; c.fillRect(0, top, m.w * TS, 56);
     const who = r.winner ? `${S.session.names[r.winner - 1]} wins` : 'Draw';
-    text(c, `${who} (${r.reason.replace(/_/g, ' ')}) at tick ${r.final_tick}`, m.w * TS / 2, m.h * TS / 2 - 8, '#fff', 18, 'center', true);
-    text(c, 'Go back to any tick to try something else', m.w * TS / 2, m.h * TS / 2 + 16, '#8593a6', 12);
+    text(c, `${who} (${r.reason.replace(/_/g, ' ')}) at tick ${r.final_tick}`, m.w * TS / 2, top + 20, '#fff', 17, 'center', true);
+    text(c, 'Go back to any tick to try something else', m.w * TS / 2, top + 42, '#8593a6', 12);
   }
 }
 
