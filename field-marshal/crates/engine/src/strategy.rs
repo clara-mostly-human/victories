@@ -133,13 +133,6 @@ fn health_pad(e: &Engine, s: &State, from: P, within: i32) -> Option<P> {
         .min_by_key(|p| path(e, *p, from))
 }
 
-/// Slam positioning in engage and press (Mike: an aspect of play in every phase, not a phase): set
-/// up our slam (a threat held: repulsor ready, reachable tile next to them with a wall behind),
-/// step out of theirs (on ladder games against 2400+ we take 1.8 stuns a game and deal 1.1).
-fn slam_terms(e: &Engine, s: &State, x: usize) -> f64 {
-    2.0 * crate::valuefeat::slam_threat(e, s, x) as i32 as f64 - 3.0 * crate::valuefeat::slam_threat(e, s, 1 - x) as i32 as f64
-}
-
 /// How well fighter `x`'s position serves mode `m`, in hp, capped at +-`cap`.
 pub fn score(e: &Engine, s: &State, x: usize, m: Mode, cap: f64) -> f64 {
     let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
@@ -171,9 +164,9 @@ pub fn score(e: &Engine, s: &State, x: usize, m: Mode, cap: f64) -> f64 {
             if o.hp < e.rules.max_hp - 15 && health_pad(e, s, o.pos, 25).is_some() {
                 v -= 0.8 * (d - 3.0).max(0.0);
             }
-            v + slam_terms(e, s, x)
+            v
         }
-        Mode::Engage => -0.5 * (d - 3.0).abs() + if sight { 1.0 } else { 0.0 } + slam_terms(e, s, x),
+        Mode::Engage => -0.5 * (d - 3.0).abs() + if sight { 1.0 } else { 0.0 },
         Mode::Disengage => {
             // distance and broken sight count once out of their reach; within it every tile counts against
             let reach = 4.0;
