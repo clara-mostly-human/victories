@@ -109,7 +109,7 @@
     <div class="panel" id="pFighters"><h2>Fighters <span class="r num" id="tickinfo"></span></h2><div id="fighters"></div></div>
 
     <div class="panel" id="pTurn">
-      <h2>Your turn <span class="r hint" id="turnhint"></span></h2>
+      <h2><span id="turnTitle">Your turn</span> <span class="r hint" id="turnhint"></span></h2>
       <div id="compose">
         <div>
           <div id="pad"></div>
@@ -118,19 +118,23 @@
         <div id="weapons"></div>
       </div>
       <div id="staged"></div>
+      <div class="hint" id="bothNote" style="display:none;margin-bottom:6px"></div>
       <div class="row">
+        <button id="bSide" style="display:none"></button>
         <button class="primary" id="bGo">Play tick <kbd>Space</kbd></button>
         <button id="bClear">Clear <kbd>Esc</kbd></button>
         <button id="bBot" title="The bot's brain chooses this tick for your side">Bot plays it <kbd>B</kbd></button>
       </div>
       <div class="row" style="margin-top:6px">
         <label class="hint"><input type="checkbox" id="cAuto" checked> pass ticks where I cannot act</label>
+        <label class="hint" title="Choose the bot's turn by hand as well, to see what would have happened if it had played something else"><input type="checkbox" id="cBoth"> I choose the bot's turn too</label>
       </div>
       <details style="margin-top:6px"><summary>Keys</summary>
         <div class="hint" style="margin-top:4px">
           Step: <kbd>Q</kbd><kbd>W</kbd><kbd>E</kbd> / <kbd>A</kbd><kbd>D</kbd> / <kbd>Z</kbd><kbd>X</kbd><kbd>C</kbd> (or the number pad), <kbd>S</kbd> stand still. Dash: <kbd>⇧</kbd> + direction.<br>
           Attack: <kbd>1</kbd> shot, <kbd>2</kbd> frostburst, <kbd>3</kbd> repulsor, then click the target tile. <kbd>F</kbd> shot at the opponent, <kbd>G</kbd> frostburst on the opponent, <kbd>R</kbd> repulsor.<br>
           Click a tile next to you to step there, or a dash landing (◇) to dash. Right-click clears.<br>
+          With "I choose the bot's turn too", <kbd>Tab</kbd> switches between your turn and the bot's.<br>
           <kbd>Space</kbd> play the tick. <kbd>←</kbd> <kbd>→</kbd> back and forward one tick, <kbd>Home</kbd> <kbd>End</kbd> first and last. <kbd>B</kbd> bot plays my tick. <kbd>P</kbd> peek.
         </div>
       </details>
@@ -211,6 +215,9 @@ const WEAPON_NAMES = {ranged:'Shot', frostburst:'Frostburst', repulsor:'Repulsor
 
 let S = null;                       // latest snapshot from the server
 let staged = {move:null, dash:null, attack:null};
+let otherStaged = {move:null, dash:null, attack:null};   // the other side's turn, when both are chosen by hand
+let both = false;                   // choose the bot's turn by hand too
+let cs = null;                      // the seat whose turn is being composed (null: the seat played by hand)
 let armed = null;                   // weapon waiting for a target click
 let dashMode = false;
 let preview = null;
@@ -245,7 +252,9 @@ async function act(path, body, opts = {}) {
 }
 
 const human = () => S.session.human;
-const me = () => human() == null ? null : S.pos.state.fighters[human()];
+const cseat = () => both && cs != null && human() != null ? cs : human();
+const me = () => cseat() == null ? null : S.pos.state.fighters[cseat()];
+const mine = () => human() == null ? null : S.pos.state.fighters[human()];
 const over = () => !!S.pos.result;
 
 function canAct(f) {
@@ -256,7 +265,7 @@ function canAct(f) {
 
 function setSnap(j, opts = {}) {
   S = j;
-  staged = {move:null, dash:null, attack:null}; armed = null; dashMode = false; preview = null;
+  staged = {move:null, dash:null, attack:null}; otherStaged = {move:null, dash:null, attack:null}; cs = null; armed = null; dashMode = false; preview = null;
   if (S.session.id !== lastSession) { lastSession = S.session.id; resize(); }
   render();
   // The bot's choice for this tick, when peeking.
@@ -265,28 +274,38 @@ function setSnap(j, opts = {}) {
     call('/api/think', {seat: 1 - h}).then(j2 => { if (j2 && j2.cur === S.cur) { S = j2; render(); } });
   }
   // A tick on which the fighter played by hand can do nothing is passed, right after a move of ours.
-  if (opts.played && $('cAuto').checked && h != null && !over() && !canAct(me())) {
+  if (opts.played && $('cAuto').checked && !both && h != null && !over() && !canAct(mine())) {
     autoTimer = setTimeout(() => act('/api/turn', {turn: {}}, {played: true}), 140);
   }
 }
 
 // ---------------------------------------------------------------- the staged turn
 
-function turnJson() {
+function turnJson(st = staged) {
   const t = {};
-  if (staged.move) t.move = staged.move;
-  if (staged.dash) t.dash = staged.dash;
-  if (staged.attack) t.attack = staged.attack;
+  if (st.move) t.move = st.move;
+  if (st.dash) t.dash = st.dash;
+  if (st.attack) t.attack = st.attack;
   return t;
 }
 
-function stagedLabel() {
+function label(st) {
   const p = [];
-  if (staged.move) p.push('step ' + staged.move);
-  if (staged.dash) p.push('dash ' + staged.dash);
-  if (staged.attack) p.push(staged.attack.target ? `${staged.attack.name} at ${staged.attack.target}` : staged.attack.name);
+  if (st.move) p.push('step ' + st.move);
+  if (st.dash) p.push('dash ' + st.dash);
+  if (st.attack) p.push(st.attack.target ? `${st.attack.name} at ${st.attack.target}` : st.attack.name);
   return p.length ? p.join(' + ') : 'wait';
 }
+
+function switchSide() {
+  if (!both || human() == null) return;
+  const t = staged; staged = otherStaged; otherStaged = t;
+  cs = cseat() === human() ? 1 - human() : human();
+  armed = null; dashMode = false;
+  restage();
+}
+
+const stagedLabel = () => label(staged);
 
 async function restage() {
   preview = null;
@@ -295,7 +314,7 @@ async function restage() {
   const t = turnJson();
   if (!Object.keys(t).length) return;
   const key = JSON.stringify(t), at = S.cur;
-  const p = await call('/api/preview', {turn: t});
+  const p = await call('/api/preview', {turn: t, seat: cseat()});
   if (p && at === S.cur && key === JSON.stringify(turnJson())) { preview = p; render(); }
 }
 
@@ -331,7 +350,7 @@ function aimAt(name, tile) {
 
 function aimAtEnemy(name) {
   if (human() == null || over()) return;
-  const en = S.pos.state.fighters[1 - human()];
+  const en = S.pos.state.fighters[1 - cseat()];
   aimAt(name, en.pos.slice());
 }
 
@@ -341,6 +360,10 @@ function commit() {
   if (!S || busy) return;
   if (human() == null) { stepLine(1); return; }
   if (over()) { toast('The game is over here. Go back to an earlier tick to play on from it.'); return; }
+  if (both) {
+    const hand = cseat() === human();
+    return act('/api/turn', {turn: turnJson(hand ? staged : otherStaged), reply: turnJson(hand ? otherStaged : staged)}, {played: true});
+  }
   act('/api/turn', {turn: turnJson()}, {played: true});
 }
 
@@ -467,23 +490,25 @@ function drawBoard() {
   }
   // shots in flight, with where they go if nobody moves
   for (const f of S.pos.flights) drawFlight(c, f, COL[f.owner - 1], false);
-  // options of the fighter played by hand
+  // options of the fighter whose turn is being composed
+  const ch = cseat();
   if (h != null && S.pos.views && !over()) {
-    const v = S.pos.views[h];
+    const v = S.pos.views[ch];
     for (const o of v.moves) { c.fillStyle = 'rgba(219,227,238,.35)'; c.beginPath(); c.arc(cx(o.tile), cy(o.tile), 2.5, 0, 7); c.fill(); }
     for (const o of v.dashes) { const x = cx(o.tile), y = cy(o.tile), r = TS * .2; c.strokeStyle = 'rgba(219,227,238,.4)'; c.lineWidth = 1; c.beginPath(); c.moveTo(x, y - r); c.lineTo(x + r, y); c.lineTo(x, y + r); c.lineTo(x - r, y); c.closePath(); c.stroke(); }
   }
   // the bot's belief when it cannot see us
   const bt = h != null ? (S.pos.thoughts[1 - h] && $('cPeek').checked ? S.pos.thoughts[1 - h] : null) : null;
   if (bt && !bt.enemy_visible) {
-    for (const t of bt.possible) { c.fillStyle = 'rgba(255,209,102,.16)'; c.fillRect(t[0] * TS + 3, t[1] * TS + 3, TS - 6, TS - 6); }
+    for (const t of bt.possible) { c.fillStyle = 'rgba(255,209,102,.07)'; c.fillRect(t[0] * TS, t[1] * TS, TS, TS); }
     c.strokeStyle = 'rgba(255,209,102,.9)'; c.setLineDash([3, 3]); c.lineWidth = 2; c.beginPath(); c.arc(cx(bt.believed_enemy), cy(bt.believed_enemy), TS * .4, 0, 7); c.stroke(); c.setLineDash([]);
   }
   // fighters
   st.fighters.forEach((f, i) => drawFighter(c, f, i));
   // the staged turn
   if (h != null && !over()) {
-    const f = st.fighters[h], v = S.pos.views[h];
+    const f = st.fighters[ch], v = S.pos.views[ch];
+    if (both) drawIntent(c, st.fighters[1 - ch], turnJson(otherStaged), COL[1 - ch]);
     if (staged.move) { const o = v.moves.find(o => o.dir === staged.move); const to = o ? o.tile : [f.pos[0] + VEC[staged.move][0], f.pos[1] + VEC[staged.move][1]]; arrow(c, f.pos, to, o ? '#fff' : '#ff5d73', 3, !o); }
     if (staged.dash) { const o = v.dashes.find(o => o.dir === staged.dash); const to = o ? o.tile : [f.pos[0] + VEC[staged.dash][0], f.pos[1] + VEC[staged.dash][1]]; arrow(c, f.pos, to, o ? '#fff' : '#ff5d73', 5, !o); }
     if (preview) {
@@ -491,7 +516,7 @@ function drawBoard() {
       for (const a of preview.areas) for (const t of a.tiles) { c.strokeStyle = '#fff'; c.setLineDash([4, 3]); c.lineWidth = 1.5; c.strokeRect(t[0] * TS + 2, t[1] * TS + 2, TS - 4, TS - 4); c.setLineDash([]); }
       for (const ev of preview.events) {
         if (ev.kind === 'repulse') for (const t of ev.tiles) { c.strokeStyle = '#b388ff'; c.setLineDash([4, 3]); c.lineWidth = 1.5; c.strokeRect(t[0] * TS + 2, t[1] * TS + 2, TS - 4, TS - 4); c.setLineDash([]); }
-        if (ev.kind === 'hit' && ev.attacker === h + 1) text(c, '-' + ev.damage, cx(st.fighters[1 - h].pos), cy(st.fighters[1 - h].pos) - TS * .95, '#fff', 12, 'center', true);
+        if (ev.kind === 'hit' && ev.attacker === ch + 1) text(c, '-' + ev.damage, cx(st.fighters[1 - ch].pos), cy(st.fighters[1 - ch].pos) - TS * .95, '#fff', 12, 'center', true);
       }
     }
     if (staged.attack && staged.attack.target) { const t = staged.attack.target; c.strokeStyle = '#fff'; c.lineWidth = 2; c.strokeRect(t[0] * TS + 3, t[1] * TS + 3, TS - 6, TS - 6); c.beginPath(); c.moveTo(cx(t) - 5, cy(t)); c.lineTo(cx(t) + 5, cy(t)); c.moveTo(cx(t), cy(t) - 5); c.lineTo(cx(t), cy(t) + 5); c.stroke(); }
@@ -505,7 +530,7 @@ function drawBoard() {
     }
   }
   // the bot's choice for this tick, when peeking
-  if (bt && !over()) drawIntent(c, st.fighters[1 - h], bt.turn, COL[1 - h]);
+  if (bt && !over() && !both) drawIntent(c, st.fighters[1 - h], bt.turn, COL[1 - h]);
   // damage of the last tick
   for (const ev of S.pos.events) {
     if (ev.kind === 'hit' || ev.kind === 'wall_slam') { const f = st.fighters[ev.target - 1]; text(c, '-' + ev.damage + (ev.kind === 'wall_slam' ? ' slam' : ''), cx(f.pos) + TS * .2, cy(f.pos) - TS * (ev.kind === 'hit' ? .95 : 1.3), '#ff5d73', 12, 'left', true); }
@@ -580,7 +605,7 @@ board.addEventListener('click', e => {
   const t = tileAt(e);
   if (!t) return;
   if (armed) return aimAt(armed, t);
-  const v = S.pos.views[human()], f = me();
+  const v = S.pos.views[cseat()], f = me();
   const step = v.moves.find(o => same(o.tile, t));
   if (step) return setDir(step.dir, false);
   const dash = v.dashes.find(o => same(o.tile, t));
@@ -679,10 +704,17 @@ function renderFighters() {
 }
 
 function renderTurn() {
-  const h = human();
+  const h = cseat();
   $('pTurn').style.display = h == null ? 'none' : '';
   if (h == null) return;
   const f = me(), v = S.pos.views ? S.pos.views[h] : {moves:[], dashes:[]}, c = f.cooldowns, done = over();
+  const who = h === human() ? 'you' : 'the bot';
+  $('turnTitle').innerHTML = both ? `Turn of <span style="color:${COL[h]}">${esc(S.session.names[h])}</span>` : 'Your turn';
+  $('bSide').style.display = both ? '' : 'none';
+  $('bSide').innerHTML = `Now ${h === human() ? "the bot's" : 'your'} turn <kbd>Tab</kbd>`;
+  $('bothNote').style.display = both ? '' : 'none';
+  $('bothNote').innerHTML = both ? `Other side: <b style="color:${COL[1 - h]}">${esc(label(otherStaged))}</b>` : '';
+  $('bBot').style.display = both ? 'none' : '';
   $('pad').innerHTML = DIRS.map(d => {
     if (!d) return `<button data-dir="" title="Stand still (S)">·</button>`;
     const ok = dashMode ? v.dashes.some(o => o.dir === d) : v.moves.some(o => o.dir === d);
@@ -706,7 +738,7 @@ function renderTurn() {
     if (hits.length) s += `<div class="hint">if the opponent stands still: ${hits.map(e => `${e.kind === 'hit' ? esc(e.attack) : 'wall slam'} hits for ${e.damage}`).join(', ')}</div>`;
   }
   $('staged').innerHTML = s;
-  $('turnhint').textContent = done ? 'game over here' : f.state !== 'idle' ? `you are ${f.state}: no action possible` : !canAct(f) ? 'everything is on cooldown' : 'no clock: take your time';
+  $('turnhint').textContent = done ? 'game over here' : f.state !== 'idle' ? `${who === 'you' ? 'you are' : 'the bot is'} ${f.state}: no action possible` : !canAct(f) ? 'everything is on cooldown' : 'no clock: take your time';
   $('bGo').disabled = done; $('bBot').disabled = done;
 }
 
@@ -715,7 +747,7 @@ function thinkHtml(th, seat, title, actual) {
   let s = `<div class="think"><div class="head">${title}: <b style="color:${COL[seat]}">${esc(th.label)}</b> <span class="hint">`;
   if (th.note === 'tree') s += `· expects ${th.score >= 0 ? '+' : ''}${th.score.toFixed(1)} hp · ${(th.sims / 1000).toFixed(1)}k iterations in ${th.ms} ms`;
   else s += `· chosen by "${esc(th.note)}", not the tree search · ${th.ms} ms`;
-  if (!th.enemy_visible) s += ' · could not see the opponent';
+  if (!th.enemy_visible) s += ` · could not see the opponent, guessed it at ${th.believed_enemy} (dashed ring; the pale tiles are where it could be)`;
   if (th.sync !== 'exact' && th.sync) s += ` · tracker: ${esc(th.sync)}`;
   s += `</span></div>`;
   if (th.root) {
@@ -837,6 +869,9 @@ $('pad').addEventListener('click', e => { const b = e.target.closest('button'); 
 $('bDash').onclick = () => { dashMode = !dashMode; render(); };
 $('weapons').addEventListener('click', e => { const b = e.target.closest('button'); if (b) arm(b.dataset.w); });
 $('bGo').onclick = commit;
+$('bSide').onclick = switchSide;
+$('cBoth').onchange = () => { both = $('cBoth').checked; if (!both && cs != null && cs !== human()) switchSide0(); cs = null; armed = null; restage(); };
+function switchSide0() { const t = staged; staged = otherStaged; otherStaged = t; }
 $('bClear').onclick = clearStaged;
 $('bBot').onclick = () => act('/api/botmove', {}, {played: true});
 $('bFirst').onclick = () => gotoIndex(0);
@@ -862,7 +897,7 @@ $('seatbtns').addEventListener('click', e => {
 $('cKeep').onchange = () => act('/api/settings', {keep_recorded: $('cKeep').checked});
 
 document.addEventListener('keydown', e => {
-  if (!S || e.target.matches('input, select, textarea') || document.querySelector('dialog[open]')) return;
+  if (!S || e.target.matches('input:not([type=checkbox]), select, textarea') || document.querySelector('dialog[open]')) return;
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const k = e.code;
   let used = true;
@@ -874,6 +909,7 @@ document.addEventListener('keydown', e => {
   else if (k === 'Escape') clearStaged();
   else if (k === 'KeyP') { $('cPeek').checked = !$('cPeek').checked; setSnap(S); }
   else if (human() == null || over()) used = false;
+  else if (k === 'Tab' && both) switchSide();
   else if (KEYDIR[k]) setDir(KEYDIR[k], e.shiftKey || dashMode);
   else if (k === 'KeyS' || k === 'Numpad5') setDir(null);
   else if (k === 'Digit1') arm('ranged');
@@ -943,6 +979,10 @@ $('rlist').addEventListener('click', async e => {
   if (await act('/api/load', {id: tr.dataset.id})) $('dLoad').close();
 });
 $('rOpen').onclick = async () => { if (await act('/api/load', {path: $('rPath').value.trim()})) $('dLoad').close(); };
+
+// A checkbox or menu that keeps the focus would swallow the next key.
+document.addEventListener('change', e => { if (e.target.matches('input[type=checkbox], select') && !e.target.closest('dialog')) e.target.blur(); });
+document.addEventListener('click', e => { const b = e.target.closest('button'); if (b && !b.closest('dialog')) b.blur(); });
 
 call('/api/state').then(j => { if (j) setSnap(j); });
 </script>
