@@ -70,9 +70,13 @@ if loaded:
     d = call("/api/think", {"seat": 0})
     check("bot asked at a replay position", d["pos"]["thoughts"][0] is not None, d["pos"]["thoughts"][0] and d["pos"]["thoughts"][0]["label"])
     d = call("/api/seat", {"seat": 1})
-    d = call("/api/turn", {"turn": {}})
-    d = call("/api/turn", {"turn": {}})
-    check("seat taken in a replay", "error" not in d and not d["pos"]["recorded"], f"tick {d['pos']['tick']}")
+    # a turn that differs from the recorded one leaves the replay's line; the same turn stays on it
+    for turn in ({"dash": "N"}, {"dash": "S"}, {"move": "E"}, {}):
+        d = call("/api/turn", {"turn": turn})
+        if "error" in d or not d["pos"]["recorded"]:
+            break
+        d = call("/api/goto", {"node": mid})
+    check("seat taken in a replay", "error" not in d and not d["pos"]["recorded"] and d["pos"]["by"][1] == 1, f"tick {d['pos']['tick']}, a new branch")
 else:
     print("no replay of field-marshal on this machine: replay checks skipped")
 call("/api/new", {"map": "arena-21", "seat": 0})
