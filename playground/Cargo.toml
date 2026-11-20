@@ -1,0 +1,24 @@
+# The playground: play the game by hand against the bot's own brain, with no clock, and
+# rewind to any position. A package of its own (not a member of field-marshal's workspace)
+# so that building it never touches field-marshal/target or the workspace's lock file.
+[package]
+name = "playground"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+victris-engine = { path = "../field-marshal/crates/engine" }
+marshal = { path = "../field-marshal/crates/bot" }
+serde_json = "1"
+flate2 = "1"
+
+# The same optimisation as the bot, so its search runs here at the speed it runs live.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+debug = 0

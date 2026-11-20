@@ -1346,6 +1346,22 @@ thread_local! {
     static KEPT: std::cell::RefCell<std::collections::HashMap<(i64, usize), Kept>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// What the tree search found at the root of its latest decision on this thread: the position
+/// it searched (the tracker's belief), each side's turns with their visits and average result
+/// in hp for that side, the average result for fighter 0, and the iterations run and reused.
+/// Only tools that show the search's thinking read it (`playground/`); the bot never does.
+pub struct RootSeen {
+    pub root: State,
+    pub acts: [Vec<(RawTurn, u32, f64)>; 2],
+    pub value: f64,
+    pub sims: u32,
+    pub reused: u32,
+}
+
+thread_local! {
+    pub static LAST_ROOT: std::cell::RefCell<Option<RootSeen>> = const { std::cell::RefCell::new(None) };
+}
+
 pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
     let started = Instant::now();
     let d = decide_inner(t, view, pb, started);
@@ -1467,6 +1483,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             let root = search.result();
             dump_visits(e, &s, me, &root.acts[me]);
             let Some((turn, _, q)) = root.acts[me].iter().max_by_key(|a| a.1).copied() else { return idle };
+            LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: root.acts, value: root.value, sims: done, reused }));
             let tree = search.into_tree();
             KEPT.with(|k| {
                 let mut k = k.borrow_mut();
@@ -1537,6 +1554,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 best = Some(*a);
             }
         }
+        LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: root.acts, value: root.value, sims: done, reused: 0 }));
         return match best {
             Some((turn, _, q)) => Decision { turn, sims: done, score: q, note: "tree" },
             None => idle,

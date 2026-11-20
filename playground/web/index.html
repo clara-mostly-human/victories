@@ -1,0 +1,950 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Victris playground</title>
+<style>
+  :root {
+    --bg: #10141a; --panel: #171d26; --panel2: #1e2632; --line: #2b3545; --text: #dbe3ee; --dim: #8593a6;
+    --p1: #4cc9f0; --p2: #ff9f1c; --good: #5dd39e; --bad: #ff5d73; --warn: #ffd166; --frost: #7aa8ff; --accent: #b388ff;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font: 13px/1.4 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; }
+  button, select, input { font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 6px; padding: 4px 9px; }
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: #4a5a72; background: #253041; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.primary { background: #2a4a7a; border-color: #3d67a8; }
+  button.on { background: #3a2f5c; border-color: var(--accent); }
+  kbd { font: 11px ui-monospace, Menlo, monospace; background: #0c1016; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; padding: 0 4px; color: var(--dim); }
+  .num { font-family: ui-monospace, Menlo, Consolas, monospace; font-variant-numeric: tabular-nums; }
+  #top { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+  #top h1 { font-size: 15px; margin: 0 6px 0 0; font-weight: 600; }
+  #info { color: var(--dim); flex: 1; min-width: 200px; }
+  body { display: flex; flex-direction: column; }
+  #main { display: flex; gap: 12px; padding: 10px 12px 0; align-items: flex-start; flex: 1; min-height: 0; }
+  #left { flex: 0 0 auto; }
+  #board { display: block; border-radius: 8px; background: #0c1016; cursor: crosshair; }
+  #hover { color: var(--dim); height: 18px; margin-top: 4px; }
+  #right { flex: 1; min-width: 330px; max-height: 100%; overflow-y: auto; padding-right: 4px; display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 10px; align-content: start; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; }
+  .panel h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin: 0 0 7px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .panel h2 span.r { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .fighter { display: grid; grid-template-columns: 1fr; gap: 3px; padding: 6px 0; }
+  .fighter + .fighter { border-top: 1px solid var(--line); }
+  .fname { display: flex; gap: 8px; align-items: baseline; }
+  .fname b { font-size: 14px; }
+  .tag { font-size: 10px; padding: 0 5px; border-radius: 8px; border: 1px solid var(--line); color: var(--dim); }
+  .hpbar { height: 10px; background: #0c1016; border-radius: 5px; overflow: hidden; position: relative; }
+  .hpbar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px; }
+  .pills { display: flex; flex-wrap: wrap; gap: 4px; }
+  .pill { font-size: 11px; padding: 1px 6px; border-radius: 9px; background: #0c1016; border: 1px solid var(--line); color: var(--dim); }
+  .pill.ready { color: var(--good); border-color: #2f6b55; }
+  .pill.state { color: var(--warn); border-color: #7a6532; }
+  .pill.buff { color: var(--p2); border-color: #7a5320; }
+  .pill.slow { color: var(--frost); border-color: #3c5590; }
+  #pad { display: grid; grid-template-columns: repeat(3, 38px); grid-auto-rows: 34px; gap: 3px; }
+  #pad button { padding: 0; font-size: 15px; }
+  #pad button.sel { background: #245; border-color: var(--p1); }
+  #compose { display: flex; gap: 12px; }
+  #weapons { display: flex; flex-direction: column; gap: 4px; flex: 1; }
+  #weapons button { text-align: left; display: flex; justify-content: space-between; gap: 6px; }
+  #weapons button.sel { border-color: var(--warn); background: #3a3320; }
+  #weapons button.armed { border-color: var(--bad); background: #40222a; }
+  #staged { margin: 8px 0 6px; padding: 6px 8px; background: #0c1016; border-radius: 6px; min-height: 30px; }
+  #staged .rej { color: var(--bad); }
+  .row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  .hint { color: var(--dim); font-size: 12px; }
+  table { border-collapse: collapse; width: 100%; }
+  .think table { table-layout: fixed; }
+  .think td:first-child, .think th:first-child { overflow: hidden; text-overflow: ellipsis; }
+  .think col.c2 { width: 118px; } .think col.c3 { width: 62px; }
+  td, th { padding: 2px 5px; text-align: left; white-space: nowrap; }
+  th { color: var(--dim); font-weight: 400; font-size: 11px; }
+  td.n { text-align: right; }
+  tr.chosen td { color: var(--warn); }
+  tr.actual td { color: var(--p1); }
+  .bar { display: inline-block; height: 7px; background: #4a5a72; border-radius: 3px; vertical-align: middle; }
+  .think { margin-bottom: 8px; }
+  .think .head { margin-bottom: 4px; }
+  #events { max-height: 150px; overflow: auto; }
+  #events div { padding: 1px 0; }
+  .var { display: flex; gap: 6px; align-items: center; padding: 2px 0; }
+  .var.cur { color: var(--warn); }
+  #bottom { padding: 8px 12px 12px; }
+  #nav { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; flex-wrap: wrap; }
+  #tl { display: block; width: 100%; height: 96px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; cursor: pointer; }
+  #toast { position: fixed; left: 50%; top: 14px; transform: translateX(-50%); background: #40222a; border: 1px solid var(--bad); padding: 7px 14px; border-radius: 8px; display: none; z-index: 30; max-width: 80vw; }
+  dialog { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; min-width: 380px; max-width: 92vw; }
+  dialog::backdrop { background: rgba(0,0,0,.55); }
+  dialog h3 { margin: 0 0 12px; font-size: 15px; }
+  dialog label { display: grid; grid-template-columns: 120px 1fr; gap: 8px; align-items: center; margin: 7px 0; }
+  dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+  #rlist { max-height: 55vh; overflow: auto; margin-top: 8px; border: 1px solid var(--line); border-radius: 6px; }
+  #rlist tr { cursor: pointer; }
+  #rlist tr:hover td { background: #253041; }
+  .win { color: var(--good); } .lose { color: var(--bad); }
+  #busy { color: var(--warn); visibility: hidden; }
+  details summary { cursor: pointer; color: var(--dim); }
+</style>
+</head>
+<body>
+<div id="top">
+  <h1>Victris playground</h1>
+  <button id="bNew">New game…</button>
+  <button id="bLoad">Load replay…</button>
+  <button id="bSave" title="Write the current line as a replay file under data/playground/games">Save line</button>
+  <button id="bSettings">Bot settings…</button>
+  <span id="info"></span>
+  <span id="busy">bot is thinking…</span>
+</div>
+
+<div id="main">
+  <div id="left">
+    <canvas id="board" width="700" height="700"></canvas>
+    <div id="hover" class="num"></div>
+  </div>
+  <div id="right">
+    <div class="panel" id="pFighters"><h2>Fighters <span class="r num" id="tickinfo"></span></h2><div id="fighters"></div></div>
+
+    <div class="panel" id="pTurn">
+      <h2>Your turn <span class="r hint" id="turnhint"></span></h2>
+      <div id="compose">
+        <div>
+          <div id="pad"></div>
+          <div class="row" style="margin-top:5px"><button id="bDash" title="Hold Shift with a direction key">Dash <kbd>⇧</kbd></button></div>
+        </div>
+        <div id="weapons"></div>
+      </div>
+      <div id="staged"></div>
+      <div class="row">
+        <button class="primary" id="bGo">Play tick <kbd>Space</kbd></button>
+        <button id="bClear">Clear <kbd>Esc</kbd></button>
+        <button id="bBot" title="The bot's brain chooses this tick for your side">Bot plays it <kbd>B</kbd></button>
+      </div>
+      <div class="row" style="margin-top:6px">
+        <label class="hint"><input type="checkbox" id="cAuto" checked> pass ticks where I cannot act</label>
+      </div>
+      <details style="margin-top:6px"><summary>Keys</summary>
+        <div class="hint" style="margin-top:4px">
+          Step: <kbd>Q</kbd><kbd>W</kbd><kbd>E</kbd> / <kbd>A</kbd><kbd>D</kbd> / <kbd>Z</kbd><kbd>X</kbd><kbd>C</kbd> (or the number pad), <kbd>S</kbd> stand still. Dash: <kbd>⇧</kbd> + direction.<br>
+          Attack: <kbd>1</kbd> shot, <kbd>2</kbd> frostburst, <kbd>3</kbd> repulsor, then click the target tile. <kbd>F</kbd> shot at the opponent, <kbd>G</kbd> frostburst on the opponent, <kbd>R</kbd> repulsor.<br>
+          Click a tile next to you to step there, or a dash landing (◇) to dash. Right-click clears.<br>
+          <kbd>Space</kbd> play the tick. <kbd>←</kbd> <kbd>→</kbd> back and forward one tick, <kbd>Home</kbd> <kbd>End</kbd> first and last. <kbd>B</kbd> bot plays my tick. <kbd>P</kbd> peek.
+        </div>
+      </details>
+    </div>
+
+    <div class="panel" id="pReplay" style="display:none">
+      <h2>Replay</h2>
+      <div id="replayinfo"></div>
+      <div class="row" style="margin-top:8px" id="seatbtns"></div>
+      <div class="row" style="margin-top:6px"><label class="hint"><input type="checkbox" id="cKeep"> on the first tick of my branch, the other side plays what it played in the replay</label></div>
+    </div>
+
+    <div class="panel" id="pBot">
+      <h2>What the bot's search thinks
+        <span class="r"><label class="hint" title="Show the bot's choice for the current tick before you move"><input type="checkbox" id="cPeek"> peek at this tick <kbd>P</kbd></label></span></h2>
+      <div id="bot"></div>
+    </div>
+
+    <div class="panel"><h2>Last tick <span class="r hint" id="lastlabels"></span></h2><div id="events" class="num"></div></div>
+    <div class="panel"><h2>Other moves tried here</h2><div id="vars"></div></div>
+  </div>
+</div>
+
+<div id="bottom">
+  <div id="nav">
+    <button id="bFirst" title="Home">⏮</button>
+    <button id="bPrev" title="Left arrow">◀ back</button>
+    <button id="bNext" title="Right arrow">forward ▶</button>
+    <button id="bLast" title="End">⏭</button>
+    <button id="bRun">▶ run</button>
+    <select id="sSpeed"><option value="2">2 ticks/s</option><option value="5" selected>5 ticks/s</option><option value="10">10 ticks/s (real speed)</option><option value="30">30 ticks/s</option></select>
+    <span class="hint">Click the timeline to jump to any tick, then play something else from there.</span>
+    <span style="flex:1"></span>
+    <button id="bCopy" title="Copy a short reference to this position, to paste into a message">Copy position</button>
+    <label class="hint">Shade what <select id="sFog"><option value="">nobody</option><option value="0">fighter 1</option><option value="1">fighter 2</option></select> cannot see</label>
+  </div>
+  <canvas id="tl" height="96"></canvas>
+</div>
+
+<div id="toast"></div>
+
+<dialog id="dNew">
+  <h3>New game against the bot</h3>
+  <label>Map <select id="nMap"></select></label>
+  <label>You play <select id="nSeat"><option value="0">Fighter 1</option><option value="1">Fighter 2</option></select></label>
+  <label>Seed <input id="nSeed" placeholder="random (the seed picks who starts on which side)"></label>
+  <div class="actions"><button id="nCancel">Cancel</button><button class="primary" id="nGo">Start</button></div>
+</dialog>
+
+<dialog id="dSettings">
+  <h3>The bot</h3>
+  <label>Playbook file <select id="sBook"></select></label>
+  <label>Think time <select id="sThink"></select></label>
+  <label>Extra settings <input id="sOver" placeholder='JSON laid over the playbook, e.g. {"tree_plans": true}'></label>
+  <div class="hint" id="sNote"></div>
+  <div class="actions"><button id="sCancel">Cancel</button><button class="primary" id="sGo">Apply</button></div>
+</dialog>
+
+<dialog id="dLoad">
+  <h3>Load a replay</h3>
+  <div class="row"><input id="rQ" placeholder="bot name, map, replay id…" style="flex:1" value="field-marshal"><button id="rSearch">Search</button></div>
+  <div id="rlist"></div>
+  <div class="row" style="margin-top:8px"><input id="rPath" placeholder="or a replay file path inside the victris folder" style="flex:1"><button id="rOpen">Open file</button></div>
+  <div class="actions"><button id="rCancel">Close</button></div>
+</dialog>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const COL = ['#4cc9f0', '#ff9f1c'];
+const DIRS = ['NW','N','NE','W',null,'E','SW','S','SE'];
+const ARROW = {NW:'↖',N:'↑',NE:'↗',W:'←',E:'→',SW:'↙',S:'↓',SE:'↘'};
+const VEC = {N:[0,-1],NE:[1,-1],E:[1,0],SE:[1,1],S:[0,1],SW:[-1,1],W:[-1,0],NW:[-1,-1]};
+const KEYDIR = {KeyQ:'NW',KeyW:'N',KeyE:'NE',KeyA:'W',KeyD:'E',KeyZ:'SW',KeyX:'S',KeyC:'SE',
+  Numpad7:'NW',Numpad8:'N',Numpad9:'NE',Numpad4:'W',Numpad6:'E',Numpad1:'SW',Numpad2:'S',Numpad3:'SE'};
+const WEAPON_KEYS = {ranged:'1', frostburst:'2', repulsor:'3'};
+const WEAPON_NAMES = {ranged:'Shot', frostburst:'Frostburst', repulsor:'Repulsor'};
+
+let S = null;                       // latest snapshot from the server
+let staged = {move:null, dash:null, attack:null};
+let armed = null;                   // weapon waiting for a target click
+let dashMode = false;
+let preview = null;
+let hoverTile = null;
+let busy = 0;
+let autoTimer = null, runTimer = null;
+let lastSession = -1;
+
+function toast(msg) {
+  const t = $('toast'); t.textContent = msg; t.style.display = 'block';
+  clearTimeout(toast.h); toast.h = setTimeout(() => t.style.display = 'none', 4500);
+}
+
+async function call(path, body) {
+  busy++; $('busy').style.visibility = 'visible';
+  try {
+    const r = await fetch(path, body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+    const j = await r.json();
+    if (j.error) { toast(j.error); return null; }
+    return j;
+  } catch (e) { toast('The playground server did not answer: ' + e.message); return null; }
+  finally { busy--; if (!busy) $('busy').style.visibility = 'hidden'; }
+}
+
+async function act(path, body, opts = {}) {
+  clearTimeout(autoTimer);
+  if (!opts.keepRun) stopRun();
+  const j = await call(path, body === undefined ? {} : body);
+  if (!j) return false;
+  setSnap(j, opts);
+  return true;
+}
+
+const human = () => S.session.human;
+const me = () => human() == null ? null : S.pos.state.fighters[human()];
+const over = () => !!S.pos.result;
+
+function canAct(f) {
+  if (!f || !f.alive || f.state !== 'idle') return false;
+  const c = f.cooldowns;
+  return c.move === 0 || c.dash === 0 || S.session.attacks.some(a => c[a] === 0);
+}
+
+function setSnap(j, opts = {}) {
+  S = j;
+  staged = {move:null, dash:null, attack:null}; armed = null; dashMode = false; preview = null;
+  if (S.session.id !== lastSession) { lastSession = S.session.id; resize(); }
+  render();
+  // The bot's choice for this tick, when peeking.
+  const h = human();
+  if ($('cPeek').checked && h != null && !over() && !S.pos.thoughts[1 - h]) {
+    call('/api/think', {seat: 1 - h}).then(j2 => { if (j2 && j2.cur === S.cur) { S = j2; render(); } });
+  }
+  // A tick on which the fighter played by hand can do nothing is passed, right after a move of ours.
+  if (opts.played && $('cAuto').checked && h != null && !over() && !canAct(me())) {
+    autoTimer = setTimeout(() => act('/api/turn', {turn: {}}, {played: true}), 140);
+  }
+}
+
+// ---------------------------------------------------------------- the staged turn
+
+function turnJson() {
+  const t = {};
+  if (staged.move) t.move = staged.move;
+  if (staged.dash) t.dash = staged.dash;
+  if (staged.attack) t.attack = staged.attack;
+  return t;
+}
+
+function stagedLabel() {
+  const p = [];
+  if (staged.move) p.push('step ' + staged.move);
+  if (staged.dash) p.push('dash ' + staged.dash);
+  if (staged.attack) p.push(staged.attack.target ? `${staged.attack.name} at ${staged.attack.target}` : staged.attack.name);
+  return p.length ? p.join(' + ') : 'wait';
+}
+
+async function restage() {
+  preview = null;
+  render();
+  if (human() == null || over()) return;
+  const t = turnJson();
+  if (!Object.keys(t).length) return;
+  const key = JSON.stringify(t), at = S.cur;
+  const p = await call('/api/preview', {turn: t});
+  if (p && at === S.cur && key === JSON.stringify(turnJson())) { preview = p; render(); }
+}
+
+function setDir(dir, dash) {
+  if (human() == null || over()) return;
+  if (!dir) { staged.move = staged.dash = null; }
+  else if (dash) { staged.dash = staged.dash === dir ? null : dir; staged.move = null; }
+  else { staged.move = staged.move === dir ? null : dir; staged.dash = null; }
+  dashMode = false;
+  restage();
+}
+
+function arm(name) {
+  if (human() == null || over()) return;
+  if (name === 'repulsor') {
+    staged.attack = staged.attack && staged.attack.name === name ? null : {name};
+    armed = null;
+  } else if (armed === name) {
+    armed = null;
+  } else if (staged.attack && staged.attack.name === name && !armed) {
+    staged.attack = null;
+  } else {
+    armed = name;
+  }
+  restage();
+}
+
+function aimAt(name, tile) {
+  staged.attack = {name, target: tile};
+  armed = null;
+  restage();
+}
+
+function aimAtEnemy(name) {
+  if (human() == null || over()) return;
+  const en = S.pos.state.fighters[1 - human()];
+  aimAt(name, en.pos.slice());
+}
+
+function clearStaged() { staged = {move:null, dash:null, attack:null}; armed = null; dashMode = false; restage(); }
+
+function commit() {
+  if (!S || busy) return;
+  if (human() == null) { stepLine(1); return; }
+  if (over()) { toast('The game is over here. Go back to an earlier tick to play on from it.'); return; }
+  act('/api/turn', {turn: turnJson()}, {played: true});
+}
+
+// ---------------------------------------------------------------- moving along the line
+
+function curIndex() { return S.line.findIndex(n => n.id === S.cur); }
+function gotoIndex(i, opts) {
+  i = Math.max(0, Math.min(S.line.length - 1, i));
+  if (S.line[i].id !== S.cur) return act('/api/goto', {node: S.line[i].id}, opts);
+  return Promise.resolve(false);
+}
+function stepLine(d, opts) { return gotoIndex(curIndex() + d, opts); }
+function stopRun() { clearInterval(runTimer); runTimer = null; $('bRun').textContent = '▶ run'; }
+function toggleRun() {
+  if (runTimer) return stopRun();
+  $('bRun').textContent = '⏸ stop';
+  runTimer = setInterval(async () => {
+    if (busy) return;
+    if (curIndex() >= S.line.length - 1) return stopRun();
+    await stepLine(1, {keepRun: true});
+  }, 1000 / (+$('sSpeed').value));
+}
+
+// ---------------------------------------------------------------- the board
+
+const board = $('board'), bx = board.getContext('2d');
+let TS = 32, DPR = 1;
+
+function resize() {
+  if (!S) return;
+  const m = S.session.map;
+  const room = Math.min(window.innerHeight - $('top').offsetHeight - $('bottom').offsetHeight - 44, window.innerWidth * 0.5);
+  const size = Math.max(378, Math.min(900, Math.floor(room / m.w) * m.w));
+  DPR = window.devicePixelRatio || 1;
+  board.style.width = size + 'px'; board.style.height = Math.round(size * m.h / m.w) + 'px';
+  board.width = Math.round(size * DPR); board.height = Math.round(size * m.h / m.w * DPR);
+  TS = size / m.w;
+  const tl = $('tl'); tl.width = Math.round(tl.clientWidth * DPR); tl.height = Math.round(96 * DPR);
+  render();
+}
+window.addEventListener('resize', resize);
+
+const cx = p => (p[0] + 0.5) * TS, cy = p => (p[1] + 0.5) * TS;
+const same = (a, b) => a && b && a[0] === b[0] && a[1] === b[1];
+
+function arrow(c, from, to, color, width, dashed) {
+  const x0 = cx(from), y0 = cy(from), x1 = cx(to), y1 = cy(to);
+  const a = Math.atan2(y1 - y0, x1 - x0), h = Math.max(6, width * 3);
+  c.save(); c.strokeStyle = color; c.fillStyle = color; c.lineWidth = width; c.setLineDash(dashed ? [5, 4] : []);
+  c.beginPath(); c.moveTo(x0, y0); c.lineTo(x1 - Math.cos(a) * h * .6, y1 - Math.sin(a) * h * .6); c.stroke();
+  c.setLineDash([]);
+  c.beginPath(); c.moveTo(x1, y1); c.lineTo(x1 - h * Math.cos(a - .45), y1 - h * Math.sin(a - .45)); c.lineTo(x1 - h * Math.cos(a + .45), y1 - h * Math.sin(a + .45)); c.closePath(); c.fill();
+  c.restore();
+}
+
+function text(c, s, x, y, color, size, align = 'center', bold) {
+  c.font = `${bold ? '600 ' : ''}${size}px ui-monospace, Menlo, Consolas, monospace`;
+  c.textAlign = align; c.textBaseline = 'middle'; c.fillStyle = color; c.fillText(s, x, y);
+}
+
+function drawBoard() {
+  const c = bx, m = S.session.map, st = S.pos.state, h = human();
+  c.setTransform(DPR, 0, 0, DPR, 0, 0);
+  c.clearRect(0, 0, m.w * TS, m.h * TS);
+  const zr = st.zone.radius, zc = st.zone.center;
+  const fogSeat = $('sFog').value === '' ? null : +$('sFog').value;
+  const sight = fogSeat != null && S.pos.views ? S.pos.views[fogSeat].sight : null;
+  // tiles
+  for (let y = 0; y < m.h; y++) for (let x = 0; x < m.w; x++) {
+    const wall = m.tiles[y][x] === '#';
+    const out = Math.max(Math.abs(x - zc[0]), Math.abs(y - zc[1])) > zr;
+    c.fillStyle = wall ? '#3a4558' : out ? '#2a1519' : ((x + y) % 2 ? '#161c25' : '#19202a');
+    c.fillRect(x * TS, y * TS, TS, TS);
+    if (wall) { c.fillStyle = '#4a5870'; c.fillRect(x * TS + 2, y * TS + 2, TS - 4, TS - 4); }
+    if (sight && sight[y * m.w + x] === '0') { c.fillStyle = 'rgba(0,0,0,.45)'; c.fillRect(x * TS, y * TS, TS, TS); }
+  }
+  // zone edge and the next shrink
+  c.strokeStyle = '#ff5d73'; c.lineWidth = 2;
+  c.strokeRect((zc[0] - zr) * TS + 1, (zc[1] - zr) * TS + 1, (2 * zr + 1) * TS - 2, (2 * zr + 1) * TS - 2);
+  const ns = S.pos.next_shrink;
+  if (ns && ns.in <= 60) {
+    c.save(); c.setLineDash([6, 5]); c.strokeStyle = 'rgba(255,93,115,.6)';
+    c.strokeRect((zc[0] - ns.radius) * TS + 1, (zc[1] - ns.radius) * TS + 1, (2 * ns.radius + 1) * TS - 2, (2 * ns.radius + 1) * TS - 2);
+    c.restore();
+    text(c, `zone shrinks in ${ns.in}`, (zc[0] - ns.radius) * TS + 6, (zc[1] - ns.radius) * TS + 10, 'rgba(255,93,115,.9)', 11, 'left');
+  }
+  // pads
+  for (const p of st.pickups) {
+    const x = cx(p.pos), y = cy(p.pos), col = p.kind === 'health' ? '#5dd39e' : '#ffd166';
+    c.globalAlpha = p.available ? 1 : .4;
+    c.strokeStyle = col; c.lineWidth = 2; c.beginPath(); c.arc(x, y, TS * .36, 0, 7); c.stroke();
+    c.globalAlpha = 1;
+    if (!p.available) { text(c, String(p.respawn_tick - st.tick), x, y + .5, col, Math.max(9, TS * .3), 'center', true); continue; }
+    if (p.kind === 'health') { c.fillStyle = col; c.fillRect(x - TS * .06, y - TS * .22, TS * .12, TS * .44); c.fillRect(x - TS * .22, y - TS * .06, TS * .44, TS * .12); }
+    else { c.fillStyle = col; c.beginPath(); c.moveTo(x + TS * .06, y - TS * .25); c.lineTo(x - TS * .14, y + TS * .04); c.lineTo(x, y + TS * .04); c.lineTo(x - TS * .06, y + TS * .25); c.lineTo(x + TS * .14, y - TS * .04); c.lineTo(x, y - TS * .04); c.closePath(); c.fill(); }
+  }
+  // frostbursts on the ground
+  for (const a of S.pos.areas) {
+    const col = COL[a.owner - 1];
+    for (const t of a.tiles) { c.fillStyle = 'rgba(122,168,255,.22)'; c.fillRect(t[0] * TS, t[1] * TS, TS, TS); c.strokeStyle = 'rgba(122,168,255,.55)'; c.lineWidth = 1; c.strokeRect(t[0] * TS + .5, t[1] * TS + .5, TS - 1, TS - 1); }
+    text(c, '❄' + a.in, cx(a.pos), cy(a.pos), '#cfe0ff', Math.max(11, TS * .4), 'center', true);
+    c.fillStyle = col; c.fillRect(a.pos[0] * TS + 3, a.pos[1] * TS + TS - 6, TS - 6, 3);
+  }
+  // what will hit which tile and when, as the side played by hand is told
+  if (h != null && S.pos.views) {
+    const seen = {};
+    for (const d of S.pos.views[h].danger) {
+      const k = d.tile[0] + ',' + d.tile[1];
+      if (seen[k] != null && seen[k] <= d.in) continue;
+      seen[k] = d.in;
+    }
+    for (const k in seen) {
+      const [x, y] = k.split(',').map(Number);
+      c.fillStyle = `rgba(255,93,115,${seen[k] <= 1 ? .28 : seen[k] <= 3 ? .13 : .06})`; c.fillRect(x * TS, y * TS, TS, TS);
+      text(c, String(seen[k]), x * TS + TS - 3, y * TS + 7, 'rgba(255,150,165,.95)', 9, 'right');
+    }
+  }
+  // the last tick: dashes and knockbacks
+  for (const ev of S.pos.events) {
+    if (ev.kind === 'dash') arrow(c, ev.from, ev.to, COL[ev.fighter - 1] + '88', 3, false);
+    if (ev.kind === 'knockback') arrow(c, ev.from, ev.to, '#ff5d73aa', 4, false);
+    if (ev.kind === 'area_explode') for (const t of ev.tiles) { c.fillStyle = 'rgba(122,168,255,.35)'; c.fillRect(t[0] * TS, t[1] * TS, TS, TS); }
+    if (ev.kind === 'repulse') for (const t of ev.tiles) { c.fillStyle = 'rgba(179,136,255,.28)'; c.fillRect(t[0] * TS, t[1] * TS, TS, TS); }
+  }
+  // shots in flight, with where they go if nobody moves
+  for (const f of S.pos.flights) drawFlight(c, f, COL[f.owner - 1], false);
+  // options of the fighter played by hand
+  if (h != null && S.pos.views && !over()) {
+    const v = S.pos.views[h];
+    for (const o of v.moves) { c.fillStyle = 'rgba(219,227,238,.35)'; c.beginPath(); c.arc(cx(o.tile), cy(o.tile), 2.5, 0, 7); c.fill(); }
+    for (const o of v.dashes) { const x = cx(o.tile), y = cy(o.tile), r = TS * .2; c.strokeStyle = 'rgba(219,227,238,.4)'; c.lineWidth = 1; c.beginPath(); c.moveTo(x, y - r); c.lineTo(x + r, y); c.lineTo(x, y + r); c.lineTo(x - r, y); c.closePath(); c.stroke(); }
+  }
+  // the bot's belief when it cannot see us
+  const bt = h != null ? (S.pos.thoughts[1 - h] && $('cPeek').checked ? S.pos.thoughts[1 - h] : null) : null;
+  if (bt && !bt.enemy_visible) {
+    for (const t of bt.possible) { c.fillStyle = 'rgba(255,209,102,.16)'; c.fillRect(t[0] * TS + 3, t[1] * TS + 3, TS - 6, TS - 6); }
+    c.strokeStyle = 'rgba(255,209,102,.9)'; c.setLineDash([3, 3]); c.lineWidth = 2; c.beginPath(); c.arc(cx(bt.believed_enemy), cy(bt.believed_enemy), TS * .4, 0, 7); c.stroke(); c.setLineDash([]);
+  }
+  // fighters
+  st.fighters.forEach((f, i) => drawFighter(c, f, i));
+  // the staged turn
+  if (h != null && !over()) {
+    const f = st.fighters[h], v = S.pos.views[h];
+    if (staged.move) { const o = v.moves.find(o => o.dir === staged.move); const to = o ? o.tile : [f.pos[0] + VEC[staged.move][0], f.pos[1] + VEC[staged.move][1]]; arrow(c, f.pos, to, o ? '#fff' : '#ff5d73', 3, !o); }
+    if (staged.dash) { const o = v.dashes.find(o => o.dir === staged.dash); const to = o ? o.tile : [f.pos[0] + VEC[staged.dash][0], f.pos[1] + VEC[staged.dash][1]]; arrow(c, f.pos, to, o ? '#fff' : '#ff5d73', 5, !o); }
+    if (preview) {
+      for (const p of preview.paths) drawFlight(c, p, '#ffffff', true);
+      for (const a of preview.areas) for (const t of a.tiles) { c.strokeStyle = '#fff'; c.setLineDash([4, 3]); c.lineWidth = 1.5; c.strokeRect(t[0] * TS + 2, t[1] * TS + 2, TS - 4, TS - 4); c.setLineDash([]); }
+      for (const ev of preview.events) {
+        if (ev.kind === 'repulse') for (const t of ev.tiles) { c.strokeStyle = '#b388ff'; c.setLineDash([4, 3]); c.lineWidth = 1.5; c.strokeRect(t[0] * TS + 2, t[1] * TS + 2, TS - 4, TS - 4); c.setLineDash([]); }
+        if (ev.kind === 'hit' && ev.attacker === h + 1) text(c, '-' + ev.damage, cx(st.fighters[1 - h].pos), cy(st.fighters[1 - h].pos) - TS * .95, '#fff', 12, 'center', true);
+      }
+    }
+    if (staged.attack && staged.attack.target) { const t = staged.attack.target; c.strokeStyle = '#fff'; c.lineWidth = 2; c.strokeRect(t[0] * TS + 3, t[1] * TS + 3, TS - 6, TS - 6); c.beginPath(); c.moveTo(cx(t) - 5, cy(t)); c.lineTo(cx(t) + 5, cy(t)); c.moveTo(cx(t), cy(t) - 5); c.lineTo(cx(t), cy(t) + 5); c.stroke(); }
+    if (armed && hoverTile) {
+      c.strokeStyle = '#ff5d73'; c.lineWidth = 2; c.strokeRect(hoverTile[0] * TS + 2, hoverTile[1] * TS + 2, TS - 4, TS - 4);
+      if (armed === 'frostburst') {
+        const range = S.session.rules.attacks.frostburst.range, d = Math.max(Math.abs(hoverTile[0] - f.pos[0]), Math.abs(hoverTile[1] - f.pos[1]));
+        if (d > range) text(c, 'out of range', cx(hoverTile), cy(hoverTile) - TS * .8, '#ff5d73', 11);
+      }
+      c.save(); c.strokeStyle = 'rgba(255,93,115,.6)'; c.setLineDash([3, 4]); c.beginPath(); c.moveTo(cx(f.pos), cy(f.pos)); c.lineTo(cx(hoverTile), cy(hoverTile)); c.stroke(); c.restore();
+    }
+  }
+  // the bot's choice for this tick, when peeking
+  if (bt && !over()) drawIntent(c, st.fighters[1 - h], bt.turn, COL[1 - h]);
+  // damage of the last tick
+  for (const ev of S.pos.events) {
+    if (ev.kind === 'hit' || ev.kind === 'wall_slam') { const f = st.fighters[ev.target - 1]; text(c, '-' + ev.damage + (ev.kind === 'wall_slam' ? ' slam' : ''), cx(f.pos) + TS * .2, cy(f.pos) - TS * (ev.kind === 'hit' ? .95 : 1.3), '#ff5d73', 12, 'left', true); }
+    if (ev.kind === 'zone_damage') { const f = st.fighters[ev.fighter - 1]; text(c, '-' + ev.damage + ' zone', cx(f.pos) + TS * .2, cy(f.pos) + TS * .95, '#ff5d73', 11, 'left', true); }
+    if (ev.kind === 'pickup') { const f = st.fighters[ev.fighter - 1]; text(c, '+' + ev.pickup, cx(f.pos), cy(f.pos) + TS * .95, '#5dd39e', 11, 'center', true); }
+  }
+  if (over()) {
+    const r = S.pos.result;
+    c.fillStyle = 'rgba(0,0,0,.55)'; c.fillRect(0, m.h * TS / 2 - 34, m.w * TS, 68);
+    const who = r.winner ? `${S.session.names[r.winner - 1]} wins` : 'Draw';
+    text(c, `${who} (${r.reason.replace(/_/g, ' ')}) at tick ${r.final_tick}`, m.w * TS / 2, m.h * TS / 2 - 8, '#fff', 18, 'center', true);
+    text(c, 'Go back to any tick to try something else', m.w * TS / 2, m.h * TS / 2 + 16, '#8593a6', 12);
+  }
+}
+
+function drawFlight(c, f, color, planned) {
+  const pts = f.pts.map(p => [(p[0] + .5) * TS, (p[1] + .5) * TS]);
+  c.save();
+  c.strokeStyle = color; c.globalAlpha = planned ? .9 : .55; c.lineWidth = 1.5; c.setLineDash([2, 4]);
+  c.beginPath(); pts.forEach((p, i) => i ? c.lineTo(p[0], p[1]) : c.moveTo(p[0], p[1])); c.stroke();
+  c.setLineDash([]); c.globalAlpha = planned ? .9 : .7; c.fillStyle = color;
+  pts.forEach((p, i) => { if (i) { c.beginPath(); c.arc(p[0], p[1], 2, 0, 7); c.fill(); } });
+  if (!planned && pts.length) { c.globalAlpha = 1; c.beginPath(); c.arc(pts[0][0], pts[0][1], TS * .15, 0, 7); c.fill(); c.strokeStyle = '#fff'; c.lineWidth = 1; c.stroke(); }
+  if (f.end && pts.length > 1) { const p = pts[pts.length - 1]; c.globalAlpha = .9; c.strokeStyle = f.end === 'hit' ? '#ff5d73' : color; c.lineWidth = 2; c.beginPath(); c.moveTo(p[0] - 4, p[1] - 4); c.lineTo(p[0] + 4, p[1] + 4); c.moveTo(p[0] + 4, p[1] - 4); c.lineTo(p[0] - 4, p[1] + 4); c.stroke(); }
+  c.restore();
+}
+
+function drawIntent(c, f, t, color) {
+  const d = t.move || t.dash;
+  if (d) arrow(c, f.pos, [f.pos[0] + VEC[d][0] * (t.dash ? 3 : 1), f.pos[1] + VEC[d][1] * (t.dash ? 3 : 1)], color, t.dash ? 4 : 2.5, true);
+  if (t.attack && t.attack.target) { c.save(); c.strokeStyle = color; c.setLineDash([2, 3]); c.lineWidth = 1.5; c.beginPath(); c.moveTo(cx(f.pos), cy(f.pos)); c.lineTo(cx(t.attack.target), cy(t.attack.target)); c.stroke(); c.strokeRect(t.attack.target[0] * TS + 4, t.attack.target[1] * TS + 4, TS - 8, TS - 8); c.restore(); }
+  if (t.attack) text(c, t.attack.name, cx(f.pos), cy(f.pos) + TS * .95, color, 10, 'center', true);
+}
+
+function drawFighter(c, f, i) {
+  const x = cx(f.pos), y = cy(f.pos), r = TS * .36, col = COL[i], st = S.pos.state, h = human();
+  c.save();
+  if (!f.alive) c.globalAlpha = .35;
+  if (f.buffs && f.buffs.power != null) { c.strokeStyle = '#ffd166'; c.lineWidth = 3; c.beginPath(); c.arc(x, y, r + 4, 0, 7); c.stroke(); }
+  c.fillStyle = col; c.beginPath(); c.arc(x, y, r, 0, 7); c.fill();
+  c.strokeStyle = '#0c1016'; c.lineWidth = 1.5; c.stroke();
+  text(c, String(i + 1), x, y + .5, '#0c1016', Math.max(11, TS * .4), 'center', true);
+  if (f.state === 'stunned') { c.strokeStyle = '#ffd166'; c.lineWidth = 2; c.setLineDash([3, 3]); c.beginPath(); c.arc(x, y, r + 7, 0, 7); c.stroke(); c.setLineDash([]); }
+  if (f.state === 'recovering' || f.state === 'dashing') { c.strokeStyle = '#8593a6'; c.lineWidth = 2; c.setLineDash([2, 3]); c.beginPath(); c.arc(x, y, r + 7, 0, 7); c.stroke(); c.setLineDash([]); }
+  if (!f.alive) { c.strokeStyle = '#ff5d73'; c.lineWidth = 3; c.beginPath(); c.moveTo(x - r, y - r); c.lineTo(x + r, y + r); c.moveTo(x + r, y - r); c.lineTo(x - r, y + r); c.stroke(); }
+  // hp bar
+  const w = TS * .9, max = S.session.rules.stats.max_hp, frac = Math.max(0, f.hp) / max;
+  c.fillStyle = '#0c1016'; c.fillRect(x - w / 2, y - r - 9, w, 5);
+  c.fillStyle = frac > .5 ? '#5dd39e' : frac > .25 ? '#ffd166' : '#ff5d73'; c.fillRect(x - w / 2, y - r - 9, w * frac, 5);
+  if (h != null) text(c, i === h ? 'YOU' : 'BOT', x, y - r - 15, col, 9, 'center', true);
+  c.restore();
+}
+
+function tileAt(e) {
+  const r = board.getBoundingClientRect(), m = S.session.map;
+  const x = Math.floor((e.clientX - r.left) / TS), y = Math.floor((e.clientY - r.top) / TS);
+  return x >= 0 && y >= 0 && x < m.w && y < m.h ? [x, y] : null;
+}
+
+board.addEventListener('mousemove', e => {
+  if (!S) return;
+  const t = tileAt(e);
+  if (same(t, hoverTile)) return;
+  hoverTile = t;
+  describeTile(t);
+  if (armed) drawBoard();
+});
+board.addEventListener('mouseleave', () => { hoverTile = null; $('hover').textContent = ''; if (armed) drawBoard(); });
+board.addEventListener('contextmenu', e => { e.preventDefault(); clearStaged(); });
+board.addEventListener('click', e => {
+  if (!S || human() == null || over()) return;
+  const t = tileAt(e);
+  if (!t) return;
+  if (armed) return aimAt(armed, t);
+  const v = S.pos.views[human()], f = me();
+  const step = v.moves.find(o => same(o.tile, t));
+  if (step) return setDir(step.dir, false);
+  const dash = v.dashes.find(o => same(o.tile, t));
+  if (dash) return setDir(dash.dir, true);
+  if (same(t, f.pos)) return setDir(null);
+  toast('That tile is not a step or a dash landing. To attack, press 1, 2 or 3 first, then click the target.');
+});
+
+function describeTile(t) {
+  if (!t) { $('hover').textContent = ''; return; }
+  const m = S.session.map, st = S.pos.state, parts = [`tile ${t[0]},${t[1]}`];
+  if (m.tiles[t[1]][t[0]] === '#') parts.push('wall');
+  st.fighters.forEach((f, i) => { if (same(f.pos, t)) parts.push(`${S.session.names[i]} (fighter ${i + 1}) hp ${f.hp}`); });
+  for (const p of st.pickups) if (same(p.pos, t)) parts.push(`${p.kind} pad ` + (p.available ? 'ready' : `back in ${p.respawn_tick - st.tick}`));
+  for (const a of S.pos.areas) if (a.tiles.some(x => same(x, t))) parts.push(`frostburst of fighter ${a.owner}: ${a.damage} damage in ${a.in}`);
+  const h = human();
+  if (h != null) {
+    const f = st.fighters[h];
+    parts.push(`${Math.max(Math.abs(t[0] - f.pos[0]), Math.abs(t[1] - f.pos[1]))} from you`);
+    if (S.pos.views) for (const d of S.pos.views[h].danger) if (same(d.tile, t)) { parts.push(`hit for ${d.damage} in ${d.in}`); break; }
+  }
+  const zc = st.zone.center;
+  if (Math.max(Math.abs(t[0] - zc[0]), Math.abs(t[1] - zc[1])) > st.zone.radius) parts.push('outside the zone');
+  $('hover').textContent = parts.join(' · ');
+}
+
+// ---------------------------------------------------------------- the timeline
+
+const tl = $('tl'), tx = tl.getContext('2d');
+function drawTimeline() {
+  const c = tx, W = tl.width / DPR, H = tl.height / DPR, line = S.line;
+  c.setTransform(DPR, 0, 0, DPR, 0, 0);
+  c.clearRect(0, 0, W, H);
+  const maxT = Math.max(line.length - 1, Math.min(S.session.rules.max_ticks, Math.max(100, Math.ceil((line.length + 20) / 100) * 100))), maxHp = S.session.rules.stats.max_hp;
+  const X = t => 8 + (W - 16) * t / maxT, Y = hp => H - 14 - (H - 30) * hp / maxHp;
+  const ci = curIndex();
+  // zone start and tick marks
+  c.fillStyle = '#8593a6'; c.font = '10px ui-monospace, Menlo, monospace'; c.textBaseline = 'alphabetic';
+  for (let t = 0; t <= maxT; t += (maxT <= 200 ? 10 : 50)) { c.fillStyle = '#2b3545'; c.fillRect(X(t), 6, 1, H - 18); c.fillStyle = '#8593a6'; c.textAlign = 'center'; c.fillText(String(t), X(t), H - 3); }
+  // the part of the line after the current tick, dimmer
+  c.fillStyle = 'rgba(255,255,255,.035)'; c.fillRect(X(0), 6, X(ci) - X(0), H - 20);
+  // the value network's chance for the side played by hand (or fighter 1)
+  const seat = human() == null ? 0 : human();
+  c.strokeStyle = 'rgba(179,136,255,.55)'; c.lineWidth = 1; c.beginPath();
+  line.forEach((n, i) => { const p = seat === 0 ? n.pwin : 1 - n.pwin, y = H - 14 - (H - 30) * p; i ? c.lineTo(X(n.tick), y) : c.moveTo(X(n.tick), y); });
+  c.stroke();
+  for (let f = 0; f < 2; f++) {
+    c.strokeStyle = COL[f]; c.lineWidth = 1.8; c.beginPath();
+    line.forEach((n, i) => { i ? c.lineTo(X(n.tick), Y(n.hp[f])) : c.moveTo(X(n.tick), Y(n.hp[f])); });
+    c.stroke();
+  }
+  // where other moves were tried, and which ticks were played by hand
+  line.forEach(n => { if (n.var > 1) { c.fillStyle = '#ffd166'; c.beginPath(); c.arc(X(n.tick - 1), 8, 3, 0, 7); c.fill(); } });
+  // cursor
+  c.fillStyle = '#fff'; c.fillRect(X(line[ci].tick) - .5, 4, 1.5, H - 16);
+  c.textAlign = X(line[ci].tick) > W - 90 ? 'right' : 'left';
+  c.fillStyle = '#fff'; c.fillText(`tick ${line[ci].tick}`, X(line[ci].tick) + (c.textAlign === 'left' ? 5 : -5), 14);
+  drawTimeline.X = X; drawTimeline.maxT = maxT; drawTimeline.W = W;
+}
+tl.addEventListener('click', e => {
+  if (!S || busy) return;
+  const r = tl.getBoundingClientRect(), x = e.clientX - r.left;
+  const t = Math.round((x - 8) / (drawTimeline.W - 16) * drawTimeline.maxT);
+  gotoIndex(t);
+});
+
+// ---------------------------------------------------------------- the panels
+
+const esc = s => String(s).replace(/[&<>"]/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch]));
+
+function powerMult() {
+  const p = S.session.rules.pickups && S.session.rules.pickups.power, m = p && p.damage_multiplier;
+  return m ? +(m[0] / m[1]).toFixed(2) : '';
+}
+
+function renderFighters() {
+  const st = S.pos.state, h = human(), max = S.session.rules.stats.max_hp;
+  $('tickinfo').textContent = `tick ${st.tick} of ${S.session.rules.max_ticks} · zone radius ${st.zone.radius}`;
+  $('fighters').innerHTML = st.fighters.map((f, i) => {
+    const v = S.pos.views ? S.pos.views[i] : null, c = f.cooldowns;
+    const cd = (name, val) => `<span class="pill ${val === 0 ? 'ready' : ''}">${name} ${val === 0 ? 'ready' : val}</span>`;
+    const pills = [cd('step', c.move), cd('dash', c.dash)].concat(S.session.attacks.map(a => cd(WEAPON_NAMES[a] ? WEAPON_NAMES[a].toLowerCase() : a, c[a])));
+    if (f.state !== 'idle') pills.unshift(`<span class="pill state">${f.state}${v && v.state_left ? ' ' + v.state_left : ''}</span>`);
+    if (v && v.power_left != null) pills.push(`<span class="pill buff">power ×${powerMult()} for ${v.power_left}</span>`);
+    if (v && v.slow) pills.push(`<span class="pill slow">slowed ${v.slow}</span>`);
+    if (f.ticks_outside) pills.push(`<span class="pill state">outside zone ${f.ticks_outside}</span>`);
+    const lost = S.pos.events.filter(e => (e.kind === 'hit' || e.kind === 'wall_slam') && e.target === i + 1).reduce((a, e) => a + e.damage, 0)
+      + S.pos.events.filter(e => (e.kind === 'zone_damage') && e.fighter === i + 1).reduce((a, e) => a + e.damage, 0);
+    const role = h == null ? '' : `<span class="tag">${i === h ? 'you' : 'bot · ' + esc(S.settings.playbook)}</span>`;
+    const frac = Math.max(0, f.hp) / max;
+    return `<div class="fighter"><div class="fname"><b style="color:${COL[i]}">${i + 1} ${esc(S.session.names[i])}</b>${role}
+      <span class="num" style="margin-left:auto">hp ${Math.max(0, f.hp)}${lost ? ` <span style="color:var(--bad)">−${lost}</span>` : ''} · dealt ${f.damage_dealt}</span></div>
+      <div class="hpbar"><i style="width:${frac * 100}%;background:${COL[i]}"></i></div>
+      <div class="pills">${pills.join('')}</div></div>`;
+  }).join('');
+}
+
+function renderTurn() {
+  const h = human();
+  $('pTurn').style.display = h == null ? 'none' : '';
+  if (h == null) return;
+  const f = me(), v = S.pos.views ? S.pos.views[h] : {moves:[], dashes:[]}, c = f.cooldowns, done = over();
+  $('pad').innerHTML = DIRS.map(d => {
+    if (!d) return `<button data-dir="" title="Stand still (S)">·</button>`;
+    const ok = dashMode ? v.dashes.some(o => o.dir === d) : v.moves.some(o => o.dir === d);
+    const sel = staged.move === d || staged.dash === d;
+    return `<button data-dir="${d}" class="${sel ? 'sel' : ''}" ${done || !ok ? 'disabled' : ''}>${ARROW[d]}</button>`;
+  }).join('');
+  $('bDash').className = dashMode ? 'on' : '';
+  $('bDash').disabled = done || !v.dashes.length;
+  $('weapons').innerHTML = ['ranged', 'frostburst', 'repulsor'].filter(a => S.session.attacks.includes(a)).map(a => {
+    const r = S.session.rules.attacks[a], ready = f.state === 'idle' && c[a] === 0;
+    const cls = armed === a ? 'armed' : staged.attack && staged.attack.name === a ? 'sel' : '';
+    const what = a === 'ranged' ? `${r.damage} dmg, bounces ${r.bounces}` : a === 'frostburst' ? `${r.damage} dmg, range ${r.range}, lands in ${r.fuse}` : `${r.damage} dmg, pushes ${r.push}`;
+    return `<button data-w="${a}" class="${cls}" ${done || !ready ? 'disabled' : ''}><span><kbd>${WEAPON_KEYS[a]}</kbd> ${WEAPON_NAMES[a]} <span class="hint">${what}</span></span><span class="num">${c[a] === 0 ? 'ready' : c[a]}</span></button>`;
+  }).join('');
+  let s = `<b>${esc(stagedLabel())}</b>`;
+  if (armed) s += ` <span style="color:var(--bad)">· click the tile to aim the ${WEAPON_NAMES[armed].toLowerCase()} at</span>`;
+  if (preview) {
+    const rej = preview.events.filter(e => e.kind === 'rejected' && e.fighter === h + 1);
+    if (rej.length) s += rej.map(e => `<div class="rej">the engine would refuse the ${esc(e.part)}: ${esc(e.reason.replace(/_/g, ' '))}</div>`).join('');
+    const hits = preview.events.filter(e => (e.kind === 'hit' || e.kind === 'wall_slam') && e.attacker === h + 1);
+    if (hits.length) s += `<div class="hint">if the opponent stands still: ${hits.map(e => `${e.kind === 'hit' ? esc(e.attack) : 'wall slam'} hits for ${e.damage}`).join(', ')}</div>`;
+  }
+  $('staged').innerHTML = s;
+  $('turnhint').textContent = done ? 'game over here' : f.state !== 'idle' ? `you are ${f.state}: no action possible` : !canAct(f) ? 'everything is on cooldown' : 'no clock: take your time';
+  $('bGo').disabled = done; $('bBot').disabled = done;
+}
+
+function thinkHtml(th, seat, title, actual) {
+  if (!th) return '';
+  let s = `<div class="think"><div class="head">${title}: <b style="color:${COL[seat]}">${esc(th.label)}</b> <span class="hint">`;
+  if (th.note === 'tree') s += `· expects ${th.score >= 0 ? '+' : ''}${th.score.toFixed(1)} hp · ${(th.sims / 1000).toFixed(1)}k iterations in ${th.ms} ms`;
+  else s += `· chosen by "${esc(th.note)}", not the tree search · ${th.ms} ms`;
+  if (!th.enemy_visible) s += ' · could not see the opponent';
+  if (th.sync !== 'exact' && th.sync) s += ` · tracker: ${esc(th.sync)}`;
+  s += `</span></div>`;
+  if (th.root) {
+    const side = (x, head, mark, cls, limit) => {
+      const sd = th.root.sides[x];
+      let rows = sd.top.slice(0, limit);
+      const extra = mark && !rows.some(a => a.label === mark) ? sd.top.find(a => a.label === mark) : null;
+      let t = `<table><colgroup><col><col class="c2"><col class="c3"></colgroup><tr><th>${head} (${sd.count} weighed)</th><th>share of search</th><th class="n">result, hp</th></tr>`;
+      const row = (a, rank) => `<tr class="${a.label === mark ? cls : ''}"><td>${a.label === mark ? '● ' : ''}${esc(a.label)}</td><td class="num"><span class="bar" style="width:${Math.round(56 * a.n / Math.max(1, sd.total))}px"></span> ${(100 * a.n / Math.max(1, sd.total)).toFixed(1)}%</td><td class="n num">${a.n ? (a.q >= 0 ? '+' : '') + a.q.toFixed(1) : '–'}</td></tr>`;
+      t += rows.map(row).join('');
+      if (extra) t += `<tr><td class="hint" colspan="3">… rank ${sd.top.indexOf(extra) + 1}</td></tr>` + row(extra);
+      else if (mark && !rows.some(a => a.label === mark)) t += `<tr class="${cls}"><td colspan="3">● ${esc(mark)}: not among the ${Math.min(40, sd.count)} turns it looked at most</td></tr>`;
+      return t + '</table>';
+    };
+    s += side(seat, 'Its own turns', th.label, 'chosen', 6);
+    s += side(1 - seat, 'What it expected from ' + (human() === 1 - seat ? 'you' : 'the other side'), actual, 'actual', 5);
+  }
+  return s + '</div>';
+}
+
+function renderBot() {
+  const h = human(), p = S.pos;
+  let s = '';
+  const seats = h == null ? [0, 1] : [1 - h];
+  for (const seat of seats) {
+    if (p.prev_thoughts && p.prev_thoughts[seat]) s += thinkHtml(p.prev_thoughts[seat], seat, `Tick ${p.tick - 1}, ${esc(S.session.names[seat])} chose`, p.labels ? p.labels[1 - seat] : null);
+    else if (p.labels && p.by && p.by[seat] === 0 && h != null) s += `<div class="think hint">Tick ${p.tick - 1}: ${esc(S.session.names[seat])} played what the replay recorded (${esc(p.labels[seat])}).</div>`;
+    if (p.thoughts[seat] && (h == null || $('cPeek').checked)) s += thinkHtml(p.thoughts[seat], seat, `This tick (${p.tick}), ${h == null ? 'our bot as ' + esc(S.session.names[seat]) + ' would play' : 'it will play'}`, null);
+  }
+  if (h != null && p.thoughts[h]) s += thinkHtml(p.thoughts[h], h, `In your place this tick the bot would play`, null);
+  if (!s) s = `<div class="hint">${h == null ? 'Use the buttons above to ask what our bot would play here.' : 'Play a tick and the search behind the bot\'s reply shows here: its own candidates, and what it expected you to do.'}</div>`;
+  if (!S.settings.root_hook) s += `<div class="hint">This build has no view into the search tree, so only the chosen turn is shown.</div>`;
+  if (h != null && !over()) s += `<div class="row"><button id="bHint">What would the bot play in my place?</button><button id="bRedo" title="Let the bot decide this tick again">Bot: think again</button><select id="sRedo" title="How long it may think when asked here"><option value="0">its usual time</option><option value="1000">1 s</option><option value="5000">5 s</option><option value="20000">20 s</option></select></div>`;
+  const keep = $('sRedo') ? $('sRedo').value : '0';
+  $('bot').innerHTML = s;
+  if ($('sRedo')) $('sRedo').value = keep;
+  const ms = () => +$('sRedo').value || undefined;
+  if ($('bHint')) $('bHint').onclick = () => act('/api/think', {seat: h, redo: true, think_ms: ms()});
+  if ($('bRedo')) $('bRedo').onclick = () => { $('cPeek').checked = true; act('/api/think', {seat: 1 - h, redo: true, think_ms: ms()}); };
+}
+
+function eventLine(e) {
+  const n = id => `<span style="color:${COL[id - 1]}">${esc(S.session.names[id - 1])}</span>`;
+  switch (e.kind) {
+    case 'hit': return `${n(e.attacker)}'s ${esc(e.attack)} hits ${n(e.target)} for <b>${e.damage}</b>${e.ricochet ? ' off a wall' : ''}`;
+    case 'wall_slam': return `${n(e.target)} is slammed into a wall for <b>${e.damage}</b>`;
+    case 'stunned': return `${n(e.fighter)} is stunned for ${e.ticks}`;
+    case 'knockback': return `${n(e.target)} is pushed from ${e.from} to ${e.to}`;
+    case 'collision': return `collision for ${e.damage}`;
+    case 'dash': return `${n(e.fighter)} dashes from ${e.from} to ${e.to}`;
+    case 'pickup': return `${n(e.fighter)} takes the ${esc(e.pickup)} pad`;
+    case 'attack': return `${n(e.fighter)} fires ${esc(e.attack)} at ${e.target}`;
+    case 'repulse': return `${n(e.owner)} fires the repulsor`;
+    case 'area_spawn': return `${n(e.owner)}'s frostburst lands at ${e.pos}, goes off at tick ${e.explodes_tick}`;
+    case 'area_explode': return `${n(e.owner)}'s frostburst goes off at ${e.pos}`;
+    case 'zone_damage': return `${n(e.fighter)} takes ${e.damage} from the zone`;
+    case 'zone_shrink': return `the zone shrinks to radius ${e.radius}`;
+    case 'death': return `${n(e.fighter)} is dead`;
+    case 'buff_end': return `${n(e.fighter)}'s power runs out`;
+    case 'pickup_spawn': return `the ${esc(e.pickup)} pad at ${e.pos} is back`;
+    case 'rejected': return `<span style="color:var(--bad)">${n(e.fighter)}'s ${esc(e.part)} was refused: ${esc(e.reason.replace(/_/g, ' '))}</span>`;
+    case 'projectile_bounce': return `a shot bounces at ${e.pos}`;
+    default: return null;
+  }
+}
+
+function renderEvents() {
+  const p = S.pos;
+  $('lastlabels').innerHTML = p.labels ? p.labels.map((l, i) => `<span style="color:${COL[i]}">${esc(l)}</span>`).join(' &nbsp; ') : '';
+  const lines = p.events.map(eventLine).filter(Boolean);
+  $('events').innerHTML = p.parent == null ? '<span class="hint">The start position.</span>' : lines.length ? lines.map(l => `<div>${l}</div>`).join('') : '<span class="hint">Nothing but movement.</span>';
+}
+
+function renderVars() {
+  const p = S.pos, h = human();
+  const who = b => ['replay', 'you', 'bot'][b];
+  const list = (items, head, curId) => items.length < 2 && !(items.length === 1 && curId == null) ? '' :
+    `<div class="hint">${head}</div>` + items.map(v => `<div class="var ${v.id === curId ? 'cur' : ''}"><button data-node="${v.id}" ${v.id === curId ? 'disabled' : ''}>${v.id === curId ? 'here' : 'go'}</button>
+      <span class="num"><span style="color:${COL[0]}">${esc(v.labels[0])}</span> <span class="hint">(${who(v.by[0])})</span> · <span style="color:${COL[1]}">${esc(v.labels[1])}</span> <span class="hint">(${who(v.by[1])})</span></span></div>`).join('');
+  let s = '';
+  if (p.siblings) s += list(p.siblings, `Tick ${p.tick - 1} was played ${p.siblings.length} ways:`, p.node);
+  if (p.variations.length) s += list(p.variations, `Already played from this position (tick ${p.tick}):`, null);
+  $('vars').innerHTML = s || '<span class="hint">Go back to any tick and play something else: both lines are kept and listed here.</span>';
+}
+
+function renderReplay() {
+  const s = S.session, isReplay = s.source !== 'game';
+  $('pReplay').style.display = isReplay ? '' : 'none';
+  if (!isReplay) return;
+  const r = s.recorded_result, v = s.verified;
+  let t = `<b>${esc(s.source)}</b><br><span style="color:${COL[0]}">1 ${esc(s.names[0])}</span> against <span style="color:${COL[1]}">2 ${esc(s.names[1])}</span>`;
+  if (r) t += `<br>Recorded result: ${r.winner ? esc(s.names[r.winner - 1]) + ' won' : 'draw'} (${esc(r.reason.replace(/_/g, ' '))}) at tick ${r.final_tick}`;
+  if (v) t += `<br><span class="${v.wrong ? 'lose' : 'win'}">${v.wrong ? `${v.wrong} of ${v.checked} ticks differ from the ladder's record` : `All ${v.checked} ticks match the ladder's state hashes`}</span>`;
+  $('replayinfo').innerHTML = t;
+  const h = human();
+  $('seatbtns').innerHTML = [0, 1].map(i => `<button data-seat="${i}" class="${h === i ? 'on' : ''}">Play ${esc(s.names[i])} from here</button>`).join('')
+    + `<button data-seat="" class="${h == null ? 'on' : ''}">Just watch</button>`
+    + (h == null && !over() ? [0, 1].map(i => `<button data-think="${i}">Ask our bot: as ${esc(s.names[i])}?</button>`).join('') : '');
+  $('cKeep').checked = S.settings.keep_recorded;
+}
+
+function renderInfo() {
+  const s = S.session;
+  $('sFog').options[1].textContent = s.names[0]; $('sFog').options[2].textContent = s.names[1];
+  const what = s.source === 'game' ? `Game on ${s.map.name}, seed ${s.seed}` : `Replay ${s.source} on ${s.map.name}`;
+  const bot = `bot: ${S.settings.playbook}, ${S.settings.think_ms || S.settings.tree_ms} ms a tick`;
+  $('info').textContent = `${what} · ${bot} · ${s.positions} positions kept` + (s.saved ? ` · saved as ${s.saved.split('/').pop()}` : '');
+  $('bNext').disabled = curIndex() >= S.line.length - 1; $('bPrev').disabled = curIndex() === 0;
+}
+
+function render() {
+  if (!S) return;
+  drawBoard(); drawTimeline(); renderFighters(); renderTurn(); renderBot(); renderEvents(); renderVars(); renderReplay(); renderInfo();
+}
+
+// ---------------------------------------------------------------- wiring
+
+$('pad').addEventListener('click', e => { const b = e.target.closest('button'); if (b) setDir(b.dataset.dir || null, dashMode); });
+$('bDash').onclick = () => { dashMode = !dashMode; render(); };
+$('weapons').addEventListener('click', e => { const b = e.target.closest('button'); if (b) arm(b.dataset.w); });
+$('bGo').onclick = commit;
+$('bClear').onclick = clearStaged;
+$('bBot').onclick = () => act('/api/botmove', {}, {played: true});
+$('bFirst').onclick = () => gotoIndex(0);
+$('bLast').onclick = () => gotoIndex(S.line.length - 1);
+$('bPrev').onclick = () => stepLine(-1);
+$('bNext').onclick = () => stepLine(1);
+$('bRun').onclick = toggleRun;
+$('sFog').onchange = render;
+$('bCopy').onclick = () => {
+  const s = S.session, where = s.source === 'game' ? `playground game ${s.map.name} seed ${s.seed}` + (s.saved ? ` (${s.saved.split('/').slice(-4).join('/')})` : '') : `replay ${s.source}`;
+  const st = S.pos.state, f = st.fighters;
+  const ref = `${where}, tick ${st.tick}: ${s.names[0]} at ${f[0].pos} hp ${f[0].hp}, ${s.names[1]} at ${f[1].pos} hp ${f[1].hp}, state hash ${S.pos.hash}`;
+  (navigator.clipboard ? navigator.clipboard.writeText(ref) : Promise.reject()).then(() => toast('Copied: ' + ref), () => { window.prompt('Copy this:', ref); });
+};
+$('cPeek').onchange = () => setSnap(S);
+$('bSave').onclick = async () => { if (await act('/api/save', {})) toast('Saved to ' + S.session.saved); };
+$('vars').addEventListener('click', e => { const b = e.target.closest('button'); if (b) act('/api/goto', {node: +b.dataset.node}); });
+$('seatbtns').addEventListener('click', e => {
+  const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.think != null) return act('/api/think', {seat: +b.dataset.think, redo: true});
+  act('/api/seat', {seat: b.dataset.seat === '' ? null : +b.dataset.seat});
+});
+$('cKeep').onchange = () => act('/api/settings', {keep_recorded: $('cKeep').checked});
+
+document.addEventListener('keydown', e => {
+  if (!S || e.target.matches('input, select, textarea') || document.querySelector('dialog[open]')) return;
+  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  const k = e.code;
+  let used = true;
+  if (k === 'ArrowLeft' || k === 'Backspace') stepLine(-1);
+  else if (k === 'ArrowRight') stepLine(1);
+  else if (k === 'Home') gotoIndex(0);
+  else if (k === 'End') gotoIndex(S.line.length - 1);
+  else if (k === 'Space' || k === 'Enter' || k === 'NumpadEnter') commit();
+  else if (k === 'Escape') clearStaged();
+  else if (k === 'KeyP') { $('cPeek').checked = !$('cPeek').checked; setSnap(S); }
+  else if (human() == null || over()) used = false;
+  else if (KEYDIR[k]) setDir(KEYDIR[k], e.shiftKey || dashMode);
+  else if (k === 'KeyS' || k === 'Numpad5') setDir(null);
+  else if (k === 'Digit1') arm('ranged');
+  else if (k === 'Digit2') arm('frostburst');
+  else if (k === 'Digit3') arm('repulsor');
+  else if (k === 'KeyF') aimAtEnemy('ranged');
+  else if (k === 'KeyG') aimAtEnemy('frostburst');
+  else if (k === 'KeyR') arm('repulsor');
+  else if (k === 'KeyB') { if (!busy) act('/api/botmove', {}, {played: true}); }
+  else used = false;
+  if (used) e.preventDefault();
+});
+
+// dialogs
+$('bNew').onclick = () => {
+  $('nMap').innerHTML = S.settings.maps.map(m => `<option ${m === S.session.map.name ? 'selected' : ''}>${m}</option>`).join('');
+  if (human() != null) $('nSeat').value = String(human());
+  $('dNew').showModal();
+};
+$('nCancel').onclick = () => $('dNew').close();
+$('nGo').onclick = async () => {
+  const body = {map: $('nMap').value, seat: +$('nSeat').value};
+  const seed = $('nSeed').value.trim();
+  if (seed) { if (!/^-?\d+$/.test(seed)) return toast('The seed is a whole number.'); body.seed = +seed; }
+  $('dNew').close();
+  await act('/api/new', body);
+};
+$('bSettings').onclick = () => {
+  const st = S.settings;
+  $('sBook').innerHTML = st.books.map(b => `<option value="${esc(b.path)}" ${b.path === st.book ? 'selected' : ''}>${esc(b.label)}</option>`).join('');
+  const opts = [[0, `the playbook's own (${st.tree_ms && !st.think_ms ? st.tree_ms + ' ms' : 'as written in the file'})`], [150, '150 ms'], [300, '300 ms'], [600, '600 ms (the most a ladder tick allows)'], [1000, '1 second'], [3000, '3 seconds'], [10000, '10 seconds']];
+  $('sThink').innerHTML = opts.map(([v, l]) => `<option value="${v}" ${(st.think_ms || 0) === v ? 'selected' : ''}>${l}</option>`).join('');
+  $('sOver').value = Object.keys(st.overrides || {}).length ? JSON.stringify(st.overrides) : '';
+  $('sNote').textContent = 'Changes apply from the next tick the bot decides. Decisions already made at earlier positions are kept; use "Bot: think again" to redo one. Your own playbook files go in data/playground/playbooks/.';
+  $('dSettings').showModal();
+};
+$('sCancel').onclick = () => $('dSettings').close();
+$('sGo').onclick = async () => {
+  let overrides = {};
+  const raw = $('sOver').value.trim();
+  if (raw) { try { overrides = JSON.parse(raw); } catch (e) { return toast('Extra settings are not valid JSON: ' + e.message); } }
+  $('dSettings').close();
+  await act('/api/settings', {book: $('sBook').value, think_ms: +$('sThink').value, overrides});
+};
+
+async function searchReplays() {
+  const r = await call('/api/replays?limit=300&q=' + encodeURIComponent($('rQ').value.trim()));
+  if (!r) return;
+  let s = '<table>';
+  if (r.mine.length) s += `<tr><th colspan="6">Games played here</th></tr>` + r.mine.map(n => `<tr data-id="${esc(n)}"><td colspan="6">${esc(n)}</td></tr>`).join('');
+  s += `<tr><th>ended (UTC)</th><th>map</th><th>fighter 1</th><th>fighter 2</th><th>result</th><th class="n">ticks</th></tr>`;
+  s += r.rows.map(x => {
+    const b = i => x.bots[i] ? `<span class="${x.winner === x.bots[i].name ? 'win' : ''}">${esc(x.bots[i].name)}</span> <span class="hint">${x.bots[i].rating || ''}</span>` : '?';
+    return `<tr data-id="${esc(x.id)}"><td class="num">${esc((x.ended || '').slice(5, 16).replace('T', ' '))}</td><td>${esc(x.map)}</td><td>${b(0)}</td><td>${b(1)}</td><td>${esc(x.winner || 'draw')} <span class="hint">${esc((x.reason || '').replace(/_/g, ' '))}</span></td><td class="n num">${x.ticks}</td></tr>`;
+  }).join('');
+  s += '</table>';
+  if (!r.rows.length && !r.mine.length) s = '<div class="hint" style="padding:10px">No replays match. The list comes from data/corpus-remote/index.jsonl on this machine.</div>';
+  else if (r.total > r.rows.length) s += `<div class="hint" style="padding:6px">Showing the latest ${r.rows.length} of ${r.total}.</div>`;
+  $('rlist').innerHTML = s;
+}
+$('bLoad').onclick = () => { $('dLoad').showModal(); searchReplays(); };
+$('rSearch').onclick = searchReplays;
+$('rQ').addEventListener('keydown', e => { if (e.key === 'Enter') searchReplays(); });
+$('rCancel').onclick = () => $('dLoad').close();
+$('rlist').addEventListener('click', async e => {
+  const tr = e.target.closest('tr[data-id]'); if (!tr) return;
+  if (await act('/api/load', {id: tr.dataset.id})) $('dLoad').close();
+});
+$('rOpen').onclick = async () => { if (await act('/api/load', {path: $('rPath').value.trim()})) $('dLoad').close(); };
+
+call('/api/state').then(j => { if (j) setSnap(j); });
+</script>
+</body>
+</html>
