@@ -146,7 +146,8 @@ pub fn score(e: &Engine, s: &State, x: usize, m: Mode, cap: f64) -> f64 {
             if buff_left(s, x) > 0 && f.pos == p {
                 cap
             } else {
-                -0.25 * path(e, p, f.pos) as f64
+                // light: the first power-up is worth about 3 points of win rate between top bots
+                -0.1 * path(e, p, f.pos) as f64
             }
         }
         Mode::Press => {
@@ -157,13 +158,11 @@ pub fn score(e: &Engine, s: &State, x: usize, m: Mode, cap: f64) -> f64 {
             let mut v = -0.4 * (d - 5.0).max(0.0) + if sight { 1.0 } else { -1.0 };
             // deny the heal: graded by how much nearer their heal we stand than they do, once they
             // are hurt enough to want it
-            // deny the heal: once they are hurt and their nearest health pad is up or nearly, head for it
-            // (they break off for it from about 4 steps out; we used to be 9 to 10 away)
-            if o.hp < e.rules.max_hp - 15 {
-                if let Some(h) = health_pad(e, s, o.pos, 25) {
-                    v -= 0.5 * path(e, h, f.pos).min(12) as f64;
-                    v += 0.4 * ((path(e, h, o.pos) - path(e, h, f.pos)) as f64).clamp(-5.0, 5.0);
-                }
+            // deny the heal by pressure (a trailer that heals cuts the leader's win rate from 80% to
+            // 57% between top bots): when they are hurt and a health pad is up or nearly, stay within
+            // reach so they cannot walk to it unhurt; racing them to the pad under fire lost leads
+            if o.hp < e.rules.max_hp - 15 && health_pad(e, s, o.pos, 25).is_some() {
+                v -= 0.8 * (d - 3.0).max(0.0);
             }
             v
         }
