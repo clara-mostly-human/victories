@@ -45,8 +45,10 @@ pub fn phase(e: &Engine, s: &State) -> u8 {
         return 2;
     }
     let first = e.rules.pickups.as_ref().map(|p| p.first_spawn).unwrap_or(20);
-    let untaken = e.map.pads.iter().enumerate().any(|(i, d)| d.kind == PadKind::Power && s.pads[i].available);
-    if s.tick < first || (untaken && s.tick < 120) {
+    // the opening lasts while a power pad is up or back within 40 ticks (a missed first power-up
+    // still leaves the other one to secure, even before it is up)
+    let to_come = e.map.pads.iter().enumerate().any(|(i, d)| d.kind == PadKind::Power && (s.pads[i].available || s.pads[i].respawn_tick - s.tick <= 40));
+    if s.tick < first || (to_come && s.tick < 150) {
         0
     } else {
         1
@@ -83,7 +85,7 @@ pub fn choose(e: &Engine, s: &State, x: usize) -> Mode {
     match phase(e, s) {
         0 => {
             let pads: Vec<(usize, P)> = e.map.pads.iter().enumerate().filter(|(_, d)| d.kind == PadKind::Power).map(|(i, d)| (i, d.pos)).collect();
-            let open: Vec<P> = pads.iter().filter(|(i, _)| s.pads[*i].available || s.tick < 20).map(|(_, p)| *p).collect();
+            let open: Vec<P> = pads.iter().filter(|(i, _)| s.pads[*i].available || s.tick < 20 || s.pads[*i].respawn_tick - s.tick <= 40).map(|(_, p)| *p).collect();
             if open.is_empty() {
                 return Mode::Engage;
             }
@@ -93,7 +95,7 @@ pub fn choose(e: &Engine, s: &State, x: usize) -> Mode {
             let pace = e.rules.move_cooldown.max(1);
             let contest: Vec<P> = open
                 .iter()
-                .filter(|p| path(e, **p, f.pos) <= path(e, **p, o.pos) + 1 && (s.tick >= first || path(e, **p, f.pos) * pace + s.tick >= first - 4))
+                .filter(|p| (path(e, **p, f.pos) <= path(e, **p, o.pos) + 1 || buff_left(s, 1 - x) > 0) && (s.tick >= first || path(e, **p, f.pos) * pace + s.tick >= first - 4))
                 .cloned()
                 .collect();
             match contest.iter().min_by_key(|p| path(e, **p, f.pos)) {
@@ -155,8 +157,11 @@ pub fn score(e: &Engine, s: &State, x: usize, m: Mode, cap: f64) -> f64 {
             let mut v = -0.4 * (d - 5.0).max(0.0) + if sight { 1.0 } else { -1.0 };
             // deny the heal: graded by how much nearer their heal we stand than they do, once they
             // are hurt enough to want it
+            // deny the heal: once they are hurt and their nearest health pad is up or nearly, head for it
+            // (they break off for it from about 4 steps out; we used to be 9 to 10 away)
             if o.hp < e.rules.max_hp - 15 {
-                if let Some(h) = health_pad(e, s, o.pos, 40) {
+                if let Some(h) = health_pad(e, s, o.pos, 25) {
+                    v -= 0.5 * path(e, h, f.pos).min(12) as f64;
                     v += 0.4 * ((path(e, h, o.pos) - path(e, h, f.pos)) as f64).clamp(-5.0, 5.0);
                 }
             }
