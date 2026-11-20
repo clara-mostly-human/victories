@@ -52,6 +52,9 @@ pub struct Config {
     /// Weight of the hp-to-come network (`valuenet::hp_to_come`, `VALUE_HP_NET`) at the end of
     /// the play-out: the linear judgment's role, by a network trained on the same target.
     pub net_value: f64,
+    /// Cap in hp on the hp-to-come network's term (0: none), so it adds a small correction and
+    /// does not jitter between sibling leaves by more than a shot is worth.
+    pub net_cap: f64,
     /// Plans as moves (part 4): at the root each side may also commit to a plan for
     /// `PLAN_TICKS` ticks (go to the nearest power pad, to the nearest health pad when hurt,
     /// to the centre, at the opponent, or to a slam setup three tiles off an opponent that
@@ -91,7 +94,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, plans: false, plan_playout: false, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -562,7 +565,8 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
         v += cfg.net_hp * (equiv - lead);
     }
     if cfg.net_value != 0.0 && st.result.is_none() {
-        v += cfg.net_value * crate::valuenet::hp_to_come(e, &st, 0, &crate::valuenet_hp_weights::VALUE_HP_NET) as f64;
+        let t = crate::valuenet::hp_to_come(e, &st, 0, &crate::valuenet_hp_weights::VALUE_HP_NET) as f64;
+        v += cfg.net_value * if cfg.net_cap > 0.0 { t.clamp(-cfg.net_cap, cfg.net_cap) } else { t };
     }
     if cfg.value_weight != 0.0 && st.result.is_none() {
         v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, crate::models::value_weights(cfg.value_gen)) as f64;

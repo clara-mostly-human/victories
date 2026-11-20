@@ -168,6 +168,8 @@ pub struct Playbook {
     pub tree_net_hp: f64,
     /// The hp-to-come network as the leaf's judgment (`mcts::Config::net_value`), with this weight.
     pub tree_net_value: f64,
+    /// Cap in hp on that network's term (`mcts::Config::net_cap`; 0: none).
+    pub tree_net_cap: f64,
     /// not 0: while either fighter holds the power buff, the tree searches this deep and plays
     /// out `tree_quiet_buff` ticks at its leaves, so it sees the buff's 50 ticks run out
     pub tree_depth_buff: u32,
@@ -341,6 +343,7 @@ impl Default for Playbook {
             tree_net: 0.0,
             tree_net_hp: 0.0,
             tree_net_value: 0.0,
+            tree_net_cap: 0.0,
             tree_depth_buff: 0,
             tree_reuse: false,
             tree_plans: false,
@@ -426,6 +429,7 @@ impl Playbook {
         f("tree_net", &mut p.tree_net);
         f("tree_net_hp", &mut p.tree_net_hp);
         f("tree_net_value", &mut p.tree_net_value);
+        f("tree_net_cap", &mut p.tree_net_cap);
         f("tree_even", &mut p.tree_even);
         f("pad_bonus", &mut p.pad_bonus);
         f("attack_prior_weight", &mut p.attack_prior_weight);
@@ -1382,6 +1386,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         cfg.net_weight = pb.tree_net;
         cfg.net_hp = pb.tree_net_hp;
         cfg.net_value = pb.tree_net_value;
+        cfg.net_cap = pb.tree_net_cap;
         cfg.plans = pb.tree_plans;
         cfg.plan_playout = pb.tree_plan_playout;
         if pb.tree_depth_buff > 0 && s.fighters.iter().any(|f| f.power_until != NO_BUFF && f.power_until > s.tick) {
