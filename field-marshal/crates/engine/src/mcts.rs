@@ -87,6 +87,10 @@ pub struct Config {
     /// the long-term goal of the phase decides what a position is worth. Each leaf is judged by its
     /// own phase; between the even game and the lopsided one the judgments blend by lead. 0 keeps `value_gen`.
     pub phase_gens: [usize; crate::valuefeat::PHASES],
+    /// The strategy layer (`strategy`): each side's mode is chosen from the root position (phase,
+    /// and ahead / even / behind in hp and power), and every leaf adds this weight times the
+    /// difference of the two sides' goal scores (each capped at 6 hp).
+    pub strategy: f64,
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
     /// fighters (bit 0 = fighter 0, bit 1 = fighter 1) whose standing shots may lead, in
@@ -115,7 +119,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], strategy: 0.0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -606,7 +610,7 @@ fn win_shaped(e: &Engine, s: &State, j: f64, w: f64) -> f64 {
     w * (2.0 / (1.0 + (-z).exp()) - 1.0)
 }
 
-pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2], goals: &[(P, Vec<u16>)]) -> f64 {
+pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2], goals: &[(P, Vec<u16>)], modes: Option<[crate::strategy::Mode; 2]>) -> f64 {
     let mut st = *s;
     let mut v = 0.0;
     let strategic: [Option<usize>; 2] = if cfg.plan_playout && !goals.is_empty() { [strategic_goal(e, s, 0, goals), strategic_goal(e, s, 1, goals)] } else { [None, None] };
@@ -663,6 +667,9 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
     }
     if cfg.slam_value != 0.0 && st.result.is_none() {
         v += cfg.slam_value * (crate::valuefeat::slam_threat(e, &st, 0) as i32 - crate::valuefeat::slam_threat(e, &st, 1) as i32) as f64;
+    }
+    if let (Some(m), true) = (modes, cfg.strategy != 0.0 && st.result.is_none()) {
+        v += cfg.strategy * (crate::strategy::score(e, &st, 0, m[0], 6.0) - crate::strategy::score(e, &st, 1, m[1], 6.0));
     }
     if cfg.heal_value != 0.0 && st.result.is_none() {
         v += cfg.heal_value * heal_race(e, &st, goals);
@@ -1003,6 +1010,8 @@ impl<'a> Search<'a> {
         // Strategy by phase: each leaf is judged by its own phase's judgment (taking the phase from
         // the root for the whole search lost 12-23-1 against the flagship).
         let leaf_cfg = self.cfg;
+        // the strategy layer: both sides' modes from the position at the root
+        let modes = if self.cfg.strategy != 0.0 { Some([crate::strategy::choose(self.e, root, 0), crate::strategy::choose(self.e, root, 1)]) } else { None };
         let mut total = 0.0;
         for _ in 0..count {
             let mut s = *root;
@@ -1017,7 +1026,7 @@ impl<'a> Search<'a> {
                     // move lists (the costly part, in time and memory) once visited again.
                     if depth > 0 && self.nodes[node].n < self.cfg.expand_at {
                         self.nodes[node].n += 1;
-                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals);
+                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals, modes);
                         break;
                     }
                     for x in 0..2 {
@@ -1040,7 +1049,7 @@ impl<'a> Search<'a> {
                         self.plans_pending = false;
                     }
                     if depth > 0 && self.cfg.expand_at == 0 {
-                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals);
+                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals, modes);
                         break;
                     }
                     if depth == 0 && self.cfg.noise_seed != 0 {
@@ -1077,7 +1086,7 @@ impl<'a> Search<'a> {
                     break;
                 }
                 if depth + 1 == self.cfg.depth {
-                    leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals);
+                    leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals, modes);
                     break;
                 }
                 let key = ((node as u64) << 32) | ((i0 as u64) << 16) | i1 as u64;
@@ -1085,7 +1094,7 @@ impl<'a> Search<'a> {
                     Some(c) => *c as usize,
                     None if self.cfg.max_nodes > 0 && self.nodes.len() >= self.cfg.max_nodes as usize => {
                         // The tree is as big as it may grow: judge this position as a leaf.
-                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals);
+                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals, modes);
                         break;
                     }
                     None => {

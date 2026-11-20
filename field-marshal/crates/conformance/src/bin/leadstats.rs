@@ -62,6 +62,17 @@ fn main() {
     // after it first leads by `lead`: the next 100 ticks: the trailer's healing, the distance, out of sight
     let (mut after_n, mut after_heal, mut after_dist, mut after_blind, mut after_heals) = (0usize, 0i64, 0.0f64, 0usize, 0usize);
     let mut after_games = 0usize;
+    // the phase (valuefeat::phase) at the moment the first 25-hp gap opens, for its leads and its deficits
+    // strategy measures: first and second power-up; time in each mode (strategy::choose); in the
+    // middle game, heals taken by the side behind; damage taken while the other side is buffed;
+    // end-game kills when ahead
+    let (mut first_pu, mut second_pu, mut second_denied, mut pu_games) = (0usize, 0usize, 0usize, 0usize);
+    let mut mode_ticks = [0usize; 5];
+    let (mut mid_behind_heals, mut mid_ahead_opp_heals) = (0usize, 0usize);
+    let (mut dmg_vs_buff, mut buff_ticks) = (0i64, 0usize);
+    let (mut end_ahead, mut end_ahead_kills) = (0usize, 0usize);
+    let mut lead_phase = [0usize; victris_engine::valuefeat::PHASES];
+    let mut trail_phase = [0usize; victris_engine::valuefeat::PHASES];
     for path in &files {
         let mut text = String::new();
         let ok = if path.to_string_lossy().ends_with(".gz") {
@@ -80,6 +91,9 @@ fn main() {
         let (mut first_lead, mut first_trail) = (false, false);
         let mut slam_at: Vec<i32> = Vec::new();
         let mut lead_tick: Option<i32> = None;
+        let mut prev_ph = 0usize;
+        let mut power_takers: Vec<usize> = Vec::new();
+        let mut end_ahead_here = false;
         let mut dash_at: Vec<i32> = Vec::new();
         for t in &replay.ticks {
             if s.result.is_some() {
@@ -89,10 +103,12 @@ fn main() {
             let d = f.hp - g.hp;
             if !first_lead && !first_trail {
                 if d >= lead {
+                    lead_phase[prev_ph] += 1;
                     first_lead = true;
                     lead_tick = Some(s.tick);
                     after_games += 1;
                 } else if d <= -lead {
+                    trail_phase[prev_ph] += 1;
                     first_trail = true;
                 }
             }
@@ -123,6 +139,16 @@ fn main() {
                     after_blind += !victris_engine::observe::can_see(&e.rules, &e.map, f.pos, g.pos) as usize;
                 }
             }
+            prev_ph = victris_engine::valuefeat::phase(e, &s);
+            if f.alive && g.alive && f.state == FState::Idle {
+                mode_ticks[victris_engine::strategy::mode_index(victris_engine::strategy::choose(e, &s, me))] += 1;
+            }
+            let ph3 = victris_engine::strategy::phase(e, &s);
+            if ph3 == 2 && !end_ahead_here && victris_engine::strategy::edge(&s, me) >= 15.0 {
+                end_ahead_here = true;
+            }
+            let opp_buffed = g.power_until != victris_engine::state::NO_BUFF && g.power_until > s.tick;
+            let pads_before: Vec<bool> = s.pads.iter().map(|p| p.available).collect();
             let before = (s.fighters[me].hp, s.fighters[o].hp, s.fighters[me].state, s.fighters[o].state);
             e.step(&mut s, &t.turns);
             let (now_me, now_o) = (s.fighters[me].state, s.fighters[o].state);
@@ -138,6 +164,26 @@ fn main() {
             }
             if before.3 == FState::Stunned || now_o == FState::Stunned {
                 dmg_in_their_stun_dealt += (before.1 - s.fighters[o].hp).max(0) as i64;
+            }
+            if opp_buffed {
+                buff_ticks += 1;
+                dmg_vs_buff += (before.0 - s.fighters[me].hp).max(0) as i64;
+            }
+            for (i, d) in e.map.pads.iter().enumerate() {
+                if pads_before[i] && !s.pads[i].available {
+                    let who = if s.fighters[me].pos == d.pos { me } else { o };
+                    if d.kind == victris_engine::map::PadKind::Power {
+                        power_takers.push(who);
+                    } else if ph3 == 1 {
+                        let ed_me = victris_engine::strategy::edge(&s, me);
+                        if who == me && ed_me <= -15.0 {
+                            mid_behind_heals += 1;
+                        }
+                        if who == o && ed_me >= 15.0 {
+                            mid_ahead_opp_heals += 1;
+                        }
+                    }
+                }
             }
             if let Some(lt) = lead_tick {
                 if s.tick <= lt + 100 && s.fighters[o].hp > before.1 {
@@ -158,13 +204,34 @@ fn main() {
             trailed += 1;
             trailed_won += won as usize;
         }
+        if !power_takers.is_empty() {
+            pu_games += 1;
+            first_pu += (power_takers[0] == me) as usize;
+            if power_takers[0] == me && power_takers.len() > 1 {
+                second_pu += (power_takers[1] == me) as usize;
+            }
+            if power_takers[0] != me && power_takers.len() > 1 {
+                second_denied += (power_takers[1] == me) as usize;
+            }
+        }
+        if end_ahead_here {
+            end_ahead += 1;
+            end_ahead_kills += (won && !s.fighters[o].alive) as usize;
+        }
         dash_slams += dash_at.iter().filter(|t| slam_at.iter().any(|s| *s >= **t && *s <= **t + 2)).count();
     }
     let g = games.max(1) as f64;
     println!("{bot}: {games} games, won {:.1}%", 100.0 * wins as f64 / g);
     println!("  first {lead} hp ahead in {led} games, won {:.1}% of them; first {lead} hp behind in {trailed}, won {:.1}%", 100.0 * led_won as f64 / led.max(1) as f64, 100.0 * trailed_won as f64 / trailed.max(1) as f64);
     let an = after_n.max(1) as f64;
+    let show = |c: &[usize; victris_engine::valuefeat::PHASES]| (0..victris_engine::valuefeat::PHASES).map(|k| format!("{} {}", victris_engine::valuefeat::PHASE_NAMES[k], c[k])).collect::<Vec<_>>().join(", ");
+    println!("  phase just before the first {lead}-hp gap opens: its leads [{}]; its deficits [{}]", show(&lead_phase), show(&trail_phase));
     println!("  in the 100 ticks after first leading by {lead} ({after_games} games): the trailer heals {:.1} hp ({:.2} pickups), distance {:.1} tiles, out of sight {:.0}% of ticks", after_heal as f64 / after_games.max(1) as f64, after_heals as f64 / after_games.max(1) as f64, after_dist / an, 100.0 * after_blind as f64 / an);
+    let mt: usize = mode_ticks.iter().sum::<usize>().max(1);
+    println!("  strategy: first power-up {:.0}% of {pu_games} games; with it, also the second {:.0}%; without it, the other one {:.0}% | modes {} | middle: heals taken while behind {:.2}/game, their heals while we lead {:.2}/game | hp lost per tick of their buff {:.2} | end: ahead in {end_ahead} games, killed {:.0}%",
+        100.0 * first_pu as f64 / pu_games.max(1) as f64, 100.0 * second_pu as f64 / first_pu.max(1) as f64, 100.0 * second_denied as f64 / (pu_games - first_pu).max(1) as f64,
+        (0..5).map(|k| format!("{} {:.0}%", victris_engine::strategy::MODE_NAMES[k], 100.0 * mode_ticks[k] as f64 / mt as f64)).collect::<Vec<_>>().join(", "),
+        mid_behind_heals as f64 / g, mid_ahead_opp_heals as f64 / g, dmg_vs_buff as f64 / buff_ticks.max(1) as f64, 100.0 * end_ahead_kills as f64 / end_ahead.max(1) as f64);
     println!("  stuns a game: dealt {:.2}, taken {:.2}; damage inside stun windows a game: dealt {:.1}, taken {:.1}", stunned_them as f64 / g, stunned_us as f64 / g, dmg_in_their_stun_dealt as f64 / g, dmg_in_our_stun as f64 / g);
     println!("  dashes a game {:.1}, {:.0}% away from the opponent, {:.0}% followed by a slam; loaded near the opponent {:.0}% of ticks; slam threat held {:.1}% of ticks, faced {:.1}%", dashes as f64 / g, 100.0 * dashes_away as f64 / dashes.max(1) as f64, 100.0 * dash_slams as f64 / dashes.max(1) as f64, 100.0 * near_loaded as f64 / near.max(1) as f64, 100.0 * threat_us as f64 / ticks.max(1) as f64, 100.0 * threat_them as f64 / ticks.max(1) as f64);
 }

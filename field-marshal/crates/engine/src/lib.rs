@@ -23,6 +23,7 @@ pub mod replay;
 pub mod rules;
 pub mod state;
 pub mod step;
+pub mod strategy;
 pub mod tempo;
 pub mod turn;
 pub mod valuefeat;

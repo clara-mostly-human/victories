@@ -189,6 +189,8 @@ pub struct Playbook {
     pub tree_heal_value: f64,
     /// Judgment row per phase of the game (`mcts::Config::phase_gens`), e.g. [16, 17, 18, 19, 20]; empty: off.
     pub tree_phase_gens: Vec<usize>,
+    /// The strategy layer's weight (`mcts::Config::strategy`; 0: off).
+    pub tree_strategy: f64,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
     pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
@@ -362,6 +364,7 @@ impl Default for Playbook {
             tree_loaded_value: 0.0,
             tree_heal_value: 0.0,
             tree_phase_gens: Vec::new(),
+            tree_strategy: 0.0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
@@ -448,6 +451,7 @@ impl Playbook {
         f("tree_slam_value", &mut p.tree_slam_value);
         f("tree_loaded_value", &mut p.tree_loaded_value);
         f("tree_heal_value", &mut p.tree_heal_value);
+        f("tree_strategy", &mut p.tree_strategy);
         if let Some(a) = v.get("tree_phase_gens").and_then(Value::as_array) {
             p.tree_phase_gens = a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect();
         }
@@ -1430,6 +1434,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         cfg.slam_value = pb.tree_slam_value;
         cfg.loaded_value = pb.tree_loaded_value;
         cfg.heal_value = pb.tree_heal_value;
+        cfg.strategy = pb.tree_strategy;
         for (k, g) in pb.tree_phase_gens.iter().take(victris_engine::valuefeat::PHASES).enumerate() {
             cfg.phase_gens[k] = *g;
         }

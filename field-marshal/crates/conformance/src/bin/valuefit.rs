@@ -27,6 +27,9 @@ fn main() {
     let bots: Vec<String> = opt("--bots").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
     // --phase k: only ticks in phase k (`valuefeat::phase`), for one judgment per phase
     let phase: Option<usize> = opt("--phase").and_then(|s| s.parse().ok());
+    // --gamma: discount a tick for the hp to come (0.98: about 50 ticks; 0.995: about 200, the
+    // longer-term goal of a phase)
+    let gamma: f64 = opt("--gamma").and_then(|s| s.parse().ok()).unwrap_or(0.98);
     // rows: (features, outcome, held out)
     let mut rows: Vec<([f64; NV], f64, bool)> = Vec::new();
     let mut games = 0usize;
@@ -36,7 +39,7 @@ fn main() {
             skip = false;
             continue;
         }
-        if a == "--ridge" || a == "--bots" || a == "--phase" {
+        if a == "--ridge" || a == "--bots" || a == "--phase" || a == "--gamma" {
             skip = true;
             continue;
         }
@@ -85,7 +88,7 @@ fn main() {
                 }
                 let mut g = 0.0;
                 for (i, (f, r, ph)) in trace.iter().enumerate().rev() {
-                    g = r + 0.98 * g;
+                    g = r + gamma * g;
                     if i % 3 == 0 && phase.map(|p| p == *ph).unwrap_or(true) {
                         let mut x = [0.0; NV];
                         for k in 0..NV {
