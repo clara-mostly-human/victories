@@ -84,7 +84,8 @@ pub struct Config {
     pub heal_value: f64,
     /// Strategy by phase: the judgment row for each phase of the game (`valuefeat::phase`:
     /// opening, late, lopsided, buffed, middle), each fitted on our own games in that phase, so
-    /// the long-term goal of the phase decides what a position is worth. 0 keeps `value_gen`.
+    /// the long-term goal of the phase decides what a position is worth. Each leaf is judged by its
+    /// own phase; between the even game and the lopsided one the judgments blend by lead. 0 keeps `value_gen`.
     pub phase_gens: [usize; crate::valuefeat::PHASES],
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
@@ -644,9 +645,21 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
         v += cfg.net_value * if cfg.net_cap > 0.0 { t.clamp(-cfg.net_cap, cfg.net_cap) } else { t };
     }
     if cfg.value_weight != 0.0 && st.result.is_none() {
-        let pg = cfg.phase_gens[crate::valuefeat::phase(e, &st)];
-        let gen = if pg > 0 { pg } else { cfg.value_gen };
-        v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, crate::models::value_weights(gen)) as f64;
+        let ph = crate::valuefeat::phase(e, &st);
+        let row = |p: usize| { let g = cfg.phase_gens[p]; if g > 0 { g } else { cfg.value_gen } };
+        let val = |g: usize| crate::valuefeat::value(e, &st, 0, crate::models::value_weights(g)) as f64;
+        let j = if cfg.phase_gens.iter().any(|g| *g > 0) && ph >= 2 {
+            // between the even game and the lopsided one the goals blend over 15 to 35 hp of lead,
+            // so no leaf's worth jumps where the lead crosses one line
+            let lead = (st.fighters[0].hp - st.fighters[1].hp).abs() as f64;
+            let a = ((lead - 15.0) / 20.0).clamp(0.0, 1.0);
+            let buffed = st.fighters.iter().any(|f| f.power_until != NO_BUFF && f.power_until > st.tick);
+            let even = if buffed { 3 } else { 4 };
+            (1.0 - a) * val(row(even)) + a * val(row(2))
+        } else {
+            val(row(ph))
+        };
+        v += cfg.value_weight * j;
     }
     if cfg.slam_value != 0.0 && st.result.is_none() {
         v += cfg.slam_value * (crate::valuefeat::slam_threat(e, &st, 0) as i32 - crate::valuefeat::slam_threat(e, &st, 1) as i32) as f64;
@@ -987,6 +1000,9 @@ impl<'a> Search<'a> {
 
     /// Runs `count` more iterations from `root` (after `start`).
     pub fn iterate(&mut self, root: &State, fixed: [Option<RawTurn>; 2], count: u32) {
+        // Strategy by phase: each leaf is judged by its own phase's judgment (taking the phase from
+        // the root for the whole search lost 12-23-1 against the flagship).
+        let leaf_cfg = self.cfg;
         let mut total = 0.0;
         for _ in 0..count {
             let mut s = *root;
@@ -1001,7 +1017,7 @@ impl<'a> Search<'a> {
                     // move lists (the costly part, in time and memory) once visited again.
                     if depth > 0 && self.nodes[node].n < self.cfg.expand_at {
                         self.nodes[node].n += 1;
-                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took), &self.goals);
+                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals);
                         break;
                     }
                     for x in 0..2 {
@@ -1024,7 +1040,7 @@ impl<'a> Search<'a> {
                         self.plans_pending = false;
                     }
                     if depth > 0 && self.cfg.expand_at == 0 {
-                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took), &self.goals);
+                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals);
                         break;
                     }
                     if depth == 0 && self.cfg.noise_seed != 0 {
@@ -1061,7 +1077,7 @@ impl<'a> Search<'a> {
                     break;
                 }
                 if depth + 1 == self.cfg.depth {
-                    leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took), &self.goals);
+                    leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals);
                     break;
                 }
                 let key = ((node as u64) << 32) | ((i0 as u64) << 16) | i1 as u64;
@@ -1069,7 +1085,7 @@ impl<'a> Search<'a> {
                     Some(c) => *c as usize,
                     None if self.cfg.max_nodes > 0 && self.nodes.len() >= self.cfg.max_nodes as usize => {
                         // The tree is as big as it may grow: judge this position as a leaf.
-                        leaf = leaf_value(self.e, &s, &self.cfg, self.dists(took), &self.goals);
+                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals);
                         break;
                     }
                     None => {
