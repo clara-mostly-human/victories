@@ -68,6 +68,9 @@ fn main() {
     // end-game kills when ahead
     let (mut first_pu, mut second_pu, mut second_denied, mut pu_games) = (0usize, 0usize, 0usize, 0usize);
     let mut mode_ticks = [0usize; 5];
+    // hp dealt and taken in each mode (the mode of the tick it starts in)
+    let mut mode_dealt = [0i64; 5];
+    let mut mode_taken = [0i64; 5];
     let (mut mid_behind_heals, mut mid_ahead_opp_heals) = (0usize, 0usize);
     let (mut dmg_vs_buff, mut buff_ticks) = (0i64, 0usize);
     let (mut end_ahead, mut end_ahead_kills) = (0usize, 0usize);
@@ -140,8 +143,9 @@ fn main() {
                 }
             }
             prev_ph = victris_engine::valuefeat::phase(e, &s);
+            let cur_mode = victris_engine::strategy::mode_index(victris_engine::strategy::choose(e, &s, me));
             if f.alive && g.alive && f.state == FState::Idle {
-                mode_ticks[victris_engine::strategy::mode_index(victris_engine::strategy::choose(e, &s, me))] += 1;
+                mode_ticks[cur_mode] += 1;
             }
             let ph3 = victris_engine::strategy::phase(e, &s);
             if ph3 == 2 && !end_ahead_here && victris_engine::strategy::edge(&s, me) >= 15.0 {
@@ -165,6 +169,8 @@ fn main() {
             if before.3 == FState::Stunned || now_o == FState::Stunned {
                 dmg_in_their_stun_dealt += (before.1 - s.fighters[o].hp).max(0) as i64;
             }
+            mode_dealt[cur_mode] += (before.1 - s.fighters[o].hp).max(0) as i64;
+            mode_taken[cur_mode] += (before.0 - s.fighters[me].hp).max(0) as i64;
             if opp_buffed {
                 buff_ticks += 1;
                 dmg_vs_buff += (before.0 - s.fighters[me].hp).max(0) as i64;
@@ -232,6 +238,7 @@ fn main() {
         100.0 * first_pu as f64 / pu_games.max(1) as f64, 100.0 * second_pu as f64 / first_pu.max(1) as f64, 100.0 * second_denied as f64 / (pu_games - first_pu).max(1) as f64,
         (0..5).map(|k| format!("{} {:.0}%", victris_engine::strategy::MODE_NAMES[k], 100.0 * mode_ticks[k] as f64 / mt as f64)).collect::<Vec<_>>().join(", "),
         mid_behind_heals as f64 / g, mid_ahead_opp_heals as f64 / g, dmg_vs_buff as f64 / buff_ticks.max(1) as f64, 100.0 * end_ahead_kills as f64 / end_ahead.max(1) as f64);
+    println!("  hp dealt - taken per game by mode: {}", (0..5).map(|k| format!("{} {:+.1} ({:.1}/{:.1})", victris_engine::strategy::MODE_NAMES[k], (mode_dealt[k] - mode_taken[k]) as f64 / g, mode_dealt[k] as f64 / g, mode_taken[k] as f64 / g)).collect::<Vec<_>>().join(", "));
     println!("  stuns a game: dealt {:.2}, taken {:.2}; damage inside stun windows a game: dealt {:.1}, taken {:.1}", stunned_them as f64 / g, stunned_us as f64 / g, dmg_in_their_stun_dealt as f64 / g, dmg_in_our_stun as f64 / g);
     println!("  dashes a game {:.1}, {:.0}% away from the opponent, {:.0}% followed by a slam; loaded near the opponent {:.0}% of ticks; slam threat held {:.1}% of ticks, faced {:.1}%", dashes as f64 / g, 100.0 * dashes_away as f64 / dashes.max(1) as f64, 100.0 * dash_slams as f64 / dashes.max(1) as f64, 100.0 * near_loaded as f64 / near.max(1) as f64, 100.0 * threat_us as f64 / ticks.max(1) as f64, 100.0 * threat_them as f64 / ticks.max(1) as f64);
 }

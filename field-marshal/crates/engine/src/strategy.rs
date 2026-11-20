@@ -87,14 +87,19 @@ pub fn choose(e: &Engine, s: &State, x: usize) -> Mode {
             if open.is_empty() {
                 return Mode::Engage;
             }
-            if buff_left(s, x) > 0 || buff_left(s, 1 - x) > 0 {
-                // the first is gone: with it, take or deny the second; without it, make sure of the other
-                let p = *open.iter().min_by_key(|p| path(e, **p, f.pos)).unwrap();
-                return Mode::Pad(p);
+            // only a pad we can still contest: up, or back by the time we get there, and we are no
+            // farther from it than the opponent plus a step; otherwise engage and stay level
+            let first = e.rules.pickups.as_ref().map(|p| p.first_spawn).unwrap_or(20);
+            let pace = e.rules.move_cooldown.max(1);
+            let contest: Vec<P> = open
+                .iter()
+                .filter(|p| path(e, **p, f.pos) <= path(e, **p, o.pos) + 1 && (s.tick >= first || path(e, **p, f.pos) * pace + s.tick >= first - 4))
+                .cloned()
+                .collect();
+            match contest.iter().min_by_key(|p| path(e, **p, f.pos)) {
+                Some(p) => Mode::Pad(*p),
+                None => Mode::Engage,
             }
-            // the first power-up: the pad we reach soonest, preferring one we reach before them
-            let p = *open.iter().min_by_key(|p| (path(e, **p, f.pos) - path(e, **p, o.pos)).min(0) * 2 + path(e, **p, f.pos)).unwrap();
-            Mode::Pad(p)
         }
         1 => {
             if ed >= 15.0 {
@@ -139,25 +144,36 @@ pub fn score(e: &Engine, s: &State, x: usize, m: Mode, cap: f64) -> f64 {
             if buff_left(s, x) > 0 && f.pos == p {
                 cap
             } else {
-                -0.5 * path(e, p, f.pos) as f64
+                -0.25 * path(e, p, f.pos) as f64
             }
         }
         Mode::Press => {
             // in range and in sight, between them and their heal
-            let mut v = -0.6 * (d - 3.0).abs() + if sight { 1.5 } else { -1.0 };
-            if let Some(h) = health_pad(e, s, o.pos, 30) {
-                if path(e, h, f.pos) < path(e, h, o.pos) {
-                    v += 2.0;
+            // keep them from getting away (past 5 tiles) and in sight; how close to fight is left to
+            // the search's tactics (pulling to 3 tiles cost 13 to 14 hp a game in pressing play)
+            // only keep them from escaping (past 6 tiles); fighting distance and sight are the
+            // search's (pressing at range with sight cost 20 hp a game against a trailing flagship)
+            let mut v = -0.4 * (d - 6.0).max(0.0);
+            let _ = sight;
+            // deny the heal: graded by how much nearer their heal we stand than they do, once they
+            // are hurt enough to want it
+            if o.hp < e.rules.max_hp - 15 {
+                if let Some(h) = health_pad(e, s, o.pos, 40) {
+                    v += 0.4 * ((path(e, h, o.pos) - path(e, h, f.pos)) as f64).clamp(-5.0, 5.0);
                 }
             }
             v
         }
         Mode::Engage => -0.5 * (d - 3.0).abs() + if sight { 1.0 } else { 0.0 },
         Mode::Disengage => {
-            let mut v = 0.4 * d.min(8.0) + if sight { -1.5 } else { 1.5 };
-            if f.hp < e.rules.max_hp - 20 {
-                if let Some(h) = health_pad(e, s, f.pos, 30) {
-                    v -= 0.4 * path(e, h, f.pos).min(15) as f64;
+            // distance and broken sight count once out of their reach; within it every tile counts against
+            let reach = 4.0;
+            let mut v = if d <= reach { -0.8 * (reach + 1.0 - d) } else { 0.4 * d.min(8.0) + if sight { -1.0 } else { 1.5 } };
+            // get the heal: nearer it than they are, and as near as we can
+            if f.hp < e.rules.max_hp - 15 {
+                if let Some(h) = health_pad(e, s, f.pos, 40) {
+                    v -= 0.3 * path(e, h, f.pos).min(15) as f64;
+                    v += 0.3 * ((path(e, h, o.pos) - path(e, h, f.pos)) as f64).clamp(-5.0, 5.0);
                 }
             }
             v
