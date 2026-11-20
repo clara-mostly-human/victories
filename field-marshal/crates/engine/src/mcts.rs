@@ -82,6 +82,10 @@ pub struct Config {
     /// return) gains what it would heal (the pad's amount, up to its missing hp), discounted 0.97
     /// a tick. Being nearer the pad than a hurt opponent denies its heal: the leader keeps its lead.
     pub heal_value: f64,
+    /// Strategy by phase: the judgment row for each phase of the game (`valuefeat::phase`:
+    /// opening, late, lopsided, buffed, middle), each fitted on our own games in that phase, so
+    /// the long-term goal of the phase decides what a position is worth. 0 keeps `value_gen`.
+    pub phase_gens: [usize; crate::valuefeat::PHASES],
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
     /// fighters (bit 0 = fighter 0, bit 1 = fighter 1) whose standing shots may lead, in
@@ -110,7 +114,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -640,7 +644,9 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
         v += cfg.net_value * if cfg.net_cap > 0.0 { t.clamp(-cfg.net_cap, cfg.net_cap) } else { t };
     }
     if cfg.value_weight != 0.0 && st.result.is_none() {
-        v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, crate::models::value_weights(cfg.value_gen)) as f64;
+        let pg = cfg.phase_gens[crate::valuefeat::phase(e, &st)];
+        let gen = if pg > 0 { pg } else { cfg.value_gen };
+        v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, crate::models::value_weights(gen)) as f64;
     }
     if cfg.slam_value != 0.0 && st.result.is_none() {
         v += cfg.slam_value * (crate::valuefeat::slam_threat(e, &st, 0) as i32 - crate::valuefeat::slam_threat(e, &st, 1) as i32) as f64;

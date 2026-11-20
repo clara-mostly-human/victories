@@ -222,6 +222,29 @@ pub fn slam_threat(e: &Engine, s: &State, a: usize) -> bool {
     reach.iter().any(|t| chebyshev(*t, v.pos) == 1 && wall_behind(e, v.pos, *t, push))
 }
 
+/// Phases of the game, each with its own long-term goal and its own judgment
+/// (`mcts::Config::phase_gens`): 0 opening (before tick 45: the race for the first power pads),
+/// 1 late (from tick 400: the zone and the hp lead decide), 2 lopsided (one side 25+ hp ahead:
+/// the leader converts, the trailer breaks off and heals), 3 buffed (a power buff running),
+/// 4 even middle game (the stun war).
+pub const PHASES: usize = 5;
+pub const PHASE_NAMES: [&str; PHASES] = ["opening", "late", "lopsided", "buffed", "middle"];
+
+pub fn phase(e: &Engine, s: &State) -> usize {
+    let (a, b) = (&s.fighters[0], &s.fighters[1]);
+    if s.tick < 45 {
+        0
+    } else if s.tick >= 400.min(e.rules.max_ticks * 2 / 3) {
+        1
+    } else if (a.hp - b.hp).abs() >= 25 {
+        2
+    } else if (a.power_until != NO_BUFF && a.power_until > s.tick) || (b.power_until != NO_BUFF && b.power_until > s.tick) {
+        3
+    } else {
+        4
+    }
+}
+
 /// Fighter `x` is loaded: idle with its dash and its repulsor both ready.
 pub fn loaded(e: &Engine, s: &State, x: usize) -> bool {
     let f = &s.fighters[x];

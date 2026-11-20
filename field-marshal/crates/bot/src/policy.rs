@@ -187,6 +187,8 @@ pub struct Playbook {
     pub tree_loaded_value: f64,
     /// The heal race at the leaf (`mcts::Config::heal_value`).
     pub tree_heal_value: f64,
+    /// Judgment row per phase of the game (`mcts::Config::phase_gens`), e.g. [16, 17, 18, 19, 20]; empty: off.
+    pub tree_phase_gens: Vec<usize>,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
     pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
@@ -359,6 +361,7 @@ impl Default for Playbook {
             tree_slam_value: 0.0,
             tree_loaded_value: 0.0,
             tree_heal_value: 0.0,
+            tree_phase_gens: Vec::new(),
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
@@ -445,6 +448,9 @@ impl Playbook {
         f("tree_slam_value", &mut p.tree_slam_value);
         f("tree_loaded_value", &mut p.tree_loaded_value);
         f("tree_heal_value", &mut p.tree_heal_value);
+        if let Some(a) = v.get("tree_phase_gens").and_then(Value::as_array) {
+            p.tree_phase_gens = a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect();
+        }
         f("tree_even", &mut p.tree_even);
         f("pad_bonus", &mut p.pad_bonus);
         f("attack_prior_weight", &mut p.attack_prior_weight);
@@ -1424,6 +1430,9 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         cfg.slam_value = pb.tree_slam_value;
         cfg.loaded_value = pb.tree_loaded_value;
         cfg.heal_value = pb.tree_heal_value;
+        for (k, g) in pb.tree_phase_gens.iter().take(victris_engine::valuefeat::PHASES).enumerate() {
+            cfg.phase_gens[k] = *g;
+        }
         if pb.tree_depth_buff > 0 && s.fighters.iter().any(|f| f.power_until != NO_BUFF && f.power_until > s.tick) {
             cfg.depth = pb.tree_depth_buff;
             if pb.tree_quiet_buff > 0 {

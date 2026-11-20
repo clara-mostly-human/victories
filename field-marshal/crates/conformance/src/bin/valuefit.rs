@@ -25,6 +25,8 @@ fn main() {
     let emit = args.iter().any(|a| a == "--emit");
     // --bots A,B,...: only replays in which both fighters are among these bots
     let bots: Vec<String> = opt("--bots").map(|s| s.split(',').map(str::to_string).collect()).unwrap_or_default();
+    // --phase k: only ticks in phase k (`valuefeat::phase`), for one judgment per phase
+    let phase: Option<usize> = opt("--phase").and_then(|s| s.parse().ok());
     // rows: (features, outcome, held out)
     let mut rows: Vec<([f64; NV], f64, bool)> = Vec::new();
     let mut games = 0usize;
@@ -34,7 +36,7 @@ fn main() {
             skip = false;
             continue;
         }
-        if a == "--ridge" || a == "--bots" {
+        if a == "--ridge" || a == "--bots" || a == "--phase" {
             skip = true;
             continue;
         }
@@ -63,12 +65,13 @@ fn main() {
                 games += 1;
                 let e = &replay.engine;
                 let mut s = e.new_match(replay.seed);
-                let mut trace: Vec<([f32; NV], f64)> = Vec::new();
+                let mut trace: Vec<([f32; NV], f64, usize)> = Vec::new();
                 for t in &replay.ticks {
                     if s.result.is_some() {
                         break;
                     }
                     let f = victris_engine::valuefeat::diff(e, &s, 0);
+                    let ph = victris_engine::valuefeat::phase(e, &s);
                     let before = (s.fighters[0].hp, s.fighters[1].hp);
                     e.step(&mut s, &t.turns);
                     let mut r = ((s.fighters[0].hp.max(0) - before.0) - (s.fighters[1].hp.max(0) - before.1)) as f64;
@@ -78,12 +81,12 @@ fn main() {
                     if !s.fighters[0].alive {
                         r -= 40.0;
                     }
-                    trace.push((f, r));
+                    trace.push((f, r, ph));
                 }
                 let mut g = 0.0;
-                for (i, (f, r)) in trace.iter().enumerate().rev() {
+                for (i, (f, r, ph)) in trace.iter().enumerate().rev() {
                     g = r + 0.98 * g;
-                    if i % 3 == 0 {
+                    if i % 3 == 0 && phase.map(|p| p == *ph).unwrap_or(true) {
                         let mut x = [0.0; NV];
                         for k in 0..NV {
                             x[k] = f[k] as f64;
