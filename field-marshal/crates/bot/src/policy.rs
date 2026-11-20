@@ -191,6 +191,8 @@ pub struct Playbook {
     pub tree_phase_gens: Vec<usize>,
     /// The strategy layer's weight (`mcts::Config::strategy`; 0: off).
     pub tree_strategy: f64,
+    /// Score only our own plan at the leaves (`mcts::Config::strategy_side` = our seat), not the opponent's.
+    pub tree_strategy_own: bool,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
     pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
@@ -365,6 +367,7 @@ impl Default for Playbook {
             tree_heal_value: 0.0,
             tree_phase_gens: Vec::new(),
             tree_strategy: 0.0,
+            tree_strategy_own: false,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
@@ -502,7 +505,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them), ("tree_reuse", &mut p.tree_reuse), ("tree_plans", &mut p.tree_plans), ("tree_plan_playout", &mut p.tree_plan_playout)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them), ("tree_reuse", &mut p.tree_reuse), ("tree_plans", &mut p.tree_plans), ("tree_plan_playout", &mut p.tree_plan_playout), ("tree_strategy_own", &mut p.tree_strategy_own)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -1435,6 +1438,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         cfg.loaded_value = pb.tree_loaded_value;
         cfg.heal_value = pb.tree_heal_value;
         cfg.strategy = pb.tree_strategy;
+        cfg.strategy_side = if pb.tree_strategy_own { me as u8 } else { 2 };
         for (k, g) in pb.tree_phase_gens.iter().take(victris_engine::valuefeat::PHASES).enumerate() {
             cfg.phase_gens[k] = *g;
         }

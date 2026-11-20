@@ -91,6 +91,9 @@ pub struct Config {
     /// and ahead / even / behind in hp and power), and every leaf adds this weight times the
     /// difference of the two sides' goal scores (each capped at 6 hp).
     pub strategy: f64,
+    /// Whose plan the leaves score: 0 or 1 for that fighter only (the opponent is left to the
+    /// search's tactics, as the bot cannot know its real plan), 2 for both sides.
+    pub strategy_side: u8,
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
     /// fighters (bit 0 = fighter 0, bit 1 = fighter 1) whose standing shots may lead, in
@@ -119,7 +122,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], strategy: 0.0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], strategy: 0.0, strategy_side: 2, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -669,7 +672,9 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
         v += cfg.slam_value * (crate::valuefeat::slam_threat(e, &st, 0) as i32 - crate::valuefeat::slam_threat(e, &st, 1) as i32) as f64;
     }
     if let (Some(m), true) = (modes, cfg.strategy != 0.0 && st.result.is_none()) {
-        v += cfg.strategy * (crate::strategy::score(e, &st, 0, m[0], 6.0) - crate::strategy::score(e, &st, 1, m[1], 6.0));
+        let s0 = if cfg.strategy_side != 1 { crate::strategy::score(e, &st, 0, m[0], 6.0) } else { 0.0 };
+        let s1 = if cfg.strategy_side != 0 { crate::strategy::score(e, &st, 1, m[1], 6.0) } else { 0.0 };
+        v += cfg.strategy * (s0 - s1);
     }
     if cfg.heal_value != 0.0 && st.result.is_none() {
         v += cfg.heal_value * heal_race(e, &st, goals);

@@ -151,10 +151,8 @@ pub fn score(e: &Engine, s: &State, x: usize, m: Mode, cap: f64) -> f64 {
             // in range and in sight, between them and their heal
             // keep them from getting away (past 5 tiles) and in sight; how close to fight is left to
             // the search's tactics (pulling to 3 tiles cost 13 to 14 hp a game in pressing play)
-            // only keep them from escaping (past 6 tiles); fighting distance and sight are the
-            // search's (pressing at range with sight cost 20 hp a game against a trailing flagship)
-            let mut v = -0.4 * (d - 6.0).max(0.0);
-            let _ = sight;
+            // keep them from getting away (past 5 tiles) and in sight
+            let mut v = -0.4 * (d - 5.0).max(0.0) + if sight { 1.0 } else { -1.0 };
             // deny the heal: graded by how much nearer their heal we stand than they do, once they
             // are hurt enough to want it
             if o.hp < e.rules.max_hp - 15 {
