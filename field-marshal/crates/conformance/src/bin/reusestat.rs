@@ -49,7 +49,10 @@ fn main() {
             collect(Path::new(a), &mut files);
         }
     }
-    let cfg = Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, ..Default::default() };
+    let cfg = Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, own_priors: args.iter().any(|a| a == "--own-priors"), ..Default::default() };
+    // how well each search foresaw the reply: the share of the opponent's root visits on the turn
+    // it then actually played, and that turn's rank among its root turns
+    let (mut reply_share_sum, mut reply_n, mut reply_top, mut reply_top3) = (0.0f64, 0usize, 0usize, 0usize);
     let (mut decisions, mut hits, mut miss_gap) = (0usize, 0usize, 0usize);
     let mut shares: Vec<f64> = Vec::new();
     let (mut carried_sum, mut total_sum) = (0u64, 0u64);
@@ -99,6 +102,22 @@ fn main() {
                     search.iterate(&s, [None, None], 100);
                     fresh += 100;
                 }
+                {
+                    let res = search.result();
+                    let theirs = &res.acts[1 - me];
+                    let tot: u32 = theirs.iter().map(|a| a.1).sum();
+                    if tot > 0 {
+                        let actual = t.turns[1 - me];
+                        let mut sorted: Vec<&(victris_engine::turn::RawTurn, u32, f64)> = theirs.iter().collect();
+                        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+                        if let Some(rank) = sorted.iter().position(|a| a.0 == actual) {
+                            reply_share_sum += sorted[rank].1 as f64 / tot as f64;
+                            reply_top += (rank == 0) as usize;
+                            reply_top3 += (rank < 3) as usize;
+                        }
+                        reply_n += 1;
+                    }
+                }
                 let total = carried + fresh;
                 carried_sum += carried;
                 total_sum += total;
@@ -114,5 +133,7 @@ fn main() {
     let q = |p: f64| shares.get(((shares.len() as f64 - 1.0) * p) as usize).cloned().unwrap_or(0.0);
     println!("{played} games of {bot}, {decisions} decisions searched for {ms} ms each");
     println!("  previous tick's tree had the branch actually played: {:.0}% of decisions ({:.0}% had no tree from the tick before: we could not act then)", 100.0 * hits as f64 / decisions.max(1) as f64, 100.0 * miss_gap as f64 / decisions.max(1) as f64);
+    let rn = reply_n.max(1) as f64;
+    println!("  the opponent's actual reply: {:.0}% of its root visits on average; its most visited turn {:.0}% of the time, in its top three {:.0}%", 100.0 * reply_share_sum / rn, 100.0 * reply_top as f64 / rn, 100.0 * reply_top3 as f64 / rn);
     println!("  visits arriving pre-built, as a share of each search's total: mean {:.0}%, median {:.0}%, top quarter above {:.0}%, top tenth above {:.0}%", 100.0 * carried_sum as f64 / total_sum.max(1) as f64, 100.0 * q(0.5), 100.0 * q(0.75), 100.0 * q(0.9));
 }
