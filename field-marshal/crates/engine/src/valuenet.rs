@@ -12,7 +12,9 @@
 use crate::geom::{add, chebyshev, DIR_VEC};
 use crate::observe::can_see;
 use crate::state::State;
-use crate::valuefeat::{phi, NV};
+use crate::valuefeat::phi;
+/// The judgment features the network reads (the first 31; later ones are the judgment's own).
+const NV: usize = 31;
 use crate::Engine;
 
 /// Inputs for one fighter: `phi` plus ten (centre distances, walls next to it, and the
@@ -31,7 +33,7 @@ pub const NW: usize = IN * H1 + H1 + H1 * H2 + H2 + H2 + 1;
 /// One fighter's inputs.
 pub fn own(e: &Engine, s: &State, x: usize) -> [f32; OWN] {
     let mut v = [0.0f32; OWN];
-    v[..NV].copy_from_slice(&phi(e, s, x, true));
+    v[..NV].copy_from_slice(&phi(e, s, x, true)[..NV]);
     let f = &s.fighters[x];
     let c = e.map.center;
     v[NV] = (f.pos[0] - c[0]).abs() as f32 / 10.0;

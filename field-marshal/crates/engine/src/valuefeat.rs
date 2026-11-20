@@ -11,7 +11,9 @@ use crate::rules::AttackKind;
 use crate::state::{FState, State, NO_BUFF};
 use crate::Engine;
 
-pub const NV: usize = 31;
+/// Features per fighter: the basic 23, 8 extended, and 3 for part 2 v8 (slam threat held,
+/// loaded, heal race won).
+pub const NV: usize = 34;
 /// The first features, which the first generations of the judgment were fitted on; the
 /// rest (`EXTENDED`) cost more to compute and are skipped when their weights are all zero.
 pub const BASIC: usize = 23;
@@ -114,7 +116,7 @@ pub fn phi(e: &Engine, s: &State, x: usize, extended: bool) -> [f32; NV] {
             _ => {}
         }
     }
-    out[BASIC..].copy_from_slice(&[
+    out[BASIC..BASIC + 8].copy_from_slice(&[
         // a wall slam on us is there for the taking, or one dash away
         b(pinned && d <= 2 && their_burst <= 1 && o.state == FState::Idle && f.state != FState::Stunned),
         b(pinned && (3..=5).contains(&d) && their_burst <= 2 && o.cd_dash <= 1),
@@ -127,7 +129,52 @@ pub fn phi(e: &Engine, s: &State, x: usize, extended: bool) -> [f32; NV] {
         race_power,
         race_health,
     ]);
+    // part 2 v8: the slam threat this fighter holds, being loaded (dash and repulsor ready), and
+    // the heal it gets if it wins the race to a health pad
+    out[31] = b(slam_threat(e, s, x));
+    out[32] = b(loaded(e, s, x));
+    out[33] = heal_gain(e, s, x) / 32.0;
     out
+}
+
+thread_local! {
+    static PAD_MAPS: std::cell::RefCell<std::collections::HashMap<(String, P), Vec<u16>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// What fighter `x` heals if it reaches a health pad (up, or back within 60 ticks) before the
+/// other fighter: the pad's amount up to its missing hp, discounted 0.97 a tick; the best pad.
+pub fn heal_gain(e: &Engine, s: &State, x: usize) -> f32 {
+    let Some(h) = e.rules.pickups.as_ref().and_then(|p| p.health) else { return 0.0 };
+    let missing = (e.rules.max_hp - s.fighters[x].hp.max(0)).max(0);
+    if missing == 0 {
+        return 0.0;
+    }
+    let w = e.map.w;
+    let pace = e.rules.move_cooldown.max(1);
+    let mut best = 0.0f32;
+    for (i, def) in e.map.pads.iter().enumerate() {
+        if def.kind != PadKind::Health {
+            continue;
+        }
+        let back = if s.pads[i].available { 0 } else { s.pads[i].respawn_tick - s.tick };
+        if back > 60 {
+            continue;
+        }
+        let (a_me, a_them) = PAD_MAPS.with(|m| {
+            let mut m = m.borrow_mut();
+            let d = m.entry((e.map.name.clone(), def.pos)).or_insert_with(|| crate::goalmodel::dist_map(e, def.pos));
+            let at = |y: usize| {
+                let f = &s.fighters[y];
+                let dd = d.get((f.pos[1] * w + f.pos[0]) as usize).cloned().unwrap_or(u16::MAX);
+                if dd == u16::MAX || !f.alive { i32::MAX } else { (dd as i32 * pace).max(back) }
+            };
+            (at(x), at(1 - x))
+        });
+        if a_me < a_them && a_me <= 60 {
+            best = best.max(h.amount.min(missing) as f32 * 0.97f32.powi(a_me));
+        }
+    }
+    best
 }
 
 /// The slam threat fighter `a` holds over the other one (the research thread's rule, which flags
