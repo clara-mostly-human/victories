@@ -127,7 +127,7 @@ fn main() {
     let mode = args.first().cloned().unwrap_or_default();
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let num = |name: &str, d: f64| opt(name).and_then(|s| s.parse::<f64>().ok()).unwrap_or(d);
-    let valued = ["--slam-value", "--loaded-value", "--win-shape", "--top", "--out", "--shard", "--deep", "--losses", "--others", "--bench", "--threads", "--iters", "--lin", "--gen", "--net-value", "--net-cap", "--label"];
+    let valued = ["--heal-value", "--slam-value", "--loaded-value", "--win-shape", "--top", "--out", "--shard", "--deep", "--losses", "--others", "--bench", "--threads", "--iters", "--lin", "--gen", "--net-value", "--net-cap", "--label"];
     let mut files = Vec::new();
     let mut skip = false;
     for a in args.iter().skip(1) {
@@ -207,6 +207,7 @@ fn main() {
         win_shape: num("--win-shape", 0.0),
         slam_value: num("--slam-value", 0.0),
         loaded_value: num("--loaded-value", 0.0),
+        heal_value: num("--heal-value", 0.0),
         ..Default::default()
     };
     let iters = num("--iters", 3000.0) as u32;

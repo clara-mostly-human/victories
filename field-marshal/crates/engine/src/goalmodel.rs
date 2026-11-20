@@ -129,7 +129,10 @@ pub fn forecast(e: &Engine, s: &State, x: usize, trail: &[P], ticks: i32, min_sh
     if share < min_share {
         return here;
     }
-    walk(e, &gs[g].1, here, ticks, e.rules.move_cooldown.max(1))
+    // halfway along the goal's path at full speed: top bots hover about as often as they travel,
+    // and the midpoint is nearest to both on average
+    let to = walk(e, &gs[g].1, here, ticks, e.rules.move_cooldown.max(1));
+    [here[0] + (to[0] - here[0]) / 2, here[1] + (to[1] - here[1]) / 2]
 }
 
 /// Distance between two tiles, for reports.

@@ -77,6 +77,11 @@ pub struct Config {
     /// beyond row 13 on top-bot games: 3.5 and 1.2 hp.
     pub slam_value: f64,
     pub loaded_value: f64,
+    /// The heal race at the leaf, in hp times this weight: for each health pad up or back within
+    /// 60 ticks, the fighter who gets there first (path length at its move pace, or the pad's
+    /// return) gains what it would heal (the pad's amount, up to its missing hp), discounted 0.97
+    /// a tick. Being nearer the pad than a hurt opponent denies its heal: the leader keeps its lead.
+    pub heal_value: f64,
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
     /// fighters (bit 0 = fighter 0, bit 1 = fighter 1) whose standing shots may lead, in
@@ -105,7 +110,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -545,6 +550,37 @@ fn strategic_goal(e: &Engine, s: &State, x: usize, goals: &[(P, Vec<u16>)]) -> O
     if dist(c, f.pos) > 2 { Some(c) } else { None }
 }
 
+/// The heal race for fighter 0, in hp (see `Config::heal_value`); `goals` holds the pads' distance maps.
+fn heal_race(e: &Engine, s: &State, goals: &[(P, Vec<u16>)]) -> f64 {
+    let Some(h) = e.rules.pickups.as_ref().and_then(|p| p.health) else { return 0.0 };
+    let w = e.map.w;
+    let pace = e.rules.move_cooldown.max(1);
+    let mut v = 0.0;
+    for (i, def) in e.map.pads.iter().enumerate() {
+        if def.kind != PadKind::Health {
+            continue;
+        }
+        let Some((_, dist)) = goals.iter().find(|(p, _)| *p == def.pos) else { continue };
+        let back = if s.pads[i].available { 0 } else { s.pads[i].respawn_tick - s.tick };
+        if back > 60 {
+            continue;
+        }
+        let arrive = |x: usize| -> i32 {
+            let f = &s.fighters[x];
+            let d = dist.get((f.pos[1] * w + f.pos[0]) as usize).cloned().unwrap_or(u16::MAX);
+            if d == u16::MAX || !f.alive { i32::MAX } else { (d as i32 * pace).max(back) }
+        };
+        let (a0, a1) = (arrive(0), arrive(1));
+        if a0 == a1 || a0.min(a1) > 60 {
+            continue;
+        }
+        let x = if a0 < a1 { 0 } else { 1 };
+        let gain = h.amount.min(e.rules.max_hp - s.fighters[x].hp.max(0)).max(0) as f64 * 0.97f64.powi(a0.min(a1));
+        v += if x == 0 { gain } else { -gain };
+    }
+    v
+}
+
 /// A finished game's worth for fighter 0 under the win-chance leaf.
 fn outcome_value(s: &State, w: f64) -> f64 {
     match s.result.and_then(|r| r.winner) {
@@ -609,6 +645,9 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
     if cfg.slam_value != 0.0 && st.result.is_none() {
         v += cfg.slam_value * (crate::valuefeat::slam_threat(e, &st, 0) as i32 - crate::valuefeat::slam_threat(e, &st, 1) as i32) as f64;
     }
+    if cfg.heal_value != 0.0 && st.result.is_none() {
+        v += cfg.heal_value * heal_race(e, &st, goals);
+    }
     if cfg.loaded_value != 0.0 && st.result.is_none() {
         v += cfg.loaded_value * (crate::valuefeat::loaded(e, &st, 0) as i32 - crate::valuefeat::loaded(e, &st, 1) as i32) as f64;
     }
@@ -670,7 +709,7 @@ pub struct RootResult {
 
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, cfg: Config) -> Search<'a> {
-        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0, pairs: HashMap::new(), plans: Vec::new(), root_plan: [Vec::new(), Vec::new()], plan_kind: Vec::new(), plans_pending: false, goals: if cfg.plan_playout { e.map.pads.iter().map(|p| p.pos).chain(std::iter::once(e.map.center)).map(|p| (p, dist_map(e, p))).collect() } else { Vec::new() }, sample_every: 0, samples: Vec::new(), leaves: 0 }
+        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0, pairs: HashMap::new(), plans: Vec::new(), root_plan: [Vec::new(), Vec::new()], plan_kind: Vec::new(), plans_pending: false, goals: if cfg.plan_playout || cfg.heal_value != 0.0 { e.map.pads.iter().map(|p| p.pos).chain(std::iter::once(e.map.center)).map(|p| (p, dist_map(e, p))).collect() } else { Vec::new() }, sample_every: 0, samples: Vec::new(), leaves: 0 }
     }
 
     fn select(&self, node: usize, side: usize) -> usize {

@@ -185,6 +185,8 @@ pub struct Playbook {
     /// hp for a slam threat held at the leaf, and for being loaded (`mcts::Config::slam_value`, `loaded_value`).
     pub tree_slam_value: f64,
     pub tree_loaded_value: f64,
+    /// The heal race at the leaf (`mcts::Config::heal_value`).
+    pub tree_heal_value: f64,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
     pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
@@ -356,6 +358,7 @@ impl Default for Playbook {
             tree_win_shape: 0.0,
             tree_slam_value: 0.0,
             tree_loaded_value: 0.0,
+            tree_heal_value: 0.0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
@@ -441,6 +444,7 @@ impl Playbook {
         f("tree_win_shape", &mut p.tree_win_shape);
         f("tree_slam_value", &mut p.tree_slam_value);
         f("tree_loaded_value", &mut p.tree_loaded_value);
+        f("tree_heal_value", &mut p.tree_heal_value);
         f("tree_even", &mut p.tree_even);
         f("pad_bonus", &mut p.pad_bonus);
         f("attack_prior_weight", &mut p.attack_prior_weight);
@@ -1419,6 +1423,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         cfg.win_shape = pb.tree_win_shape;
         cfg.slam_value = pb.tree_slam_value;
         cfg.loaded_value = pb.tree_loaded_value;
+        cfg.heal_value = pb.tree_heal_value;
         if pb.tree_depth_buff > 0 && s.fighters.iter().any(|f| f.power_until != NO_BUFF && f.power_until > s.tick) {
             cfg.depth = pb.tree_depth_buff;
             if pb.tree_quiet_buff > 0 {
