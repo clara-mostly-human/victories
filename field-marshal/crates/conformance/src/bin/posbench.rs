@@ -127,7 +127,7 @@ fn main() {
     let mode = args.first().cloned().unwrap_or_default();
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let num = |name: &str, d: f64| opt(name).and_then(|s| s.parse::<f64>().ok()).unwrap_or(d);
-    let valued = ["--top", "--out", "--shard", "--deep", "--losses", "--others", "--bench", "--threads", "--iters", "--lin", "--gen", "--net-value", "--net-cap", "--label"];
+    let valued = ["--slam-value", "--loaded-value", "--win-shape", "--top", "--out", "--shard", "--deep", "--losses", "--others", "--bench", "--threads", "--iters", "--lin", "--gen", "--net-value", "--net-cap", "--label"];
     let mut files = Vec::new();
     let mut skip = false;
     for a in args.iter().skip(1) {
@@ -204,6 +204,9 @@ fn main() {
         own_priors: args.iter().any(|a| a == "--own-priors"),
         plans: args.iter().any(|a| a == "--plans"),
         plan_playout: args.iter().any(|a| a == "--plan-playout"),
+        win_shape: num("--win-shape", 0.0),
+        slam_value: num("--slam-value", 0.0),
+        loaded_value: num("--loaded-value", 0.0),
         ..Default::default()
     };
     let iters = num("--iters", 3000.0) as u32;
@@ -216,11 +219,11 @@ fn main() {
     let jobs: Vec<(&String, &Vec<&Value>)> = groups.iter().collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     // per group: n, regret sum, agree, ready, fired, frost, burst, dash, opp far5 stay, far5 step, far10 stay, far10 step, opp samples
-    let totals: Vec<[f64; 13]> = std::thread::scope(|sc| {
+    let totals: Vec<[f64; 15]> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads.max(1))
             .map(|_| {
                 sc.spawn(|| {
-                    let mut acc = vec![[0.0f64; 13]; 2];
+                    let mut acc = vec![[0.0f64; 15]; 2];
                     loop {
                         let j = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let Some((name, roots)) = jobs.get(j) else { break };
@@ -298,6 +301,10 @@ fn main() {
                                 a[10] += chebyshev(here, p10.fighters[o].pos) as f64;
                                 a[11] += chebyshev(ahead(5), p10.fighters[o].pos) as f64;
                                 a[12] += 1.0;
+                                // goal inference: its tiles over the last 8 ticks
+                                let trail: Vec<victris_engine::geom::P> = (tick.saturating_sub(8)..=tick).filter_map(|k| states.get(k)).map(|st| st.fighters[o].pos).collect();
+                                a[13] += chebyshev(victris_engine::goalmodel::forecast(e, root, o, &trail, 5, 0.4), p5.fighters[o].pos) as f64;
+                                a[14] += chebyshev(victris_engine::goalmodel::forecast(e, root, o, &trail, 10, 0.4), p10.fighters[o].pos) as f64;
                             }
                         }
                     }
@@ -305,11 +312,11 @@ fn main() {
                 })
             })
             .collect();
-        let mut t = vec![[0.0f64; 13]; 2];
+        let mut t = vec![[0.0f64; 15]; 2];
         for h in hs {
             let a = h.join().unwrap();
             for g in 0..2 {
-                for k in 0..13 {
+                for k in 0..15 {
                     t[g][k] += a[g][k];
                 }
             }
@@ -332,9 +339,9 @@ fn main() {
             100.0 * a[7] / n
         );
         if a[12] > 0.0 {
-            println!("  {:<24} opponent 5 ticks on: {:.2} tiles from standing still, {:.2} from its last step; 10 ticks: {:.2}, {:.2}", "", a[8] / a[12], a[9] / a[12], a[10] / a[12], a[11] / a[12]);
+            println!("  {:<24} opponent's tile, error in tiles 5 / 10 ticks on: standing still {:.2} / {:.2}, last step {:.2} / {:.2}, inferred goal {:.2} / {:.2}", "", a[8] / a[12], a[10] / a[12], a[9] / a[12], a[11] / a[12], a[13] / a[12], a[14] / a[12]);
         }
     }
-    let all: Vec<f64> = (0..13).map(|k| totals[0][k] + totals[1][k]).collect();
+    let all: Vec<f64> = (0..15).map(|k| totals[0][k] + totals[1][k]).collect();
     println!("  all {:>5} roots: regret {:.2} hp, agrees {:.1}%", all[0] as usize, all[1] / all[0].max(1.0), 100.0 * all[2] / all[0].max(1.0));
 }

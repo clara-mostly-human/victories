@@ -11,6 +11,7 @@
 pub mod clone;
 pub mod events;
 pub mod geom;
+pub mod goalmodel;
 pub mod hash;
 pub mod map;
 pub mod mcts;

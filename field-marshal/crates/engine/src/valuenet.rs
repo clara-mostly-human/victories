@@ -157,6 +157,18 @@ pub fn hp_to_come(e: &Engine, s: &State, x: usize, w: &[f32]) -> f32 {
     32.0 * (g(w, &a, &b, &c) - g(w, &b, &a, &c))
 }
 
+/// The win-chance curve for the search's leaf (`mcts::Config::win_shape`): log-odds of fighter 0
+/// winning from both fighters' hp (shares of max) and the share of the game played,
+/// z = c1*d + c2*d*t + c3*d/(h0+h1+0.15) with d = h0 - h1. Fitted by `winlab --curve` on 6,787
+/// games (held-out log loss 0.5495, hp lead alone 0.5588). The relative-lead term makes an even
+/// trade worth more to the side ahead: the trailer gets closer to death.
+pub const WIN_CURVE: [f32; 3] = [1.1572, 2.3839, 4.1186];
+
+pub fn win_logit(h0: f32, h1: f32, t: f32) -> f32 {
+    let d = h0 - h1;
+    WIN_CURVE[0] * d + WIN_CURVE[1] * d * t + WIN_CURVE[2] * d / (h0 + h1 + 0.15)
+}
+
 /// Fighter `x`'s chance of winning from this position, by the weights given.
 pub fn win_prob(e: &Engine, s: &State, x: usize, w: &[f32]) -> f32 {
     if w.len() != NW {

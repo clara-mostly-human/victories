@@ -66,6 +66,17 @@ pub struct Config {
     /// no later than the opponent, else the centre) while the quiet play-out still dodges and takes
     /// sure shots, so the leaf's judgment sees where strategic movement leads. The tree is untouched.
     pub plan_playout: bool,
+    /// The win-chance leaf (part 2): with a value W > 0 the search no longer adds up hp swings.
+    /// A leaf is worth W * (2p - 1), p the chance fighter 0 wins by `valuenet::win_logit` from
+    /// both fighters' hp at the end of the play-out (the judgment's hp shifting them) and the
+    /// time; a finished game is worth W, -W or 0. W near 48 keeps one hp about one unit at an
+    /// even mid-game position.
+    pub win_shape: f64,
+    /// hp for each slam threat a side holds at the leaf (`valuefeat::slam_threat`), fighter 0's
+    /// minus fighter 1's; and for being loaded (dash and repulsor both ready). Measured worth
+    /// beyond row 13 on top-bot games: 3.5 and 1.2 hp.
+    pub slam_value: f64,
+    pub loaded_value: f64,
     /// a fighter standing still may aim its shot at a tile the opponent could step to
     pub lead: bool,
     /// fighters (bit 0 = fighter 0, bit 1 = fighter 1) whose standing shots may lead, in
@@ -94,7 +105,7 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
     }
 }
 
@@ -534,6 +545,26 @@ fn strategic_goal(e: &Engine, s: &State, x: usize, goals: &[(P, Vec<u16>)]) -> O
     if dist(c, f.pos) > 2 { Some(c) } else { None }
 }
 
+/// A finished game's worth for fighter 0 under the win-chance leaf.
+fn outcome_value(s: &State, w: f64) -> f64 {
+    match s.result.and_then(|r| r.winner) {
+        Some(1) => w,
+        Some(_) => -w,
+        None => 0.0,
+    }
+}
+
+/// The win-chance leaf's worth for fighter 0: both fighters' hp, shifted by the judgment `j`
+/// (hp for fighter 0), read through the win-chance curve.
+fn win_shaped(e: &Engine, s: &State, j: f64, w: f64) -> f64 {
+    let max = e.rules.max_hp as f64;
+    let h0 = (s.fighters[0].hp.max(0) as f64 + j / 2.0).clamp(0.0, max);
+    let h1 = (s.fighters[1].hp.max(0) as f64 - j / 2.0).clamp(0.0, max);
+    let t = s.tick as f64 / e.rules.max_ticks.max(1) as f64;
+    let z = crate::valuenet::win_logit((h0 / max) as f32, (h1 / max) as f32, t as f32) as f64;
+    w * (2.0 / (1.0 + (-z).exp()) - 1.0)
+}
+
 pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2], goals: &[(P, Vec<u16>)]) -> f64 {
     let mut st = *s;
     let mut v = 0.0;
@@ -552,6 +583,10 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
         e.step(&mut st, &turns);
         v += reward(&st, before);
     }
+    if cfg.win_shape > 0.0 && st.result.is_some() {
+        return outcome_value(&st, cfg.win_shape);
+    }
+    let playout = v;
     let buff = |i: usize| if st.fighters[i].power_until == NO_BUFF { 0 } else { (st.fighters[i].power_until - st.tick).max(0) };
     v += cfg.buff_value * (buff(0) - buff(1)) as f64;
     if cfg.net_weight != 0.0 && st.result.is_none() {
@@ -570,6 +605,16 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
     }
     if cfg.value_weight != 0.0 && st.result.is_none() {
         v += cfg.value_weight * crate::valuefeat::value(e, &st, 0, crate::models::value_weights(cfg.value_gen)) as f64;
+    }
+    if cfg.slam_value != 0.0 && st.result.is_none() {
+        v += cfg.slam_value * (crate::valuefeat::slam_threat(e, &st, 0) as i32 - crate::valuefeat::slam_threat(e, &st, 1) as i32) as f64;
+    }
+    if cfg.loaded_value != 0.0 && st.result.is_none() {
+        v += cfg.loaded_value * (crate::valuefeat::loaded(e, &st, 0) as i32 - crate::valuefeat::loaded(e, &st, 1) as i32) as f64;
+    }
+    if cfg.win_shape > 0.0 {
+        // the judgment's terms (all but the play-out's hp swing, which the final hp already holds)
+        return win_shaped(e, &st, v - playout, cfg.win_shape);
     }
     v
 }
@@ -962,8 +1007,12 @@ impl<'a> Search<'a> {
                 let turns = [self.nodes[node].acts[0][i0].turn, self.nodes[node].acts[1][i1].turn];
                 let before = (s.fighters[0].hp, s.fighters[1].hp);
                 self.e.step(&mut s, &turns);
-                path.push((node, i0, i1, reward(&s, before)));
+                let r = if self.cfg.win_shape > 0.0 { 0.0 } else { reward(&s, before) };
+                path.push((node, i0, i1, r));
                 if s.result.is_some() {
+                    if self.cfg.win_shape > 0.0 {
+                        leaf = outcome_value(&s, self.cfg.win_shape);
+                    }
                     break;
                 }
                 if depth + 1 == self.cfg.depth {

@@ -130,6 +130,58 @@ pub fn phi(e: &Engine, s: &State, x: usize, extended: bool) -> [f32; NV] {
     out
 }
 
+/// The slam threat fighter `a` holds over the other one (the research thread's rule, which flags
+/// 94-98% of top bots' slams a tick ahead): `a` is idle with its repulsor ready; using only what is
+/// off cooldown it can reach a tile next to its victim this tick by a step, a dash, or a dash and
+/// then a step; and from that tile a wall or corner blocks within the push's reach behind the
+/// victim in the push direction.
+pub fn slam_threat(e: &Engine, s: &State, a: usize) -> bool {
+    let (f, v) = (&s.fighters[a], &s.fighters[1 - a]);
+    if f.state != FState::Idle || !f.alive || !v.alive {
+        return false;
+    }
+    let Some(burst) = e.rules.attacks.iter().position(|x| matches!(x.kind, AttackKind::Burst { .. })) else { return false };
+    if f.cd_attack[burst] != 0 {
+        return false;
+    }
+    let push = e.rules.attacks.iter().find_map(|x| if let AttackKind::Burst { push } = x.kind { Some(push) } else { None }).unwrap_or(0).max(1);
+    let mut from: Vec<P> = vec![f.pos];
+    if f.cd_dash == 0 {
+        for d in 0..8u8 {
+            let mut p = f.pos;
+            for _ in 0..e.rules.dash_distance {
+                let q = add(p, DIR_VEC[d as usize]);
+                if e.map.step_blocked(p, d) || q == v.pos {
+                    break;
+                }
+                p = q;
+            }
+            if p != f.pos {
+                from.push(p);
+            }
+        }
+    }
+    let mut reach: Vec<P> = from.clone();
+    if f.cd_move == 0 {
+        for p in &from {
+            for d in 0..8u8 {
+                let q = add(*p, DIR_VEC[d as usize]);
+                if !e.map.step_blocked(*p, d) && q != v.pos {
+                    reach.push(q);
+                }
+            }
+        }
+    }
+    reach.iter().any(|t| chebyshev(*t, v.pos) == 1 && wall_behind(e, v.pos, *t, push))
+}
+
+/// Fighter `x` is loaded: idle with its dash and its repulsor both ready.
+pub fn loaded(e: &Engine, s: &State, x: usize) -> bool {
+    let f = &s.fighters[x];
+    let burst = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Burst { .. }));
+    f.state == FState::Idle && f.cd_dash == 0 && burst.map(|b| f.cd_attack[b] == 0).unwrap_or(false)
+}
+
 /// The difference of the two fighters' vectors, from `x`'s point of view.
 pub fn diff(e: &Engine, s: &State, x: usize) -> [f32; NV] {
     diff_with(e, s, x, true)

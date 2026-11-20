@@ -612,6 +612,64 @@ fn main() {
         k as f32
     };
     let k_hp = fit1(&hp_of);
+    // --curve: the win-chance curve for the search's leaf: log-odds of fighter 0 winning from the
+    // two fighters' hp (shares of max) and the time, z = c1*d + c2*d*t + c3*d/(h0+h1+0.15) with
+    // d = h0 - h1 and t the share of the game played; fitted by Newton's method on the training
+    // positions; held-out accuracy and log loss against hp alone; prints the constants.
+    if args.iter().any(|a| a == "--curve") {
+        let feats = |i: usize| -> [f64; 3] {
+            let r = st.row(i);
+            let h0 = r[2] as f64 / Q as f64;
+            let h1 = r[2 + OWN] as f64 / Q as f64;
+            let t = r[2 + 2 * OWN] as f64 / Q as f64;
+            let d = h0 - h1;
+            [d, d * t, d / (h0 + h1 + 0.15)]
+        };
+        let mut c = [0.0f64; 3];
+        for _ in 0..30 {
+            let mut g = [0.0f64; 3];
+            let mut h = [[1e-6f64; 3]; 3];
+            for &i in train.iter().step_by(2) {
+                let f = feats(i);
+                let z: f64 = (0..3).map(|k| c[k] * f[k]).sum();
+                let p = 1.0 / (1.0 + (-z).exp());
+                let y = y_of(i) as f64;
+                for a in 0..3 {
+                    g[a] += (p - y) * f[a];
+                    for b in 0..3 {
+                        h[a][b] += p * (1.0 - p) * f[a] * f[b];
+                    }
+                }
+            }
+            // solve h * step = g (3x3, Cramer's rule)
+            let det = |m: &[[f64; 3]; 3]| m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+            let d0 = det(&h);
+            for k in 0..3 {
+                let mut m = h;
+                for r in 0..3 {
+                    m[r][k] = g[r];
+                }
+                c[k] -= det(&m) / d0;
+            }
+        }
+        let (mut acc, mut ll, mut acc_h, mut ll_h, mut n) = (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for &i in &test {
+            let f = feats(i);
+            let z: f64 = (0..3).map(|k| c[k] * f[k]).sum();
+            let p = 1.0 / (1.0 + (-z).exp());
+            let ph = 1.0 / (1.0 + (-(k_hp as f64) * hp_of(i) as f64).exp());
+            let y = y_of(i);
+            let hit = |p: f64| if (p - 0.5).abs() < 1e-9 { 0.5 } else { ((p > 0.5) == (y > 0.5)) as i32 as f64 };
+            acc += hit(p);
+            acc_h += hit(ph);
+            ll += logloss(p as f32, y);
+            ll_h += logloss(ph as f32, y);
+            n += 1.0;
+        }
+        println!("win curve: held-out accuracy {:.1}% log loss {:.4}; hp alone {:.1}% {:.4}", 100.0 * acc / n, ll / n, 100.0 * acc_h / n, ll_h / n);
+        println!("pub const WIN_CURVE: [f32; 3] = [{:.4}, {:.4}, {:.4}];", c[0], c[1], c[2]);
+        return;
+    }
     // hp per share of max hp in the store
     let max_hp = 130.0f32;
     eprintln!("hp alone: {:.4} log-odds per hp ({:.1} hp per unit)", k_hp / max_hp, max_hp / k_hp);
