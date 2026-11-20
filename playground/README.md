@@ -34,6 +34,18 @@ as on the ladder: the bot has not seen your turn for the tick when it chooses.
 From a replay, "Play <name> from here" takes a seat at any tick; our bot's brain plays the
 other seat from then on (on the first tick it can play what the replay recorded).
 
+## Field-marshal's games against the top 10
+
+"Load game…" lists field-marshal's ladder games against the bots ranked in the top 10 now
+(ranks from `data/standings-remote/standings.json`, games from `data/corpus-remote/index.jsonl`,
+replays already on this Mac), wins and losses, filtered by result, map, seat and opponent.
+A picked game opens at tick 0 with you in field-marshal's seat. → steps through the game as
+played. At every tick on the game's own line, field-marshal's move from the game is filled in:
+change it and press Space, and the opponent plays what it played in the game on that tick,
+then our bot's brain plays it from there (the opponent's real code is not available).
+"Bot plays it" (B) plays one tick of your seat with field-marshal's brain, "Bot plays on" (N)
+plays both seats tick after tick until you stop it.
+
 ## What the search panel shows
 
 For the tick just played: the turn the bot chose, the result it expected (hp, from its

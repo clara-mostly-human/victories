@@ -430,7 +430,9 @@ impl Session {
 
     fn node_brief(&self, id: usize) -> Value {
         let n = &self.nodes[id];
-        json!({ "id": id, "labels": [label(&self.engine, &n.turns[0]), label(&self.engine, &n.turns[1])], "by": n.by, "recorded": n.recorded })
+        let tick = n.state.tick - 1;
+        json!({ "id": id, "labels": [label(&self.engine, &n.turns[0]), label(&self.engine, &n.turns[1])], "by": n.by, "recorded": n.recorded,
+            "turns": [turn_json(tick, &n.turns[0], &self.engine), turn_json(tick, &n.turns[1], &self.engine)] })
     }
 
     fn pos_json(&self) -> Value {
@@ -667,6 +669,83 @@ impl App {
         Ok(())
     }
 
+    /// Field-marshal's ladder games against the bots now ranked in the top `top` of the
+    /// ladder (from the standings the fleet fetches, `data/standings-remote/standings.json`),
+    /// newest first, with the filters the page offers. Only games whose replay is on this machine.
+    fn top_games(&self, ours: &str, top: u64, map: &str, seat: u64, result: &str, opponent: &str) -> Value {
+        let standings: Value = std::fs::read_to_string(self.root.join("data/standings-remote/standings.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or(Value::Null);
+        let mut ranked: Vec<(String, u64, Value)> = standings
+            .get("leaderboard")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| {
+                        let rank = r.get("rank").and_then(Value::as_u64)?;
+                        (rank <= top).then(|| (r.get("name").and_then(Value::as_str).unwrap_or("").to_string(), rank, r.get("rating").cloned().unwrap_or(Value::Null)))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ranked.sort_by_key(|r| r.1);
+        let rank_of = |name: &str| ranked.iter().find(|r| r.0 == name).map(|r| r.1);
+        let mut rows: Vec<Value> = Vec::new();
+        let (mut wins, mut losses, mut draws, mut all) = (0, 0, 0, 0);
+        if let Ok(text) = std::fs::read_to_string(self.root.join("data/corpus-remote/index.jsonl")) {
+            for line in text.lines() {
+                if !line.contains(ours) {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+                let bots = v.get("bots").and_then(Value::as_array).cloned().unwrap_or_default();
+                let Some(me) = bots.iter().find(|b| b.get("name").and_then(Value::as_str) == Some(ours)) else { continue };
+                let Some(opp) = bots.iter().find(|b| b.get("name").and_then(Value::as_str) != Some(ours)) else { continue };
+                let opp_name = opp.get("name").and_then(Value::as_str).unwrap_or("");
+                let Some(rank) = rank_of(opp_name) else { continue };
+                if v.get("voided").and_then(Value::as_bool).unwrap_or(false) {
+                    continue;
+                }
+                let id = v.get("id").and_then(Value::as_str).unwrap_or("");
+                if self.replay_path(id).is_none() {
+                    continue;
+                }
+                let fighter = me.get("fighter").and_then(Value::as_u64).unwrap_or(0);
+                let res = match v.get("winner") {
+                    Some(Value::Null) | None => "draw",
+                    Some(w) if Some(w) == me.get("id") => "win",
+                    _ => "loss",
+                };
+                all += 1;
+                let m = v.get("map").and_then(Value::as_str).unwrap_or("");
+                if (!map.is_empty() && m != map) || (seat != 0 && fighter != seat) || (!opponent.is_empty() && opp_name != opponent) {
+                    continue;
+                }
+                match res {
+                    "win" => wins += 1,
+                    "loss" => losses += 1,
+                    _ => draws += 1,
+                }
+                if !result.is_empty() && res != result {
+                    continue;
+                }
+                rows.push(json!({
+                    "id": id, "ended": v.get("ended"), "map": m, "seat": fighter, "result": res, "reason": v.get("reason"), "ticks": v.get("final_tick"),
+                    "version": me.get("version"), "rating": me.get("rating_before"),
+                    "opponent": { "name": opp_name, "rank": rank, "rating": opp.get("rating_before"), "version": opp.get("version") },
+                }));
+            }
+        }
+        rows.sort_by(|a, b| b["ended"].as_str().unwrap_or("").cmp(a["ended"].as_str().unwrap_or("")));
+        json!({
+            "ours": ours, "top": top, "fetched": standings.get("fetched"), "all": all,
+            "counts": { "win": wins, "loss": losses, "draw": draws },
+            "opponents": ranked.iter().map(|r| json!({ "name": r.0, "rank": r.1, "rating": r.2 })).collect::<Vec<_>>(),
+            "rows": rows,
+        })
+    }
+
     fn list_replays(&self, q: &str, limit: usize) -> Value {
         let q = q.to_lowercase();
         let mut rows: Vec<Value> = Vec::new();
@@ -747,6 +826,13 @@ impl App {
         let seat_of = |v: Option<&Value>| -> Option<usize> { v.and_then(Value::as_u64).filter(|x| *x < 2).map(|x| x as usize) };
         match (req.method.as_str(), req.path.as_str()) {
             ("GET", "/api/state") => {}
+            ("GET", "/api/topgames") => {
+                let get = |key: &str| req.query.split('&').find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(percent_decode)).unwrap_or_default();
+                let ours = get("bot");
+                let ours = if ours.is_empty() { "field-marshal".to_string() } else { ours };
+                let top = get("top").parse().unwrap_or(10u64).clamp(1, 100);
+                return Ok(self.top_games(&ours, top, &get("map"), get("seat").parse().unwrap_or(0), &get("result"), &get("opponent")));
+            }
             ("GET", "/api/replays") => {
                 let get = |key: &str| req.query.split('&').find_map(|kv| kv.strip_prefix(&format!("{key}=")).map(percent_decode)).unwrap_or_default();
                 let limit = get("limit").parse().unwrap_or(200usize).min(2000);
@@ -841,6 +927,20 @@ impl App {
                     (p, name)
                 };
                 self.load_replay(&path, &name)?;
+                // "seat": take the seat of the bot of this name (or this fighter number) at once,
+                // so a move can be changed at any tick
+                match body.get("seat") {
+                    Some(Value::String(who)) => self.sess.human = self.sess.names.iter().position(|n| n == who),
+                    Some(Value::Number(x)) => self.sess.human = x.as_u64().filter(|x| (1..=2).contains(x)).map(|x| x as usize - 1),
+                    _ => {}
+                }
+                // "tick": open the game at this tick
+                if let Some(t) = body.get("tick").and_then(Value::as_i64) {
+                    let line = self.sess.line();
+                    if let Some(&n) = line.iter().find(|&&n| self.sess.nodes[n].state.tick as i64 == t).or(line.last()) {
+                        self.sess.cur = n;
+                    }
+                }
             }
             ("POST", "/api/seat") => {
                 self.sess.human = seat_of(body.get("seat"));

@@ -81,9 +81,11 @@
   dialog h3 { margin: 0 0 12px; font-size: 15px; }
   dialog label { display: grid; grid-template-columns: 120px 1fr; gap: 8px; align-items: center; margin: 7px 0; }
   dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
-  #rlist { max-height: 55vh; overflow: auto; margin-top: 8px; border: 1px solid var(--line); border-radius: 6px; }
-  #rlist tr { cursor: pointer; }
-  #rlist tr:hover td { background: #253041; }
+  #rlist, .rlist { max-height: 55vh; overflow: auto; margin-top: 8px; border: 1px solid var(--line); border-radius: 6px; }
+  #rlist tr, .rlist tr[data-id] { cursor: pointer; }
+  #rlist tr:hover td, .rlist tr[data-id]:hover td { background: #253041; }
+  .rlist th { position: sticky; top: 0; background: var(--panel); }
+  #dTop { min-width: min(820px, 92vw); }
   .win { color: var(--good); } .lose { color: var(--bad); }
   #busy { color: var(--warn); visibility: hidden; }
   details summary { cursor: pointer; color: var(--dim); }
@@ -93,7 +95,8 @@
 <div id="top">
   <h1>Victris playground</h1>
   <button id="bNew">New game…</button>
-  <button id="bLoad">Load replay…</button>
+  <button id="bTop" class="primary" title="field-marshal's ladder games against the current top 10">Load game…</button>
+  <button id="bLoad">All replays…</button>
   <button id="bSave" title="Write the current line as a replay file under data/playground/games">Save line</button>
   <button id="bSettings">Bot settings…</button>
   <span id="info"></span>
@@ -124,6 +127,7 @@
         <button class="primary" id="bGo">Play tick <kbd>Space</kbd></button>
         <button id="bClear">Clear <kbd>Esc</kbd></button>
         <button id="bBot" title="The bot's brain chooses this tick for your side">Bot plays it <kbd>B</kbd></button>
+        <button id="bOn" title="The bot's brain plays both sides, tick after tick, until you stop it or the game ends">Bot plays on ▶ <kbd>N</kbd></button>
       </div>
       <div class="row" style="margin-top:6px">
         <label class="hint"><input type="checkbox" id="cAuto" checked> pass ticks where I cannot act</label>
@@ -135,7 +139,7 @@
           Attack: <kbd>1</kbd> shot, <kbd>2</kbd> frostburst, <kbd>3</kbd> repulsor, then click the target tile. <kbd>F</kbd> shot at the opponent, <kbd>G</kbd> frostburst on the opponent, <kbd>R</kbd> repulsor.<br>
           Click a tile next to you to step there, or a dash landing (◇) to dash. Right-click clears.<br>
           With "I choose the bot's turn too", <kbd>Tab</kbd> switches between your turn and the bot's.<br>
-          <kbd>Space</kbd> play the tick. <kbd>←</kbd> <kbd>→</kbd> back and forward one tick, <kbd>Home</kbd> <kbd>End</kbd> first and last. <kbd>B</kbd> bot plays my tick. <kbd>P</kbd> peek.
+          <kbd>Space</kbd> play the tick. <kbd>←</kbd> <kbd>→</kbd> back and forward one tick, <kbd>Home</kbd> <kbd>End</kbd> first and last. <kbd>B</kbd> bot plays my tick, <kbd>N</kbd> bot plays on for both sides (again to stop). <kbd>P</kbd> peek.
         </div>
       </details>
     </div>
@@ -193,6 +197,20 @@
   <div class="actions"><button id="sCancel">Cancel</button><button class="primary" id="sGo">Apply</button></div>
 </dialog>
 
+<dialog id="dTop">
+  <h3>field-marshal against the top 10</h3>
+  <div class="row">
+    <select id="tResult"><option value="">wins and losses</option><option value="loss">losses only</option><option value="win">wins only</option></select>
+    <select id="tMap"><option value="">every map</option></select>
+    <select id="tSeat"><option value="0">either seat</option><option value="1">field-marshal as fighter 1</option><option value="2">field-marshal as fighter 2</option></select>
+    <select id="tOpp"><option value="">every top-10 opponent</option></select>
+  </div>
+  <div class="hint" id="tCount" style="margin-top:6px"></div>
+  <div id="tList" class="rlist"></div>
+  <div class="hint" style="margin-top:6px">Pick a game: it opens at the start with you in field-marshal's seat. Step through it with → (or click the timeline). At any tick, field-marshal's move from the game is filled in: change it and press Space, and the game goes on from there.</div>
+  <div class="actions"><button id="tCancel">Close</button></div>
+</dialog>
+
 <dialog id="dLoad">
   <h3>Load a replay</h3>
   <div class="row"><input id="rQ" placeholder="bot name, map, replay id…" style="flex:1" value="field-marshal"><button id="rSearch">Search</button></div>
@@ -244,6 +262,7 @@ async function call(path, body) {
 
 async function act(path, body, opts = {}) {
   clearTimeout(autoTimer);
+  if (!opts.keepRun && typeof playOn !== 'undefined' && playOn) { playOn = false; }
   if (!opts.keepRun) stopRun();
   const j = await call(path, body === undefined ? {} : body);
   if (!j) return false;
@@ -267,6 +286,7 @@ function setSnap(j, opts = {}) {
   S = j;
   staged = {move:null, dash:null, attack:null}; otherStaged = {move:null, dash:null, attack:null}; cs = null; armed = null; dashMode = false; preview = null;
   if (S.session.id !== lastSession) { lastSession = S.session.id; resize(); }
+  prefillRecorded();
   render();
   // The bot's choice for this tick, when peeking.
   const h = human();
@@ -295,6 +315,20 @@ function label(st) {
   if (st.dash) p.push('dash ' + st.dash);
   if (st.attack) p.push(st.attack.target ? `${st.attack.name} at ${st.attack.target}` : st.attack.name);
   return p.length ? p.join(' + ') : 'wait';
+}
+
+// On a replay's own line, the turn played there in the game is filled in, so changing a
+// move means editing it; Space with it unchanged follows the game, as → does.
+function recordedChild() { return S.pos.variations.find(v => v.recorded); }
+function fromJson(t) {
+  return {move: t.move || null, dash: t.dash || null, attack: t.attack ? (t.attack.target ? {name: t.attack.name, target: t.attack.target.slice()} : {name: t.attack.name}) : null};
+}
+function prefillRecorded() {
+  const h = human(), rc = recordedChild();
+  if (h == null || over() || !rc) return;
+  staged = fromJson(rc.turns[h]);
+  otherStaged = fromJson(rc.turns[1 - h]);
+  restage();
 }
 
 function switchSide() {
@@ -732,6 +766,12 @@ function renderTurn() {
     return `<button data-w="${a}" class="${cls}" ${done || !ready ? 'disabled' : ''}><span><kbd>${WEAPON_KEYS[a]}</kbd> ${WEAPON_NAMES[a]} <span class="hint">${what}</span></span><span class="num">${c[a] === 0 ? 'ready' : c[a]}</span></button>`;
   }).join('');
   let s = `<b>${esc(stagedLabel())}</b>`;
+  const rc = recordedChild();
+  if (rc && !both) {
+    const same = JSON.stringify(turnJson()) === JSON.stringify(turnJson(fromJson(rc.turns[h])));
+    s += same ? `<div class="hint">This is what ${esc(S.session.names[h])} played here in the game. Change it and press Space to try something else; → follows the game.</div>`
+              : `<div style="color:var(--warn)">Changed: in the game ${esc(S.session.names[h])} played <b>${esc(rc.labels[h])}</b>. Space plays your move; ${$('cKeep').checked ? `${esc(S.session.names[1 - h])} plays what it played in the game (${esc(rc.labels[1 - h])}) this tick, then our bot's brain plays it` : `our bot's brain plays ${esc(S.session.names[1 - h])}`}.</div>`;
+  }
   if (armed) s += ` <span style="color:var(--bad)">· click the tile to aim the ${WEAPON_NAMES[armed].toLowerCase()} at</span>`;
   if (preview) {
     const rej = preview.events.filter(e => e.kind === 'rejected' && e.fighter === h + 1);
@@ -741,7 +781,7 @@ function renderTurn() {
   }
   $('staged').innerHTML = s;
   $('turnhint').textContent = done ? 'game over here' : f.state !== 'idle' ? `${who === 'you' ? 'you are' : 'the bot is'} ${f.state}: no action possible` : !canAct(f) ? 'everything is on cooldown' : 'no clock: take your time';
-  $('bGo').disabled = done; $('bBot').disabled = done;
+  $('bGo').disabled = done; $('bBot').disabled = done; $('bOn').disabled = done && !playOn;
 }
 
 function thinkHtml(th, seat, title, actual) {
@@ -773,6 +813,9 @@ function thinkHtml(th, seat, title, actual) {
 function renderBot() {
   const h = human(), p = S.pos;
   let s = '';
+  // the bot played the seat played by hand on the last tick ("Bot plays it" or "Bot plays on"): its search first
+  if (h != null && p.prev_thoughts && p.prev_thoughts[h] && p.by && p.by[h] === 2)
+    s += thinkHtml(p.prev_thoughts[h], h, `Tick ${p.tick - 1}, the bot in your seat (${esc(S.session.names[h])}) chose`, p.labels ? p.labels[1 - h] : null);
   const seats = h == null ? [0, 1] : [1 - h];
   for (const seat of seats) {
     if (p.prev_thoughts && p.prev_thoughts[seat]) s += thinkHtml(p.prev_thoughts[seat], seat, `Tick ${p.tick - 1}, ${esc(S.session.names[seat])} chose`, p.labels ? p.labels[1 - seat] : null);
@@ -871,6 +914,19 @@ $('pad').addEventListener('click', e => { const b = e.target.closest('button'); 
 $('bDash').onclick = () => { dashMode = !dashMode; render(); };
 $('weapons').addEventListener('click', e => { const b = e.target.closest('button'); if (b) arm(b.dataset.w); });
 $('bGo').onclick = commit;
+let playOn = false;
+async function botPlaysOn() {
+  if (playOn) { playOn = false; $('bOn').innerHTML = 'Bot plays on ▶ <kbd>N</kbd>'; return; }
+  if (human() == null || over()) return;
+  playOn = true; $('bOn').innerHTML = 'Stop ⏸ <kbd>N</kbd>';
+  while (playOn && S && !over()) {
+    if (!(await act('/api/botmove', {}, {keepRun: true}))) break;
+    $('bOn').innerHTML = 'Stop ⏸ <kbd>N</kbd>';
+    await new Promise(r => setTimeout(r, 60));
+  }
+  playOn = false; $('bOn').innerHTML = 'Bot plays on ▶ <kbd>N</kbd>';
+}
+$('bOn').onclick = botPlaysOn;
 $('bSide').onclick = switchSide;
 $('cBoth').onchange = () => { both = $('cBoth').checked; if (!both && cs != null && cs !== human()) switchSide0(); cs = null; armed = null; restage(); };
 function switchSide0() { const t = staged; staged = otherStaged; otherStaged = t; }
@@ -921,6 +977,7 @@ document.addEventListener('keydown', e => {
   else if (k === 'KeyG') aimAtEnemy('frostburst');
   else if (k === 'KeyR') arm('repulsor');
   else if (k === 'KeyB') { if (!busy) act('/api/botmove', {}, {played: true}); }
+  else if (k === 'KeyN') botPlaysOn();
   else used = false;
   if (used) e.preventDefault();
 });
@@ -973,6 +1030,39 @@ async function searchReplays() {
   $('rlist').innerHTML = s;
 }
 $('bLoad').onclick = () => { $('dLoad').showModal(); searchReplays(); };
+
+const tMaps = ['arena-21', 'columns-21', 'pillars-21'];
+let topOpps = null;
+async function searchTop() {
+  const q = new URLSearchParams({result: $('tResult').value, map: $('tMap').value, seat: $('tSeat').value, opponent: $('tOpp').value});
+  const r = await call('/api/topgames?' + q);
+  if (!r) return;
+  if (!topOpps) {
+    topOpps = r.opponents;
+    $('tOpp').innerHTML = '<option value="">every top-10 opponent</option>' + r.opponents.map(o => `<option value="${esc(o.name)}">#${o.rank} ${esc(o.name)} (${o.rating})</option>`).join('');
+  }
+  const c = r.counts, shown = r.rows.length;
+  const when = r.fetched ? new Date(r.fetched).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'}) : 'unknown';
+  $('tCount').innerHTML = `${c.win + c.loss + c.draw} games with these filters: <span class="win">${c.win} won</span>, <span class="lose">${c.loss} lost</span>${c.draw ? `, ${c.draw} drawn` : ''}. Top 10 as of the standings fetched ${esc(when)}; ranks are today's, ratings are from the day of the game.`;
+  if (!shown) { $('tList').innerHTML = '<div class="hint" style="padding:10px">No games match.</div>'; return; }
+  $('tList').innerHTML = '<table><tr><th>played</th><th>map</th><th>seat</th><th>opponent</th><th>result</th><th class="n">ticks</th></tr>' + r.rows.map(x => {
+    const d = x.ended ? new Date(x.ended).toLocaleString([], {month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'}) : '';
+    return `<tr data-id="${esc(x.id)}"><td class="num">${esc(d)}</td><td>${esc(x.map)}</td><td>${x.seat}</td>
+      <td><span class="hint">#${x.opponent.rank}</span> ${esc(x.opponent.name)} <span class="hint">${x.opponent.rating || ''}</span></td>
+      <td class="${x.result === 'win' ? 'win' : x.result === 'loss' ? 'lose' : ''}">${x.result === 'win' ? 'won' : x.result === 'loss' ? 'lost' : 'draw'} <span class="hint">${esc((x.reason || '').replace(/_/g, ' '))}</span></td>
+      <td class="n num">${x.ticks}</td></tr>`;
+  }).join('') + '</table>';
+}
+$('bTop').onclick = () => {
+  if ($('tMap').options.length === 1) $('tMap').innerHTML += tMaps.map(m => `<option>${m}</option>`).join('');
+  $('dTop').showModal(); searchTop();
+};
+['tResult', 'tMap', 'tSeat', 'tOpp'].forEach(id => $(id).onchange = searchTop);
+$('tCancel').onclick = () => $('dTop').close();
+$('tList').addEventListener('click', async e => {
+  const tr = e.target.closest('tr[data-id]'); if (!tr) return;
+  if (await act('/api/load', {id: tr.dataset.id, seat: 'field-marshal'})) $('dTop').close();
+});
 $('rSearch').onclick = searchReplays;
 $('rQ').addEventListener('keydown', e => { if (e.key === 'Enter') searchReplays(); });
 $('rCancel').onclick = () => $('dLoad').close();
