@@ -113,7 +113,17 @@ pub fn build(root: &Path, store: &Store, git_ref: &str, note: Option<&str>, test
     }
     if tests {
         eprintln!("running the tests");
-        sh(&mut cargo(&["test", "--release", "--workspace"]), "cargo test")?;
+        // The tests build without link-time optimisation and with many codegen units, in a
+        // target folder of their own: a fat-LTO link of every test binary took most of a
+        // release's time, and the shipped binaries in `target` must stay the fully
+        // optimised ones built above (a test build with other settings in the same folder
+        // would overwrite them before they are copied).
+        let mut test = cargo(&["test", "--release", "--workspace"]);
+        test.env("CARGO_TARGET_DIR", build_dir.join("target-test"))
+            .env("CARGO_PROFILE_RELEASE_LTO", "off")
+            .env("CARGO_PROFILE_RELEASE_CODEGEN_UNITS", "16")
+            .env("CARGO_PROFILE_RELEASE_DEBUG", "0");
+        sh(&mut test, "cargo test")?;
     }
     let seq = store.next_release_seq().map_err(|e| e.to_string())?;
     let id = format!("r{seq}-{short}");
@@ -530,6 +540,11 @@ pub fn promote(root: &Path, store: &Store, cfg: &Config, id: &str, force: Option
         if b.managed {
             out.push((b.name.clone(), deploy(root, store, cfg, &b.name, id, None, force.or(Some("promote")))?));
         } else {
+            // Not deployed by us, but the store should still say which release it is on (the
+            // status page and the gateway's label bookkeeping read it); its label stays.
+            if let Some(version) = store.bot_state(&b.name).ok().flatten().and_then(|s| s.version) {
+                store.set_deployment(&b.name, id, &version, "promote (follows data/releases/live)").map_err(|e| e.to_string())?;
+            }
             eprintln!("{} follows data/releases/live, which now points at {}; its own thread restarts it", b.name, PathBuf::from(&r.path).display());
         }
     }

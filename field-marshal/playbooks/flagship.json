@@ -1,6 +1,6 @@
 {
   "default": {
-    "name": "slam-prior",
+    "name": "learned",
     "tree_ms": 150,
     "tree_value": 1.0,
     "tree_gen": 13,
@@ -9,7 +9,8 @@
     "tree_quiet_buff": 10,
     "tree_threads": 1,
     "tree_reuse": true,
-    "tree_slam_prior": 0.228
+    "tree_slam_prior": 0.228,
+    "tree_pv_dir": "/Users/clara/Projects/victris/field-marshal/models/pv"
   },
   "opponents": {}
 }
