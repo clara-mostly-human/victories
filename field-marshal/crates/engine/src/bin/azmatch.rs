@@ -1,6 +1,7 @@
 //! azmatch: plays two searches against each other on the exact engine, everything in sight.
 //!
 //!   azmatch --a SPEC --b SPEC [--games 100] [--seed 1] [--threads 4] [--map columns-21] [--open 10]
+//!           [--book GAMES.az] [--soft 0]
 //!
 //! SPEC is `flag:N` (the flagship's search, the live playbook's settings, N lines a tick),
 //! `pv:NET.json:N` (the network-led search), or either with `Nms` in place of N for a time
@@ -8,10 +9,17 @@
 //! most visited turn. Both searches are repeatable, so without help every game would be one of
 //! two: each pair of games starts with --open ticks of random steps (no attacks, no dashes),
 //! the same steps for both games of the pair, and the two players swap sides between them.
+//! Those openings are not enough: nothing has happened yet, so many games settle into the same
+//! few games anyway. With --book each pair instead starts from a position out of a saved game
+//! (azgen's file): a random tick from 20 to 220 with both alive and the hp within 20.
+//! --soft K tests play from the spawn instead: before tick K each player draws its turn in
+//! proportion to its own search's visits, so every game is different and each player still
+//! plays its own opening (use with --open 0).
 
+use victris_engine::azdata::GameLog;
 use victris_engine::mcts;
 use victris_engine::pvnet::PvNet;
-use victris_engine::pvsearch::{self, outcome, PvConfig, Rng};
+use victris_engine::pvsearch::{self, outcome, pick, PvConfig, Rng};
 use victris_engine::state::{FState, State};
 use victris_engine::{Engine, RawTurn};
 
@@ -43,7 +51,7 @@ fn parse(spec: &str) -> Player {
 }
 
 /// The player's turn for fighter `x` at `s`, the lines it searched and how deep the average line went.
-fn think(e: &Engine, p: &Player, flag: mcts::Config, s: &State, x: usize) -> (RawTurn, u64, f64) {
+fn think(e: &Engine, p: &Player, flag: mcts::Config, s: &State, x: usize) -> (RawTurn, u64, f64, Vec<(RawTurn, u32)>) {
     let started = std::time::Instant::now();
     let mut lines = 0u64;
     match &p.net {
@@ -62,7 +70,8 @@ fn think(e: &Engine, p: &Player, flag: mcts::Config, s: &State, x: usize) -> (Ra
                 }
             }
             let depth: u64 = search.depth_hist.iter().enumerate().map(|(d, n)| d as u64 * n).sum();
-            (search.best(x), lines, depth as f64 / lines.max(1) as f64)
+            let visits: Vec<(RawTurn, u32)> = search.root()[x].iter().map(|v| (v.0, v.1)).collect();
+            (search.best(x), lines, depth as f64 / lines.max(1) as f64, visits)
         }
         None => {
             let mut search = mcts::Search::new(e, flag);
@@ -80,7 +89,8 @@ fn think(e: &Engine, p: &Player, flag: mcts::Config, s: &State, x: usize) -> (Ra
                 }
             }
             let r = search.result();
-            (r.acts[x].iter().max_by_key(|a| a.1).map(|a| a.0).unwrap_or(RawTurn::IDLE), lines, 0.0)
+            let visits: Vec<(RawTurn, u32)> = r.acts[x].iter().map(|a| (a.0, a.1)).collect();
+            (r.acts[x].iter().max_by_key(|a| a.1).map(|a| a.0).unwrap_or(RawTurn::IDLE), lines, 0.0, visits)
         }
     }
 }
@@ -93,6 +103,11 @@ fn main() {
     let threads: usize = arg(&args, "--threads", 4);
     let map: String = arg(&args, "--map", String::from("columns-21"));
     let open: i32 = arg(&args, "--open", 10);
+    // AZ_GAMES=1 prints a line for each game
+    let list = std::env::var("AZ_GAMES").is_ok();
+    let soft: i32 = arg(&args, "--soft", 0);
+    let book_path: String = arg(&args, "--book", String::new());
+    let book: Vec<GameLog> = if book_path.is_empty() { Vec::new() } else { GameLog::read_all(&std::fs::read(&book_path).expect("cannot read the book")) };
     let players = [parse(&sa), parse(&sb)];
     let e = Engine::shipped(&map);
     let flag = mcts::Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, slam_prior: 0.228, ..Default::default() };
@@ -113,7 +128,29 @@ fn main() {
                         let side = g % 2;
                         let mut s = e.new_match(seed.wrapping_mul(7919).wrapping_add((g / 2) as i64));
                         let mut rng = Rng::new((seed as u64).wrapping_mul(104_729).wrapping_add((g / 2) as u64));
+                        if !book.is_empty() {
+                            // a position out of a saved game, the same one for both games of the pair
+                            let mut seen = Vec::new();
+                            for _ in 0..20 {
+                                seen.clear();
+                                if !book[rng.below(book.len())].samples(&e, &mut seen) {
+                                    continue;
+                                }
+                                let fit: Vec<usize> = (0..seen.len())
+                                    .filter(|i| {
+                                        let t = &seen[*i].s;
+                                        t.tick >= 20 && t.tick <= 220 && t.fighters[0].alive && t.fighters[1].alive && (t.fighters[0].hp - t.fighters[1].hp).abs() <= 20
+                                    })
+                                    .collect();
+                                if !fit.is_empty() {
+                                    s = seen[fit[rng.below(fit.len())]].s;
+                                    break;
+                                }
+                            }
+                        }
                         let mut buf = Vec::new();
+                        // this game's own draws, for --soft
+                        let mut own = Rng::new((seed as u64).wrapping_mul(15_485_863).wrapping_add(g as u64));
                         while s.result.is_none() {
                             let mut pair = [RawTurn::IDLE, RawTurn::IDLE];
                             for x in 0..2 {
@@ -123,8 +160,8 @@ fn main() {
                                     pair[x] = buf[rng.below(buf.len())];
                                 } else if s.fighters[x].alive && s.fighters[x].state == FState::Idle {
                                     let who = if x == side { 0 } else { 1 };
-                                    let (t, lines, depth) = think(&e, &players[who], flag, &s, x);
-                                    pair[x] = t;
+                                    let (t, lines, depth, visits) = think(&e, &players[who], flag, &s, x);
+                                    pair[x] = if s.tick < soft { pick(&visits, 1.0, &mut own) } else { t };
                                     st[6 + who * 3] += lines as f64;
                                     st[7 + who * 3] += 1.0;
                                     st[8 + who * 3] += depth;
@@ -140,6 +177,9 @@ fn main() {
                         st[3] += s.fighters[side].hp.max(0) as f64;
                         st[4] += s.fighters[1 - side].hp.max(0) as f64;
                         st[5] += s.tick as f64;
+                        if list {
+                            println!("game {g} side {side} ticks {} hp a {} b {} a's result {a_result}", s.tick, s.fighters[side].hp.max(0), s.fighters[1 - side].hp.max(0));
+                        }
                     }
                     st
                 })
