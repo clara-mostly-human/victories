@@ -176,52 +176,95 @@ impl<'a> Search<'a> {
             self.nodes.push(nd);
         }
         for _ in 0..count {
-            let mut s = *root;
-            let mut node = 0usize;
-            self.path.clear();
-            let value;
-            loop {
-                let (i0, i1) = (self.select(node, 0), self.select(node, 1));
-                self.path.push((node as u32, i0 as u16, i1 as u16));
-                let pair = [self.nodes[node].acts[0][i0].turn, self.nodes[node].acts[1][i1].turn];
-                self.e.step(&mut s, &pair);
-                if let Some(v) = outcome(&s) {
-                    value = v;
-                    break;
+            self.line(root, None);
+        }
+    }
+
+    /// Searching while waiting for the next tick: `count` lines from `root` that all begin
+    /// with the turn fighter `me` has already sent, so the work lands under the positions the
+    /// game can now move to and `advance_to` finds it there. The opponent's first turn is
+    /// spread over its turns in proportion to the visits they already have (not by what does
+    /// best against our turn, which it cannot know). False when `ours` is not one of the
+    /// root's turns or nothing was searched from `root` yet: nothing is done then.
+    pub fn ponder(&mut self, root: &State, me: usize, ours: &RawTurn, count: u32) -> bool {
+        if root.result.is_some() || self.nodes.is_empty() {
+            return false;
+        }
+        let Some(mine) = self.nodes[0].acts[me].iter().position(|a| a.turn == *ours) else { return false };
+        let theirs: Vec<f64> = self.nodes[0].acts[1 - me].iter().map(|a| a.n as f64).collect();
+        let total: f64 = theirs.iter().sum();
+        if total <= 0.0 {
+            return false;
+        }
+        let mut given = vec![0u32; theirs.len()];
+        for j in 0..count {
+            // the opponent turn furthest behind its share
+            let mut best = (f64::MIN, 0usize);
+            for (i, n) in theirs.iter().enumerate() {
+                let behind = n / total * (j + 1) as f64 - given[i] as f64;
+                if *n > 0.0 && behind > best.0 {
+                    best = (behind, i);
                 }
-                let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
-                match self.index.get(&key) {
-                    Some(&child) => {
-                        node = child as usize;
-                        if self.path.len() as u32 >= self.cfg.depth {
-                            value = self.nodes[node].v;
-                            break;
-                        }
-                    }
-                    None => {
-                        let child = self.expand(&s, self.cfg.even);
-                        value = child.v;
-                        if self.nodes.len() < self.cfg.max_nodes {
-                            let id = self.nodes.len() as u32;
-                            self.index.insert(key, id);
-                            self.nodes[node].kids.push(((i0 as u32) << 16 | i1 as u32, id));
-                            self.nodes.push(child);
-                        }
+            }
+            given[best.1] += 1;
+            let first = if me == 0 { (mine, best.1) } else { (best.1, mine) };
+            self.line(root, Some(first));
+        }
+        true
+    }
+
+    /// One line from `root` to a new position or the end of the game; `first` fixes both
+    /// fighters' turns at the root.
+    fn line(&mut self, root: &State, first: Option<(usize, usize)>) {
+        let mut s = *root;
+        let mut node = 0usize;
+        self.path.clear();
+        let value;
+        loop {
+            let (i0, i1) = match first {
+                Some(pair) if node == 0 => pair,
+                _ => (self.select(node, 0), self.select(node, 1)),
+            };
+            self.path.push((node as u32, i0 as u16, i1 as u16));
+            let pair = [self.nodes[node].acts[0][i0].turn, self.nodes[node].acts[1][i1].turn];
+            self.e.step(&mut s, &pair);
+            if let Some(v) = outcome(&s) {
+                value = v;
+                break;
+            }
+            let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
+            match self.index.get(&key) {
+                Some(&child) => {
+                    node = child as usize;
+                    if self.path.len() as u32 >= self.cfg.depth {
+                        value = self.nodes[node].v;
                         break;
                     }
                 }
+                None => {
+                    let child = self.expand(&s, self.cfg.even);
+                    value = child.v;
+                    if self.nodes.len() < self.cfg.max_nodes {
+                        let id = self.nodes.len() as u32;
+                        self.index.insert(key, id);
+                        self.nodes[node].kids.push(((i0 as u32) << 16 | i1 as u32, id));
+                        self.nodes.push(child);
+                    }
+                    break;
+                }
             }
-            self.depth_hist[self.path.len().min(63)] += 1;
-            for &(n, i0, i1) in &self.path {
-                let nd = &mut self.nodes[n as usize];
-                nd.n += 1;
-                let a = &mut nd.acts[0][i0 as usize];
-                a.n += 1;
-                a.w += value;
-                let b = &mut nd.acts[1][i1 as usize];
-                b.n += 1;
-                b.w -= value;
-            }
+        }
+        self.depth_hist[self.path.len().min(63)] += 1;
+        for k in 0..self.path.len() {
+            let (n, i0, i1) = self.path[k];
+            let nd = &mut self.nodes[n as usize];
+            nd.n += 1;
+            let a = &mut nd.acts[0][i0 as usize];
+            a.n += 1;
+            a.w += value;
+            let b = &mut nd.acts[1][i1 as usize];
+            b.n += 1;
+            b.w -= value;
         }
     }
 
@@ -230,6 +273,44 @@ impl<'a> Search<'a> {
         let list = |x: usize| match self.nodes.first() {
             Some(nd) => nd.acts[x].iter().map(|a| (a.turn, a.n, if a.n > 0 { a.w / a.n as f32 } else { 0.0 })).collect(),
             None => vec![(RawTurn::IDLE, 0, 0.0)],
+        };
+        [list(0), list(1)]
+    }
+
+    /// Each fighter's turns at the root with the visits each one earned: its visits less the
+    /// ones it only got because the root was made to look wider than the search looks
+    /// anywhere else (`even_root` above `even`, as self-play asks). A turn other than the most
+    /// visited keeps at most the visits that bring its upper bound, counted with its ordinary
+    /// share, level with the most visited turn's. What is left is what the search found, not
+    /// what it was told to try: a network taught the plain visits learns the extra width as if
+    /// it were a finding, and its shares stay blurred however many generations it trains.
+    pub fn root_earned(&self) -> [Vec<(RawTurn, f32)>; 2] {
+        let list = |x: usize| -> Vec<(RawTurn, f32)> {
+            let Some(nd) = self.nodes.first() else {
+                return vec![(RawTurn::IDLE, 0.0)];
+            };
+            let acts = &nd.acts[x];
+            let (even, wide) = (self.cfg.even, self.cfg.even_root);
+            let flat = 1.0 / acts.len().max(1) as f32;
+            // the share this turn would have anywhere but at the root
+            let share = |a: &Act| (1.0 - even) * ((a.prior - wide * flat) / (1.0 - wide).max(1e-6)).max(0.0) + even * flat;
+            let root_n = (nd.n.max(1) as f32).sqrt();
+            let top = (0..acts.len()).max_by_key(|i| acts[*i].n).unwrap_or(0);
+            if acts.is_empty() || acts[top].n == 0 {
+                return acts.iter().map(|a| (a.turn, 0.0)).collect();
+            }
+            let bound = acts[top].w / acts[top].n as f32 + self.cfg.c * share(&acts[top]) * root_n / (1.0 + acts[top].n as f32);
+            acts.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if i == top || a.n == 0 {
+                        return (a.turn, a.n as f32);
+                    }
+                    let gap = bound - a.w / a.n as f32;
+                    let earned = if gap > 1e-6 { (self.cfg.c * share(a) * root_n / gap - 1.0).clamp(0.0, a.n as f32) } else { a.n as f32 };
+                    (a.turn, earned)
+                })
+                .collect()
         };
         [list(0), list(1)]
     }

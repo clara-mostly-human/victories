@@ -27,6 +27,23 @@ pub struct GameLog {
     pub ticks: Vec<TickLog>,
 }
 
+/// Earned visits (`Search::root_earned`) by kind of turn, as shares out of 255. A kind that
+/// earned less than half a visit is left out.
+pub fn shares_earned(visits: &[(RawTurn, f32)]) -> [u8; CLASSES] {
+    let mut by = [0.0f32; CLASSES];
+    for (t, n) in visits {
+        by[class_of(t)] += *n;
+    }
+    let total: f32 = by.iter().filter(|v| **v >= 0.5).sum();
+    let mut out = [0u8; CLASSES];
+    for c in 0..CLASSES {
+        if by[c] >= 0.5 && total > 0.0 {
+            out[c] = ((by[c] as f64 / total as f64) * 255.0).round().max(1.0) as u8;
+        }
+    }
+    out
+}
+
 /// Visits by kind of turn, as shares out of 255 (a visited kind never rounds down to zero).
 pub fn shares(visits: &[(RawTurn, u32)]) -> [u8; CLASSES] {
     let mut by = [0u32; CLASSES];

@@ -3,7 +3,7 @@
 //! play has its own kind, the map's mirror images are the same game, and the search keeps its
 //! tree from one tick to the next.
 
-use victris_engine::azdata::{shares, GameLog, TickLog};
+use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
 use victris_engine::pvnet::{class_of, encode, layout, loss_grad, turns, Inputs, PvNet, Sample, Scratch, Sym, CLASSES, IN};
 use victris_engine::pvsearch::{pick, PvConfig, Rng, Search};
 use victris_engine::{Engine, RawTurn};
@@ -275,4 +275,94 @@ fn the_search_keeps_its_tree_between_ticks() {
         }
     }
     assert!(kept_any, "the most visited pair of turns should have been searched at least once");
+}
+
+#[test]
+fn pondering_fills_the_tree_under_the_turn_already_sent() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(11);
+    let mut s = e.new_match(3);
+    let (mut plain_kept, mut ponder_kept, mut ticks) = (0u64, 0u64, 0u32);
+    for _ in 0..30 {
+        if s.result.is_some() {
+            break;
+        }
+        // two searches of the same position; one also ponders under fighter 0's turn
+        let mut plain = Search::new(&e, &net, PvConfig::default());
+        plain.iterate(&s, 400);
+        let mut pondered = Search::new(&e, &net, PvConfig::default());
+        pondered.iterate(&s, 400);
+        let ours = pondered.best(0);
+        assert_eq!(ours, plain.best(0), "the same search twice gives the same turn");
+        assert!(pondered.ponder(&s, 0, &ours, 400));
+        // every pondered line began with our turn, and the counts still add up
+        let root = pondered.root();
+        let mine = root[0].iter().find(|a| a.0 == ours).unwrap().1;
+        let plain_mine = plain.root()[0].iter().find(|a| a.0 == ours).unwrap().1;
+        assert_eq!(mine, plain_mine + 400);
+        assert_eq!(root[0].iter().map(|a| a.1).sum::<u32>(), 800);
+        assert_eq!(root[1].iter().map(|a| a.1).sum::<u32>(), 800);
+        // the opponent's turns keep their shares: none gains more than its share of 400 plus one
+        for (a, b) in plain.root()[1].iter().zip(root[1].iter()) {
+            let share = a.1 as f64 / 400.0 * 400.0;
+            assert!((b.1 - a.1) as f64 <= share + 1.0, "an opponent turn with {} visits got {} more", a.1, b.1 - a.1);
+        }
+        // the game moves on with our turn and the opponent's most visited one
+        let pair = [ours, plain.best(1)];
+        let old = s;
+        e.step(&mut s, &pair);
+        if s.result.is_some() {
+            break;
+        }
+        if plain.advance_to(&old, &s) && pondered.advance_to(&old, &s) {
+            assert!(pondered.visits() >= plain.visits());
+            plain_kept += plain.visits() as u64;
+            ponder_kept += pondered.visits() as u64;
+            ticks += 1;
+        }
+    }
+    assert!(ticks > 5, "the tree should carry over on most ticks");
+    assert!(ponder_kept as f64 > 1.5 * plain_kept as f64, "pondering kept {ponder_kept} visits against {plain_kept} without");
+    // a turn that is not at the root is refused
+    let mut search = Search::new(&e, &net, PvConfig::default());
+    assert!(!search.ponder(&s, 0, &RawTurn::IDLE, 10), "nothing searched yet");
+}
+
+#[test]
+fn earned_visits_leave_out_what_the_wide_root_forced() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(11);
+    let mut s = e.new_match(3);
+    // a few ticks in, so both fighters have a choice of turns
+    for _ in 0..6 {
+        e.step(&mut s, &[RawTurn::IDLE, RawTurn::IDLE]);
+    }
+    let mut wide = Search::new(&e, &net, PvConfig { even_root: 0.25, ..Default::default() });
+    wide.iterate(&s, 800);
+    let (plain, earned) = (wide.root(), wide.root_earned());
+    for x in 0..2 {
+        assert_eq!(plain[x].len(), earned[x].len());
+        let top = (0..plain[x].len()).max_by_key(|i| plain[x][*i].1).unwrap();
+        let mut kept = 0.0f32;
+        for i in 0..plain[x].len() {
+            assert_eq!(plain[x][i].0, earned[x][i].0);
+            assert!(earned[x][i].1 >= 0.0 && earned[x][i].1 <= plain[x][i].1 as f32, "fighter {x} turn {i}: earned {} of {}", earned[x][i].1, plain[x][i].1);
+            kept += earned[x][i].1;
+        }
+        // the most visited turn keeps every visit; the width's visits are gone from the others
+        assert_eq!(earned[x][top].1, plain[x][top].1 as f32);
+        let all: u32 = plain[x].iter().map(|a| a.1).sum();
+        assert!(kept < all as f32, "fighter {x}: nothing was taken out ({kept} of {all})");
+        // saved as shares: they add up to the whole, and fewer kinds of turn carry any
+        let (a, b) = (shares(&plain[x].iter().map(|v| (v.0, v.1)).collect::<Vec<_>>()), shares_earned(&earned[x]));
+        let total: u32 = b.iter().map(|v| *v as u32).sum();
+        assert!((230..=290).contains(&total), "fighter {x}: shares add up to {total}");
+        assert!(b.iter().filter(|v| **v > 0).count() <= a.iter().filter(|v| **v > 0).count());
+        for c in 0..CLASSES {
+            assert!(a[c] > 0 || b[c] == 0, "a kind of turn with no visits has earned some");
+        }
+    }
+    // before any line is searched there is nothing to earn
+    let fresh = Search::new(&e, &net, PvConfig::default());
+    assert!(fresh.root_earned().iter().all(|l| l.iter().all(|v| v.1 == 0.0)));
 }

@@ -84,6 +84,9 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
             crate::policy::PV_ORACLE.with(|o| *o.borrow_mut() = if oracle { Some(s) } else { None });
             let d = decide(&trackers[i], &view, book);
             crate::policy::PV_ORACLE.with(|o| *o.borrow_mut() = None);
+            if book.tree_pv_ponder > 0 && d.note == "pv" {
+                crate::policy::pv_ponder(&trackers[i], book, book.tree_pv_ponder, None);
+            }
             // ARENA_DASHLOG=1: one line for every dash, to see what the dashes are for.
             if matches!(d.turn.dash, victris_engine::turn::DirIn::Dir(_)) && std::env::var_os("ARENA_DASHLOG").is_some() {
                 let (me, en) = (&s.fighters[i], &s.fighters[1 - i]);
