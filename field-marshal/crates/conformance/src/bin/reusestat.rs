@@ -41,7 +41,7 @@ fn main() {
             skip = false;
             continue;
         }
-        if a == "--bot" || a == "--games" || a == "--ms" {
+        if a == "--bot" || a == "--games" || a == "--ms" || a == "--turn-model" || a == "--habit" || a == "--both" {
             skip = true;
             continue;
         }
@@ -49,7 +49,17 @@ fn main() {
             collect(Path::new(a), &mut files);
         }
     }
-    let cfg = Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, own_priors: args.iter().any(|a| a == "--own-priors"), ..Default::default() };
+    let mut cfg = Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, slam_prior: 0.228, own_priors: args.iter().any(|a| a == "--own-priors"), ..Default::default() };
+    // --turn-model file: the opponent's learned turn model; --both file: ours too; --habit L
+    let leak = |p: String| -> &'static [f32; victris_engine::turnfeat::TF] {
+        let m = victris_engine::turnfeat::TurnModel::load(Path::new(&p)).expect("turn model");
+        let mut a = [0.0f32; victris_engine::turnfeat::TF];
+        a.copy_from_slice(&m.w);
+        Box::leak(Box::new(a))
+    };
+    let opp_w = opt("--turn-model").map(leak);
+    let our_w = opt("--both").map(leak);
+    let habit: f32 = opt("--habit").and_then(|s| s.parse().ok()).unwrap_or(0.0);
     // how well each search foresaw the reply: the share of the opponent's root visits on the turn
     // it then actually played, and that turn's rank among its root turns
     let (mut reply_share_sum, mut reply_n, mut reply_top, mut reply_top3) = (0.0f64, 0usize, 0usize, 0usize);
@@ -68,6 +78,11 @@ fn main() {
         let Ok(replay) = parse_replay(&text) else { continue };
         let Some(me) = replay.bots.iter().position(|b| *b == bot) else { continue };
         played += 1;
+        cfg.turn_w = [None, None];
+        cfg.turn_w[1 - me] = opp_w;
+        cfg.turn_w[me] = our_w;
+        cfg.habit = habit;
+        cfg.habit_side = (1 - me) as u8;
         let e = &replay.engine;
         let mut s = e.new_match(replay.seed);
         // the previous tick's search, its root, the tick, and the turn we actually played

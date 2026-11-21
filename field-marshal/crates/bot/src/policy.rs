@@ -206,6 +206,10 @@ pub struct Playbook {
     pub tree_deadline_k: u32,
     /// Lines reaching a power pad's first tick up are read this many ticks further (`mcts::Config::deadline_ext`; 0: off).
     pub tree_deadline_ext: u32,
+    /// Learned turn model file (`turnfeat`) for both sides' priors (`mcts::Config::turn_w`); empty: off.
+    pub tree_turn_model: String,
+    /// Raw-board judgments by map: a folder holding <map>.json (`rawnet`); empty: off.
+    pub tree_raw_dir: String,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
     pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
@@ -387,6 +391,8 @@ impl Default for Playbook {
             tree_calib: false,
             tree_deadline_k: 0,
             tree_deadline_ext: 0,
+            tree_turn_model: String::new(),
+            tree_raw_dir: String::new(),
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
@@ -542,6 +548,12 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_depth_buff").and_then(Value::as_u64) {
             p.tree_depth_buff = x as u32;
+        }
+        if let Some(x) = v.get("tree_raw_dir").and_then(Value::as_str) {
+            p.tree_raw_dir = x.to_string();
+        }
+        if let Some(x) = v.get("tree_turn_model").and_then(Value::as_str) {
+            p.tree_turn_model = x.to_string();
         }
         if let Some(x) = v.get("tree_deadline_ext").and_then(Value::as_u64) {
             p.tree_deadline_ext = x as u32;
@@ -1473,6 +1485,14 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         cfg.calib = pb.tree_calib;
         cfg.deadline_k = pb.tree_deadline_k as usize;
         cfg.deadline_ext = pb.tree_deadline_ext as i32;
+        if !pb.tree_raw_dir.is_empty() {
+            cfg.raw_net = raw_net(&format!("{}/{}.json", pb.tree_raw_dir, e.map.name));
+        }
+        if !pb.tree_turn_model.is_empty() {
+            if let Some(w) = turn_model(&pb.tree_turn_model) {
+                cfg.turn_w = [Some(w), Some(w)];
+            }
+        }
         for (k, w) in pb.tree_strategy_w.iter().take(5).enumerate() {
             cfg.strategy_w[k] = *w;
         }
@@ -2231,3 +2251,25 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     }
 }
 
+/// A learned turn model by file path, loaded once and kept for the life of the process.
+fn turn_model(path: &str) -> Option<&'static [f32; victris_engine::turnfeat::TF]> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MODELS: OnceLock<Mutex<HashMap<String, Option<&'static [f32; victris_engine::turnfeat::TF]>>>> = OnceLock::new();
+    let mut m = MODELS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
+    *m.entry(path.to_string()).or_insert_with(|| {
+        let tm = victris_engine::turnfeat::TurnModel::load(std::path::Path::new(path))?;
+        let mut a = [0.0f32; victris_engine::turnfeat::TF];
+        a.copy_from_slice(&tm.w);
+        Some(Box::leak(Box::new(a)))
+    })
+}
+
+/// A raw-board judgment by file path, loaded once (None if the file is missing or does not fit).
+fn raw_net(path: &str) -> Option<&'static victris_engine::rawnet::RawNet> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NETS: OnceLock<Mutex<HashMap<String, Option<&'static victris_engine::rawnet::RawNet>>>> = OnceLock::new();
+    let mut m = NETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
+    *m.entry(path.to_string()).or_insert_with(|| victris_engine::rawnet::RawNet::load(std::path::Path::new(path)).map(|n| &*Box::leak(Box::new(n))))
+}

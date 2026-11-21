@@ -142,11 +142,22 @@ pub struct Config {
     /// not 0: a line that reaches the tick a power pad restocks is not judged until this many
     /// ticks later; the search reads those ticks move by move (past `depth` if need be)
     pub deadline_ext: i32,
+    /// per side: a learned turn model (`turnfeat`) that gives the priors of that side's move lists
+    /// in place of the fitted class models (a small even share stays)
+    pub turn_w: [Option<&'static [f32; crate::turnfeat::TF]>; 2],
+    /// not 0: the side `habit_side` picks its moves partly by its habits: visits are pulled
+    /// toward its turn model's probabilities with this weight, and toward its worst case for the
+    /// other side with the rest (`opp_pick_move`)
+    pub habit: f32,
+    pub habit_side: u8,
+    /// a judgment learned from the raw board (`rawnet`), used at the leaves in place of the
+    /// linear one when set
+    pub raw_net: Option<&'static crate::rawnet::RawNet>,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], strategy: 0.0, strategy_side: 2, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0, slam_prior: 0.0, strategy_w: [0.0; 5], strategy_prior: 0.0, calib: false, deadline_k: 0, deadline_ext: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], strategy: 0.0, strategy_side: 2, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0, slam_prior: 0.0, strategy_w: [0.0; 5], strategy_prior: 0.0, calib: false, deadline_k: 0, deadline_ext: 0, turn_w: [None, None], habit: 0.0, habit_side: 1, raw_net: None }
     }
 }
 
@@ -687,7 +698,9 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
         let t = crate::valuenet::hp_to_come(e, &st, 0, &crate::valuenet_hp_weights::VALUE_HP_NET) as f64;
         v += cfg.net_value * if cfg.net_cap > 0.0 { t.clamp(-cfg.net_cap, cfg.net_cap) } else { t };
     }
-    if cfg.value_weight != 0.0 && st.result.is_none() {
+    if let (Some(net), true) = (cfg.raw_net, st.result.is_none()) {
+        v += net.value0(e, &st) as f64;
+    } else if cfg.value_weight != 0.0 && st.result.is_none() {
         let ph = crate::valuefeat::phase(e, &st);
         let row = |p: usize| { let g = cfg.phase_gens[p]; if g > 0 { g } else { cfg.value_gen } };
         let val = |g: usize| crate::valuefeat::value(e, &st, 0, crate::models::value_weights(g)) as f64;
@@ -786,12 +799,15 @@ impl<'a> Search<'a> {
     fn select(&self, node: usize, side: usize) -> usize {
         let nd = &self.nodes[node];
         let root_n = ((nd.n + 1) as f64).sqrt();
+        // opp_pick_move: the habit side's visits are pulled toward its learned probabilities
+        let lam = if self.cfg.habit > 0.0 && side == self.cfg.habit_side as usize { self.cfg.habit as f64 } else { 0.0 };
         let mut best = (f64::MIN, 0);
         for (i, a) in nd.acts[side].iter().enumerate() {
             let q = if a.n > 0 { a.w / a.n as f64 / SCALE } else { 0.0 };
             let u = self.cfg.c * a.prior as f64 * root_n / (1.0 + a.n as f64);
-            if q + u > best.0 {
-                best = (q + u, i);
+            let v = if lam > 0.0 { (1.0 - lam) * (q + u) + lam * (a.prior as f64 - a.n as f64 / (nd.n as f64 + 1.0)) } else { q + u };
+            if v > best.0 {
+                best = (v, i);
             }
         }
         best.1
@@ -1116,9 +1132,16 @@ impl<'a> Search<'a> {
                             _ => actions_cal(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst, self.cfg.calib),
                         };
                     }
+                    for x in 0..2 {
+                        if let Some(w) = self.cfg.turn_w[x] {
+                            learned_priors(self.e, &s, x, &mut self.nodes[node].acts[x], w, self.cfg.even.min(0.05));
+                        }
+                    }
                     if self.cfg.slam_prior > 0.0 {
                         for x in 0..2 {
-                            slam_reweight(self.e, &s, x, &mut self.nodes[node].acts[x], self.cfg.slam_prior);
+                            if self.cfg.turn_w[x].is_none() {
+                                slam_reweight(self.e, &s, x, &mut self.nodes[node].acts[x], self.cfg.slam_prior);
+                            }
                         }
                     }
                     if let (Some(m), true) = (modes, self.cfg.strategy_prior > 0.0 && depth < 3) {
@@ -1370,4 +1393,17 @@ pub fn matrix_value(m: &[Vec<f64>], rounds: usize) -> f64 {
 /// Within the first `ext` ticks of a power pad being up again (`Config::deadline_ext`).
 pub fn in_spawn_fight(e: &Engine, s: &State, ext: i32) -> bool {
     ext > 0 && e.map.pads.iter().enumerate().any(|(i, d)| d.kind == PadKind::Power && s.pads[i].available && (0..ext).contains(&(s.tick - s.pads[i].respawn_tick)))
+}
+
+/// `Config::turn_w`: the priors of `acts` from a learned turn model, with an `even` share.
+fn learned_priors(e: &Engine, s: &State, x: usize, acts: &mut [Act], w: &[f32; crate::turnfeat::TF], even: f32) {
+    if acts.len() < 2 || s.fighters[x].state != FState::Idle {
+        return;
+    }
+    let turns: Vec<RawTurn> = acts.iter().map(|a| a.turn).collect();
+    let p = crate::turnfeat::turn_probs(e, s, x, &turns, w);
+    let flat = 1.0 / acts.len() as f32;
+    for (a, pi) in acts.iter_mut().zip(p) {
+        a.prior = (1.0 - even) * pi + even * flat;
+    }
 }

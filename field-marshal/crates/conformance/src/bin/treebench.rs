@@ -45,6 +45,17 @@ fn main() {
         ("flagship + slam prior + strategy prior 0.3", Config { value_gen: 13, dash_burst: true, slam_prior: 0.228, strategy_prior: 0.3, ..base }),
         ("win-probability judgment only (40)", Config { value_weight: 0.0, net_weight: 40.0, dash_burst: true, ..base }),
     ];
+    // RAW_NET=path: also the flagship with that raw-board judgment
+    let mut variants = variants.to_vec();
+    if let Ok(path) = std::env::var("RAW_NET") {
+        if let Some(net) = victris_engine::rawnet::RawNet::load(std::path::Path::new(&path)) {
+            let net: &'static victris_engine::rawnet::RawNet = Box::leak(Box::new(net));
+            variants.push(("flagship + raw-board judgment", Config { value_gen: 13, dash_burst: true, slam_prior: 0.228, raw_net: Some(net), ..base }));
+        }
+    }
+    if std::env::var("TB_ONLY_RAW").is_ok() {
+        variants.retain(|v| v.0.contains("raw"));
+    }
     for (name, cfg) in variants {
         let mut search = Search::new(e, cfg);
         search.start();
