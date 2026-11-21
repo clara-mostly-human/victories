@@ -130,6 +130,8 @@ struct Match {
     last_turn: Option<(i32, RawTurn)>,
     think_us: Vec<u32>,
     sims: u64,
+    /// learned-search lines grown between ticks (pondering)
+    pondered: u64,
     rejected: u32,
     server_refusals: u32,
     panics: u32,
@@ -264,6 +266,26 @@ impl Session {
 
     pub fn in_match(&self) -> bool {
         self.cur.is_some()
+    }
+
+    /// Pondering: after a turn is sent, while the next observation is on its way, the learned
+    /// search keeps growing the tree its last decision kept (the opponent's likely replies to
+    /// the turn we sent), so the next decision starts deeper. Up to `lines` search lines,
+    /// stopping at `until`. Returns the lines searched: 0 when there is nothing to ponder (the
+    /// playbook has no `tree_pv_dir`, the last decision did not come from the learned search,
+    /// or the opponent was out of sight). Must run on the thread that called `decide`, where
+    /// the kept tree lives. A panic in it costs nothing but this pondering.
+    pub fn ponder(&mut self, lines: u32, until: Option<Instant>) -> u32 {
+        let Some(m) = self.cur.as_mut() else { return 0 };
+        let Some(tracker) = m.tracker.as_ref() else { return 0 };
+        let playbook = &m.playbook;
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| crate::policy::pv_ponder(tracker, playbook, lines, until))) {
+            Ok(n) => {
+                m.pondered += n as u64;
+                n
+            }
+            Err(_) => 0,
+        }
     }
 
     fn log(&mut self, mut line: Value) {
@@ -419,6 +441,7 @@ impl Session {
                 last_turn: None,
                 think_us: Vec::new(),
                 sims: 0,
+                pondered: 0,
                 rejected: 0,
                 server_refusals: 0,
                 panics: 0,
@@ -632,7 +655,7 @@ impl Session {
                 "final_tick": msg.get("final_tick"), "rating_change": msg.get("rating_change"), "voided": msg.get("voided"),
                 "replay_url": msg.get("replay_url"),
                 "think_us": { "p50": pct(0.5), "p99": pct(0.99), "max": m.think_us.last() },
-                "sims": m.sims, "rejected_parts": m.rejected, "server_refusals": m.server_refusals, "panics": m.panics,
+                "sims": m.sims, "pondered": m.pondered, "rejected_parts": m.rejected, "server_refusals": m.server_refusals, "panics": m.panics,
                 "min_budget_ms": if m.min_budget_ms == i64::MAX { Value::Null } else { json!(m.min_budget_ms) },
                 "charge_ms": if m.charges.is_empty() { Value::Null } else { json!({ "p50": charge(0.5), "p99": charge(0.99), "lost_turns": lost }) },
                 "remote": self.remote,

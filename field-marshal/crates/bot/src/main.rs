@@ -141,16 +141,37 @@ fn run_stdio(mut session: Session, provisional: bool) {
     }
     // Not locked for the whole run: the fallback above writes in the middle of a decision.
     let mut out = std::io::stdout();
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
+    // Frames are read on a thread of their own, so this thread can ponder between ticks and
+    // still see the next frame within a few milliseconds of its arrival. Deciding and
+    // pondering stay on this thread: the learned search keeps its tree in a thread local.
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in stdin.lock().lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut pending: Option<String> = None;
+    loop {
+        let line = match pending.take() {
+            Some(l) => l,
+            None => match rx.recv() {
+                Ok(l) => l,
+                Err(_) => break,
+            },
+        };
         if line.trim().is_empty() {
             continue;
         }
+        let mut sent_turn = false;
         for o in session.handle(&line) {
             match o {
                 Out::Send(s) => {
                     let _ = writeln!(out, "{s}");
                     let _ = out.flush();
+                    sent_turn |= session.in_match();
                 }
                 Out::RequeueAfter(_) => {
                     // Behind a pipe the other side owns the connection: say what we would do.
@@ -169,6 +190,38 @@ fn run_stdio(mut session: Session, provisional: bool) {
                 }
                 Out::Done => return,
             }
+        }
+        if sent_turn {
+            pending = ponder_until_next_frame(&mut session, &rx);
+        }
+    }
+}
+
+/// Grows the learned search's kept tree in short slices until the next frame arrives (or
+/// there is nothing to ponder, or 1.5 s have gone by without a frame), and returns that frame.
+/// Each slice is sized to take about 1 to 2 ms, so a frame waits at most a couple of milliseconds.
+fn ponder_until_next_frame(session: &mut Session, rx: &std::sync::mpsc::Receiver<String>) -> Option<String> {
+    use std::sync::mpsc::TryRecvError;
+    let started = Instant::now();
+    let mut slice: u32 = 16;
+    loop {
+        match rx.try_recv() {
+            Ok(line) => return Some(line),
+            Err(TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) => {}
+        }
+        if started.elapsed() > Duration::from_millis(1500) {
+            return None;
+        }
+        let t = Instant::now();
+        if session.ponder(slice, None) == 0 {
+            return None;
+        }
+        let took = t.elapsed();
+        if took < Duration::from_millis(1) {
+            slice = (slice * 2).min(512);
+        } else if took > Duration::from_millis(2) {
+            slice = (slice / 2).max(2);
         }
     }
 }
