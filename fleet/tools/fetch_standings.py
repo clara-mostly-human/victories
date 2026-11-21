@@ -13,8 +13,8 @@ import argparse, json, sys, time, urllib.error, urllib.parse, urllib.request
 
 HOST = "https://victrisarena.com"
 AGENT = {"User-Agent": "standings-collector/1.0"}
-ROW_KEEP = ("name", "display_name", "rating", "rating_deviation", "score", "version", "wins", "losses", "draws", "games", "idle_penalty", "house", "online", "owner")
-BOT_KEEP = ("name", "rating", "rank", "score", "online", "status", "idle_penalty", "played")
+ROW_KEEP = ("name", "display_name", "rating", "rating_deviation", "score", "leaderboard_score", "version", "wins", "losses", "draws", "games", "idle_penalty", "house", "online", "owner")
+BOT_KEEP = ("name", "rating", "rank", "score", "leaderboard_score", "online", "status", "idle_penalty", "played")
 VERSION_KEEP = ("version", "label", "alias", "rating", "rating_deviation", "score", "rank", "wins", "losses", "draws", "games", "ranked", "last_played", "health")
 
 
