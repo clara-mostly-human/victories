@@ -176,52 +176,95 @@ impl<'a> Search<'a> {
             self.nodes.push(nd);
         }
         for _ in 0..count {
-            let mut s = *root;
-            let mut node = 0usize;
-            self.path.clear();
-            let value;
-            loop {
-                let (i0, i1) = (self.select(node, 0), self.select(node, 1));
-                self.path.push((node as u32, i0 as u16, i1 as u16));
-                let pair = [self.nodes[node].acts[0][i0].turn, self.nodes[node].acts[1][i1].turn];
-                self.e.step(&mut s, &pair);
-                if let Some(v) = outcome(&s) {
-                    value = v;
-                    break;
+            self.line(root, None);
+        }
+    }
+
+    /// Searching while waiting for the next tick: `count` lines from `root` that all begin
+    /// with the turn fighter `me` has already sent, so the work lands under the positions the
+    /// game can now move to and `advance_to` finds it there. The opponent's first turn is
+    /// spread over its turns in proportion to the visits they already have (not by what does
+    /// best against our turn, which it cannot know). False when `ours` is not one of the
+    /// root's turns or nothing was searched from `root` yet: nothing is done then.
+    pub fn ponder(&mut self, root: &State, me: usize, ours: &RawTurn, count: u32) -> bool {
+        if root.result.is_some() || self.nodes.is_empty() {
+            return false;
+        }
+        let Some(mine) = self.nodes[0].acts[me].iter().position(|a| a.turn == *ours) else { return false };
+        let theirs: Vec<f64> = self.nodes[0].acts[1 - me].iter().map(|a| a.n as f64).collect();
+        let total: f64 = theirs.iter().sum();
+        if total <= 0.0 {
+            return false;
+        }
+        let mut given = vec![0u32; theirs.len()];
+        for j in 0..count {
+            // the opponent turn furthest behind its share
+            let mut best = (f64::MIN, 0usize);
+            for (i, n) in theirs.iter().enumerate() {
+                let behind = n / total * (j + 1) as f64 - given[i] as f64;
+                if *n > 0.0 && behind > best.0 {
+                    best = (behind, i);
                 }
-                let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
-                match self.index.get(&key) {
-                    Some(&child) => {
-                        node = child as usize;
-                        if self.path.len() as u32 >= self.cfg.depth {
-                            value = self.nodes[node].v;
-                            break;
-                        }
-                    }
-                    None => {
-                        let child = self.expand(&s, self.cfg.even);
-                        value = child.v;
-                        if self.nodes.len() < self.cfg.max_nodes {
-                            let id = self.nodes.len() as u32;
-                            self.index.insert(key, id);
-                            self.nodes[node].kids.push(((i0 as u32) << 16 | i1 as u32, id));
-                            self.nodes.push(child);
-                        }
+            }
+            given[best.1] += 1;
+            let first = if me == 0 { (mine, best.1) } else { (best.1, mine) };
+            self.line(root, Some(first));
+        }
+        true
+    }
+
+    /// One line from `root` to a new position or the end of the game; `first` fixes both
+    /// fighters' turns at the root.
+    fn line(&mut self, root: &State, first: Option<(usize, usize)>) {
+        let mut s = *root;
+        let mut node = 0usize;
+        self.path.clear();
+        let value;
+        loop {
+            let (i0, i1) = match first {
+                Some(pair) if node == 0 => pair,
+                _ => (self.select(node, 0), self.select(node, 1)),
+            };
+            self.path.push((node as u32, i0 as u16, i1 as u16));
+            let pair = [self.nodes[node].acts[0][i0].turn, self.nodes[node].acts[1][i1].turn];
+            self.e.step(&mut s, &pair);
+            if let Some(v) = outcome(&s) {
+                value = v;
+                break;
+            }
+            let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
+            match self.index.get(&key) {
+                Some(&child) => {
+                    node = child as usize;
+                    if self.path.len() as u32 >= self.cfg.depth {
+                        value = self.nodes[node].v;
                         break;
                     }
                 }
+                None => {
+                    let child = self.expand(&s, self.cfg.even);
+                    value = child.v;
+                    if self.nodes.len() < self.cfg.max_nodes {
+                        let id = self.nodes.len() as u32;
+                        self.index.insert(key, id);
+                        self.nodes[node].kids.push(((i0 as u32) << 16 | i1 as u32, id));
+                        self.nodes.push(child);
+                    }
+                    break;
+                }
             }
-            self.depth_hist[self.path.len().min(63)] += 1;
-            for &(n, i0, i1) in &self.path {
-                let nd = &mut self.nodes[n as usize];
-                nd.n += 1;
-                let a = &mut nd.acts[0][i0 as usize];
-                a.n += 1;
-                a.w += value;
-                let b = &mut nd.acts[1][i1 as usize];
-                b.n += 1;
-                b.w -= value;
-            }
+        }
+        self.depth_hist[self.path.len().min(63)] += 1;
+        for k in 0..self.path.len() {
+            let (n, i0, i1) = self.path[k];
+            let nd = &mut self.nodes[n as usize];
+            nd.n += 1;
+            let a = &mut nd.acts[0][i0 as usize];
+            a.n += 1;
+            a.w += value;
+            let b = &mut nd.acts[1][i1 as usize];
+            b.n += 1;
+            b.w -= value;
         }
     }
 

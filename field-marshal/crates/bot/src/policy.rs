@@ -228,6 +228,10 @@ pub struct Playbook {
     /// this search only matches the hand-written policy, which takes 3.8 power pads a game to
     /// its 0.8. It needs a guess that moves as an opponent would before it earns these ticks.
     pub tree_pv_fog: bool,
+    /// For the arena only: after each decision of the learned search, this many more lines
+    /// under the turn it sent (`pv_ponder`), standing in for the live bot's wait for the next
+    /// tick. 0 (the default): none. A live session ponders by time instead.
+    pub tree_pv_ponder: u32,
     /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
     /// past the time cap); 0: by time. For self-play: more games an hour, and the same game
     /// every time from the same seed.
@@ -417,6 +421,7 @@ impl Default for Playbook {
             tree_raw_dir: String::new(),
             tree_pv_dir: String::new(),
             tree_pv_fog: false,
+            tree_pv_ponder: 0,
             tree_iters: 0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
@@ -585,6 +590,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_pv_fog").and_then(Value::as_bool) {
             p.tree_pv_fog = x;
+        }
+        if let Some(x) = v.get("tree_pv_ponder").and_then(Value::as_u64) {
+            p.tree_pv_ponder = x as u32;
         }
         if let Some(x) = v.get("tree_turn_model").and_then(Value::as_str) {
             p.tree_turn_model = x.to_string();
@@ -1454,6 +1462,8 @@ thread_local! {
 struct PvKept {
     tick: i32,
     root: State,
+    /// the turn we sent from `root`
+    ours: RawTurn,
     tree: victris_engine::pvsearch::Tree,
 }
 
@@ -1688,7 +1698,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 if k.len() > 16 {
                     k.clear();
                 }
-                k.insert(key, PvKept { tick: s.tick, root: s, tree });
+                k.insert(key, PvKept { tick: s.tick, root: s, ours: turn, tree });
             });
             return Decision { turn, sims: done + reused, score: q as f64, note: "pv" };
         }
@@ -2427,6 +2437,35 @@ fn pv_net(path: &str) -> Option<&'static victris_engine::pvnet::PvNet> {
     static NETS: OnceLock<Mutex<HashMap<String, Option<&'static victris_engine::pvnet::PvNet>>>> = OnceLock::new();
     let mut m = NETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
     *m.entry(path.to_string()).or_insert_with(|| victris_engine::pvnet::PvNet::load(std::path::Path::new(path)).map(|n| &*Box::leak(Box::new(n))))
+}
+
+/// Pondering for the learned search: after `decide` has sent its turn, more lines under that
+/// turn in the tree it kept, so next tick's search starts further along. Runs until `lines`
+/// lines are done or `until` has passed, whichever comes first (give `u32::MAX` lines to go by
+/// time alone), and returns the lines done; 0 when the last decision was not the learned
+/// search's with the opponent in sight. Call it from the thread that called `decide`, in the
+/// wait for the next tick; that wait is not charged to the match budget.
+pub fn pv_ponder(t: &Tracker, pb: &Playbook, lines: u32, until: Option<Instant>) -> u32 {
+    if pb.tree_pv_dir.is_empty() {
+        return 0;
+    }
+    let e = &t.engine;
+    let Some(net) = pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)) else { return 0 };
+    let key = (t.seed, t.me);
+    let Some(k) = PV_KEPT.with(|k| k.borrow_mut().remove(&key)) else { return 0 };
+    let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig::default());
+    search.start_from(k.tree);
+    let mut done = 0u32;
+    while done < lines && until.map(|u| Instant::now() < u).unwrap_or(true) {
+        let chunk = (lines - done).min(200);
+        if !search.ponder(&k.root, t.me, &k.ours, chunk) {
+            break;
+        }
+        done += chunk;
+    }
+    let tree = search.into_tree();
+    PV_KEPT.with(|m| m.borrow_mut().insert(key, PvKept { tick: k.tick, root: k.root, ours: k.ours, tree }));
+    done
 }
 
 /// ARENA_ROOTS=file: for every tree decision, the position's hash and what the search made of it

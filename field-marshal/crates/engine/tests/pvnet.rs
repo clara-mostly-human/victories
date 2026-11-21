@@ -276,3 +276,54 @@ fn the_search_keeps_its_tree_between_ticks() {
     }
     assert!(kept_any, "the most visited pair of turns should have been searched at least once");
 }
+
+#[test]
+fn pondering_fills_the_tree_under_the_turn_already_sent() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(11);
+    let mut s = e.new_match(3);
+    let (mut plain_kept, mut ponder_kept, mut ticks) = (0u64, 0u64, 0u32);
+    for _ in 0..30 {
+        if s.result.is_some() {
+            break;
+        }
+        // two searches of the same position; one also ponders under fighter 0's turn
+        let mut plain = Search::new(&e, &net, PvConfig::default());
+        plain.iterate(&s, 400);
+        let mut pondered = Search::new(&e, &net, PvConfig::default());
+        pondered.iterate(&s, 400);
+        let ours = pondered.best(0);
+        assert_eq!(ours, plain.best(0), "the same search twice gives the same turn");
+        assert!(pondered.ponder(&s, 0, &ours, 400));
+        // every pondered line began with our turn, and the counts still add up
+        let root = pondered.root();
+        let mine = root[0].iter().find(|a| a.0 == ours).unwrap().1;
+        let plain_mine = plain.root()[0].iter().find(|a| a.0 == ours).unwrap().1;
+        assert_eq!(mine, plain_mine + 400);
+        assert_eq!(root[0].iter().map(|a| a.1).sum::<u32>(), 800);
+        assert_eq!(root[1].iter().map(|a| a.1).sum::<u32>(), 800);
+        // the opponent's turns keep their shares: none gains more than its share of 400 plus one
+        for (a, b) in plain.root()[1].iter().zip(root[1].iter()) {
+            let share = a.1 as f64 / 400.0 * 400.0;
+            assert!((b.1 - a.1) as f64 <= share + 1.0, "an opponent turn with {} visits got {} more", a.1, b.1 - a.1);
+        }
+        // the game moves on with our turn and the opponent's most visited one
+        let pair = [ours, plain.best(1)];
+        let old = s;
+        e.step(&mut s, &pair);
+        if s.result.is_some() {
+            break;
+        }
+        if plain.advance_to(&old, &s) && pondered.advance_to(&old, &s) {
+            assert!(pondered.visits() >= plain.visits());
+            plain_kept += plain.visits() as u64;
+            ponder_kept += pondered.visits() as u64;
+            ticks += 1;
+        }
+    }
+    assert!(ticks > 5, "the tree should carry over on most ticks");
+    assert!(ponder_kept as f64 > 1.5 * plain_kept as f64, "pondering kept {ponder_kept} visits against {plain_kept} without");
+    // a turn that is not at the root is refused
+    let mut search = Search::new(&e, &net, PvConfig::default());
+    assert!(!search.ponder(&s, 0, &RawTurn::IDLE, 10), "nothing searched yet");
+}
