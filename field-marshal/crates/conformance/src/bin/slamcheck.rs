@@ -51,6 +51,7 @@ fn main() {
     let iterations: u32 = opt("--iterations").and_then(|s| s.parse().ok()).unwrap_or(27_000);
     let dash_burst = args.iter().any(|a| a == "--dash-burst");
     let show: usize = opt("--show").and_then(|s| s.parse().ok()).unwrap_or(8);
+    let gen: usize = opt("--gen").and_then(|s| s.parse().ok()).unwrap_or(1);
     let dir = args.iter().find(|a| !a.starts_with("--") && std::path::Path::new(a).is_dir()).expect("a replay directory");
     let mut files: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
     files.sort();
@@ -101,7 +102,7 @@ fn main() {
                     let (st, turns) = history[n - 1 - back];
                     let (f, o) = (&st.fighters[me], &st.fighters[1 - me]);
                     let burst_cd = e.rules.attacks.iter().enumerate().filter(|(_, a)| matches!(a.kind, AttackKind::Burst { .. })).map(|(i, _)| o.cd_attack[i]).min().unwrap_or(99);
-                    let cfg = Config { value_weight: 1.0, value_gen: 1, buff_value: 0.0, dash_burst, ..Default::default() };
+                    let cfg = Config { value_weight: 1.0, value_gen: gen, buff_value: 0.0, dash_burst, ..Default::default() };
                     let mut search = Search::new(e, cfg);
                     search.start();
                     search.iterate(&st, [None, None], iterations);

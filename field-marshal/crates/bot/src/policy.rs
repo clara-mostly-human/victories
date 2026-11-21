@@ -193,6 +193,9 @@ pub struct Playbook {
     pub tree_strategy: f64,
     /// Score only our own plan at the leaves (`mcts::Config::strategy_side` = our seat), not the opponent's.
     pub tree_strategy_own: bool,
+    /// Share of the move prior for turns whose repulsor slams the opponent if it holds
+    /// (`mcts::Config::slam_prior`; 0: off; measured on the ladder: 0.228).
+    pub tree_slam_prior: f64,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
     pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
@@ -368,6 +371,7 @@ impl Default for Playbook {
             tree_phase_gens: Vec::new(),
             tree_strategy: 0.0,
             tree_strategy_own: false,
+            tree_slam_prior: 0.0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
@@ -455,6 +459,7 @@ impl Playbook {
         f("tree_loaded_value", &mut p.tree_loaded_value);
         f("tree_heal_value", &mut p.tree_heal_value);
         f("tree_strategy", &mut p.tree_strategy);
+        f("tree_slam_prior", &mut p.tree_slam_prior);
         if let Some(a) = v.get("tree_phase_gens").and_then(Value::as_array) {
             p.tree_phase_gens = a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect();
         }
@@ -1438,6 +1443,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         cfg.loaded_value = pb.tree_loaded_value;
         cfg.heal_value = pb.tree_heal_value;
         cfg.strategy = pb.tree_strategy;
+        cfg.slam_prior = pb.tree_slam_prior as f32;
         cfg.strategy_side = if pb.tree_strategy_own { me as u8 } else { 2 };
         for (k, g) in pb.tree_phase_gens.iter().take(victris_engine::valuefeat::PHASES).enumerate() {
             cfg.phase_gens[k] = *g;
@@ -2192,3 +2198,4 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         None => idle,
     }
 }
+

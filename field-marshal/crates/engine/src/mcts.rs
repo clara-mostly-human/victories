@@ -118,11 +118,16 @@ pub struct Config {
     /// (0 = off: at 150 ms a move it scored 8 of 18 against 10 of 18 without, so it is
     /// off until it earns its place)
     pub forcing_depth: u32,
+    /// not 0: in every move list, the turns whose repulsor (standing or after a dash) slams the
+    /// opponent into a wall if it holds share this much of the prior. Measured on 589 ladder
+    /// games against 2400+ bots: they play such a turn on 22.8% of the ticks they have one, where
+    /// the fitted move model gives those turns 3.9%.
+    pub slam_prior: f32,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], strategy: 0.0, strategy_side: 2, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], strategy: 0.0, strategy_side: 2, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0, slam_prior: 0.0 }
     }
 }
 
@@ -1049,6 +1054,11 @@ impl<'a> Search<'a> {
                             _ => actions_with(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst),
                         };
                     }
+                    if self.cfg.slam_prior > 0.0 {
+                        for x in 0..2 {
+                            slam_reweight(self.e, &s, x, &mut self.nodes[node].acts[x], self.cfg.slam_prior);
+                        }
+                    }
                     if depth == 0 && self.cfg.plans {
                         self.add_root_plans(&s, fixed);
                         self.plans_pending = false;
@@ -1150,5 +1160,35 @@ impl<'a> Search<'a> {
         }
         self.total += total;
         self.done += count;
+    }
+}
+
+/// `Config::slam_prior`: gives the turns of `acts` whose repulsor slams the opponent into a wall
+/// if it holds the share `target` of the prior (only raises it; needs both kinds of turn).
+fn slam_reweight(e: &Engine, s: &State, x: usize, acts: &mut [Act], target: f32) {
+    if acts.len() < 2 || s.fighters[x].state != FState::Idle {
+        return;
+    }
+    let is_burst = |t: &RawTurn| matches!(t.attack, crate::turn::AttackIn::Named { attack, .. } if matches!(e.rules.attacks[attack as usize].kind, AttackKind::Burst { .. }));
+    let slams: Vec<bool> = acts
+        .iter()
+        .map(|a| {
+            if !is_burst(&a.turn) {
+                return false;
+            }
+            let mut st = *s;
+            let mut turns = [RawTurn::IDLE; 2];
+            turns[x] = a.turn;
+            e.step(&mut st, &turns).slammed[1 - x]
+        })
+        .collect();
+    let m: f32 = acts.iter().zip(&slams).filter(|(_, &b)| b).map(|(a, _)| a.prior).sum();
+    let total: f32 = acts.iter().map(|a| a.prior).sum();
+    if m <= 0.0 || m >= total || m >= target * total {
+        return;
+    }
+    let (up, down) = (target * total / m, (1.0 - target) * total / (total - m));
+    for (a, &b) in acts.iter_mut().zip(&slams) {
+        a.prior *= if b { up } else { down };
     }
 }

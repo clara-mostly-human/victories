@@ -40,6 +40,8 @@ fn main() {
         ("expand on the second visit", Config { expand_at: 1, ..base }),
         ("expand on the second visit, dash + repulsor", Config { expand_at: 1, dash_burst: true, ..base }),
         ("dash + repulsor", Config { dash_burst: true, ..base }),
+        ("flagship (row 13, dash + repulsor)", Config { value_gen: 13, dash_burst: true, ..base }),
+        ("flagship + slam prior 0.228", Config { value_gen: 13, dash_burst: true, slam_prior: 0.228, ..base }),
         ("win-probability judgment only (40)", Config { value_weight: 0.0, net_weight: 40.0, dash_burst: true, ..base }),
     ];
     for (name, cfg) in variants {
