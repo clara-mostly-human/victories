@@ -216,6 +216,17 @@ CREATE TABLE IF NOT EXISTS ladder (
   games INTEGER,
   updated_ms INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ladder_versions (
+  bot TEXT NOT NULL,
+  version TEXT NOT NULL,
+  rating REAL,
+  rd REAL,
+  score REAL,
+  rank INTEGER,
+  games INTEGER,
+  updated_ms INTEGER NOT NULL,
+  PRIMARY KEY (bot, version)
+);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY,
   ts_ms INTEGER NOT NULL,
@@ -387,6 +398,26 @@ impl Store {
             }
         }
         self.conn.execute_batch("COMMIT")
+    }
+
+    /// One of our bots' versions as the ladder's own page for the bot lists it: rating,
+    /// deviation, leaderboard score (what the board ranks by) and place, which the
+    /// leaderboard itself may not show yet (it lists one version per bot).
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_ladder_version(&self, bot: &str, version: &str, rating: f64, rd: Option<f64>, score: Option<f64>, rank: Option<i64>, games: Option<i64>) -> rusqlite::Result<()> {
+        self.conn.execute(
+            "INSERT INTO ladder_versions (bot, version, rating, rd, score, rank, games, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(bot, version) DO UPDATE SET rating = ?3, rd = ?4, score = ?5, rank = ?6, games = ?7, updated_ms = ?8",
+            params![bot, version, rating, rd, score, rank, games, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// (rating, leaderboard score, place, when) of one of our bots' versions, from the last standings.
+    pub fn ladder_version(&self, bot: &str, version: &str) -> Option<(f64, Option<f64>, Option<i64>, i64)> {
+        self.conn
+            .query_row("SELECT rating, score, rank, updated_ms FROM ladder_versions WHERE bot = ?1 AND version = ?2", params![bot, version], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .ok()
     }
 
     /// Fills in what older bot builds did not write at match end: the opponent's rating

@@ -109,6 +109,12 @@ pub fn refresh_ladder(root: &Path, store: &Store, ours: &[String]) -> Result<usi
                 let label = ["version", "label", "name", "number"].iter().find_map(|k| ver.get(*k).and_then(Value::as_str)).filter(|l| l.starts_with('v'));
                 let rating = ver.get("rating").and_then(Value::as_f64);
                 if let (Some(label), Some(rating)) = (label, rating) {
+                    let games = match (ver.get("wins").and_then(Value::as_i64), ver.get("losses").and_then(Value::as_i64)) {
+                        (Some(w), Some(l)) => Some(w + l + ver.get("draws").and_then(Value::as_i64).unwrap_or(0)),
+                        _ => None,
+                    };
+                    let score = ver.get("leaderboard_score").or_else(|| ver.get("score")).and_then(Value::as_f64);
+                    let _ = store.set_ladder_version(bot, label, rating, ver.get("rating_deviation").and_then(Value::as_f64), score, ver.get("rank").and_then(Value::as_i64), games);
                     let _ = store.conn.execute(
                         "UPDATE matches SET rating_after = ?3 WHERE bot = ?1 AND version = ?2 AND match_id =
                            (SELECT match_id FROM matches WHERE bot = ?1 AND version = ?2 AND result IS NOT NULL ORDER BY COALESCE(ended_ms, started_ms) DESC LIMIT 1)",

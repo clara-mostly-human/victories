@@ -21,6 +21,9 @@ pub struct BotLine {
     pub rating: Option<f64>,
     /// place on the ladder, when this version is ranked
     pub rank: Option<i64>,
+    /// the ladder's leaderboard score for this version (rating less its uncertainty and any
+    /// idle penalty): what the board ranks by
+    pub score: Option<f64>,
     pub rating_day: f64,
     pub last_game_ms: Option<i64>,
     pub think_p99_ms: Option<f64>,
@@ -249,6 +252,15 @@ fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>
                 |r| r.get(0),
             )
             .ok();
+        // The ladder's own figures for the version playing now, from its page for the bot (the
+        // leaderboard lists one version per bot, so a new label is missing there at first):
+        // rating, score and place straight from the ladder, as of the last standings fetch.
+        // Adding up the per-game changes on a carried base drifts from them.
+        let playing: Option<String> = one(store, "SELECT version FROM matches WHERE bot = ?1 AND version IS NOT NULL ORDER BY started_ms DESC LIMIT 1", [&b.name]);
+        let (rating, rank, score) = match playing.as_deref().and_then(|v| store.ladder_version(&b.name, v)) {
+            Some((r, s, k, _)) => (Some(r), k.or(rank), s),
+            None => (rating, rank, None),
+        };
         // The change over 24 hours, within the version playing now (every version starts afresh).
         let version_change: f64 = store
             .conn
@@ -315,6 +327,7 @@ fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>
             hour_games: one(store, "SELECT COUNT(*) FROM matches WHERE bot = ?1 AND result IS NOT NULL AND started_ms >= ?2", rusqlite::params![b.name, now - 3_600_000]).unwrap_or(0),
             rating,
             rank,
+            score,
             rating_day: version_change,
             last_game_ms: one(store, "SELECT MAX(COALESCE(ended_ms, started_ms)) FROM matches WHERE bot = ?1", [&b.name]),
             // The last 90 seconds of turns when the bot is in a match; between matches, the
@@ -781,7 +794,7 @@ pub fn html(s: &Snapshot) -> String {
             b.think_p99_ms.map(|p| format!("{p:.0} ms")).unwrap_or_else(|| "&ndash;".into()),
             net_cell(b),
             lost_cell(b),
-            rank = b.rank.map(|r| format!("#{r}, ")).unwrap_or_default(),
+            rank = format!("{}{}", b.rank.map(|r| format!("#{r}, ")).unwrap_or_default(), b.score.map(|s| format!("score {s:.0}, ")).unwrap_or_default()),
         ));
     }
     let mut game_rows = String::new();
@@ -1187,7 +1200,7 @@ pub fn state_json(s: &Snapshot) -> serde_json::Value {
         }],
         "bots": s.bots.iter().map(|b| serde_json::json!({
             "bot": b.name, "role": b.role, "state": state(b).0, "release": b.release, "version": b.version,
-            "rating": b.rating.map(|r| r.round()), "rating_change_24h": b.rating_day.round(), "games_24h": b.day.games(), "games_last_hour": b.hour_games,
+            "rating": b.rating.map(|r| r.round()), "rank": b.rank, "score": b.score.map(|r| r.round()), "rating_change_24h": b.rating_day.round(), "games_24h": b.day.games(), "games_last_hour": b.hour_games,
             "wins": b.day.wins, "losses": b.day.losses, "draws": b.day.draws, "score_pct": pct(&b.day), "think_p99_ms": b.think_p99_ms.map(|p| p.round()),
             "last_turn_s": b.last_turn_s.map(|t| t.round()), "ping_ms": b.ping_ms.map(|p| p.round()), "wire_ms": b.wire_ms.map(|p| p.round()),
             "socket_id": b.net.as_ref().and_then(|n| n.socket.as_ref().map(|s| s.id)),
