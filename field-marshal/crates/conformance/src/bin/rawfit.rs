@@ -34,6 +34,7 @@ struct Sample {
     y: f32,
     lin: f32,
     test: bool,
+    own: bool,
 }
 
 fn q(x: &[f32; IN]) -> [i8; IN] {
@@ -119,6 +120,10 @@ fn main() {
     let threads: usize = opt("--threads").and_then(|s| s.parse().ok()).unwrap_or(6);
     let init = opt("--init").and_then(|p| RawNet::load(Path::new(&p)));
     let out = opt("--out");
+    // the search's own verdicts (roots.txt next to self-play replays) blended into the target,
+    // and our own self-play games (paths with /sp/raw-) counted this many times in training
+    let root_mix: f32 = opt("--root-mix").and_then(|s| s.parse().ok()).unwrap_or(0.5);
+    let own_weight: usize = opt("--own-weight").and_then(|s| s.parse().ok()).unwrap_or(1);
     let mut files = Vec::new();
     let mut skip = false;
     for a in &args {
@@ -126,7 +131,7 @@ fn main() {
             skip = false;
             continue;
         }
-        if ["--map", "--h1", "--h2", "--epochs", "--every", "--init", "--out", "--threads"].contains(&a.as_str()) {
+        if ["--map", "--h1", "--h2", "--epochs", "--every", "--init", "--out", "--threads", "--root-mix", "--own-weight"].contains(&a.as_str()) {
             skip = true;
             continue;
         }
@@ -137,7 +142,23 @@ fn main() {
     let lin_w = victris_engine::models::value_weights(13);
     let mut samples: Vec<Sample> = Vec::new();
     let mut games = 0usize;
+    let mut roots: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+    let mut roots_read: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut with_root = 0usize;
     for path in &files {
+        let own = path.to_string_lossy().contains("/sp/raw-");
+        if let Some(dir) = path.parent() {
+            if roots_read.insert(dir.to_path_buf()) {
+                if let Ok(text) = std::fs::read_to_string(dir.join("roots.txt")) {
+                    for line in text.lines() {
+                        let mut it = line.split_whitespace();
+                        if let (Some(h), Some(v)) = (it.next(), it.next().and_then(|v| v.parse::<f32>().ok())) {
+                            roots.insert(h.to_string(), v);
+                        }
+                    }
+                }
+            }
+        }
         let mut text = String::new();
         if path.to_string_lossy().ends_with(".gz") {
             if std::fs::File::open(path).map(|f| GzDecoder::new(f).read_to_string(&mut text)).is_err() {
@@ -154,7 +175,7 @@ fn main() {
         let test = games % 5 == 4;
         games += 1;
         let mut s = e.new_match(replay.seed);
-        let mut rec: Vec<(usize, [i8; IN], [i8; IN], f32)> = Vec::new();
+        let mut rec: Vec<(usize, [i8; IN], [i8; IN], f32, Option<f32>)> = Vec::new();
         let mut reward: Vec<f64> = Vec::new();
         let (mut ea, mut eb) = ([0.0f32; IN], [0.0f32; IN]);
         for (ti, t) in replay.ticks.iter().enumerate() {
@@ -165,7 +186,8 @@ fn main() {
                 encode(e, &s, 0, &mut ea);
                 encode(e, &s, 1, &mut eb);
                 let lin = victris_engine::valuefeat::value(e, &s, 0, lin_w);
-                rec.push((ti, q(&ea), q(&eb), lin));
+                let root = if own && !roots.is_empty() { roots.get(&e.state_hash(&s)).copied() } else { None };
+                rec.push((ti, q(&ea), q(&eb), lin, root));
             }
             let before = (s.fighters[0].hp.max(0), s.fighters[1].hp.max(0));
             e.step(&mut s, &t.turns);
@@ -182,8 +204,13 @@ fn main() {
         for k in (0..reward.len()).rev() {
             to_come[k] = reward[k] + 0.98 * to_come[k + 1];
         }
-        for (ti, a, b, lin) in rec {
-            samples.push(Sample { a, b, y: to_come[ti] as f32, lin, test });
+        for (ti, a, b, lin, root) in rec {
+            let mut y = to_come[ti] as f32;
+            if let Some(r) = root {
+                y = (1.0 - root_mix) * y + root_mix * r;
+                with_root += 1;
+            }
+            samples.push(Sample { a, b, y, lin, test, own });
         }
     }
     let n_params = RawNet::params(h1, h2);
@@ -201,7 +228,13 @@ fn main() {
             RawNet::new(map.clone(), h1, h2, w)
         }
     };
-    let train: Vec<usize> = (0..samples.len()).filter(|i| !samples[*i].test).collect();
+    let mut train: Vec<usize> = Vec::new();
+    for i in (0..samples.len()).filter(|i| !samples[*i].test) {
+        for _ in 0..if samples[i].own { own_weight.max(1) } else { 1 } {
+            train.push(i);
+        }
+    }
+    eprintln!("{} positions carry the search's own verdict; own games weighted x{}", with_root, own_weight);
     let test: Vec<usize> = (0..samples.len()).filter(|i| samples[*i].test).collect();
     eprintln!("{} games on {map}, {} positions ({} held out), {} weights", games, samples.len(), test.len(), n_params);
     let eval = |net: &RawNet| -> (f64, f64, f64) {

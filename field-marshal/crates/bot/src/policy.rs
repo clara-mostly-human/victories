@@ -210,6 +210,10 @@ pub struct Playbook {
     pub tree_turn_model: String,
     /// Raw-board judgments by map: a folder holding <map>.json (`rawnet`); empty: off.
     pub tree_raw_dir: String,
+    /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
+    /// past the time cap); 0: by time. For self-play: more games an hour, and the same game
+    /// every time from the same seed.
+    pub tree_iters: u32,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
     pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
@@ -393,6 +397,7 @@ impl Default for Playbook {
             tree_deadline_ext: 0,
             tree_turn_model: String::new(),
             tree_raw_dir: String::new(),
+            tree_iters: 0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
@@ -548,6 +553,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_depth_buff").and_then(Value::as_u64) {
             p.tree_depth_buff = x as u32;
+        }
+        if let Some(x) = v.get("tree_iters").and_then(Value::as_u64) {
+            p.tree_iters = x as u32;
         }
         if let Some(x) = v.get("tree_raw_dir").and_then(Value::as_str) {
             p.tree_raw_dir = x.to_string();
@@ -1569,14 +1577,16 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             }
             let mut done = 0u32;
             loop {
-                search.iterate(&s, [None, None], 1000);
-                done += 1000;
-                if started.elapsed().as_millis() as u64 >= deadline {
+                let chunk = if pb.tree_iters > 0 { (pb.tree_iters - done).min(1000) } else { 1000 };
+                search.iterate(&s, [None, None], chunk);
+                done += chunk;
+                if (pb.tree_iters > 0 && done >= pb.tree_iters) || started.elapsed().as_millis() as u64 >= deadline {
                     break;
                 }
             }
             let root = search.result();
             dump_visits(e, &s, me, &root.acts[me]);
+            dump_root(e, &s, root.value);
             let Some((turn, _, q)) = root.acts[me].iter().max_by_key(|a| a.1).copied() else { return idle };
             LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: root.acts, value: root.value, sims: done, reused }));
             let tree = search.into_tree();
@@ -2272,4 +2282,15 @@ fn raw_net(path: &str) -> Option<&'static victris_engine::rawnet::RawNet> {
     static NETS: OnceLock<Mutex<HashMap<String, Option<&'static victris_engine::rawnet::RawNet>>>> = OnceLock::new();
     let mut m = NETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
     *m.entry(path.to_string()).or_insert_with(|| victris_engine::rawnet::RawNet::load(std::path::Path::new(path)).map(|n| &*Box::leak(Box::new(n))))
+}
+
+/// ARENA_ROOTS=file: for every tree decision, the position's hash and what the search made of it
+/// (its root value, for fighter 0), so the raw-board judgment can train on the search's own
+/// verdicts (`rawfit` reads roots.txt next to the replays).
+fn dump_root(e: &victris_engine::Engine, s: &State, value0: f64) {
+    let Some(path) = std::env::var_os("ARENA_ROOTS") else { return };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{} {:.3}", e.state_hash(s), value0);
+    }
 }
