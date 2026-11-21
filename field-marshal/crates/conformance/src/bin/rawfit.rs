@@ -198,7 +198,7 @@ fn main() {
                 rng ^= rng << 17;
                 *v = ((rng % 20001) as f32 / 10000.0 - 1.0) * 0.1;
             }
-            RawNet { map: map.clone(), h1, h2, w }
+            RawNet::new(map.clone(), h1, h2, w)
         }
     };
     let train: Vec<usize> = (0..samples.len()).filter(|i| !samples[*i].test).collect();

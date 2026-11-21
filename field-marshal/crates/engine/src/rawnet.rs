@@ -121,11 +121,51 @@ pub struct RawNet {
     pub h2: usize,
     /// h1 x IN, then h1 biases, h2 x h1, h2 biases, h2 output weights, output bias
     pub w: Vec<f32>,
+    /// The two weight matrices of `w` turned on their side for `value0` (`sideways`): for each
+    /// input its h1 weights, then for each first-layer unit its h2 weights. Built by `new` and
+    /// `load`; call `refresh` after changing `w` by hand.
+    side: Vec<f32>,
+}
+
+/// acc += x * w, unit by unit. Every unit keeps its own running sum, so the compiler may do
+/// several units in one instruction without changing any result (a sum over the inputs of one
+/// unit, as in `g`, must be done one number at a time).
+#[inline(always)]
+fn axpy(acc: &mut [f32], x: f32, w: &[f32]) {
+    for (a, w) in acc.iter_mut().zip(w.iter()) {
+        *a += x * *w;
+    }
 }
 
 impl RawNet {
     pub fn params(h1: usize, h2: usize) -> usize {
         h1 * IN + h1 + h2 * h1 + h2 + h2 + 1
+    }
+
+    pub fn new(map: String, h1: usize, h2: usize, w: Vec<f32>) -> RawNet {
+        let mut net = RawNet { map, h1, h2, w, side: Vec::new() };
+        net.refresh();
+        net
+    }
+
+    /// Rebuilds the sideways copy of the weights from `w`.
+    pub fn refresh(&mut self) {
+        let (h1, h2) = (self.h1, self.h2);
+        let mut side = vec![0.0f32; IN * h1 + h1 * h2];
+        if self.w.len() == Self::params(h1, h2) {
+            for j in 0..h1 {
+                for i in 0..IN {
+                    side[i * h1 + j] = self.w[j * IN + i];
+                }
+            }
+            let base2 = h1 * IN + h1;
+            for j in 0..h2 {
+                for i in 0..h1 {
+                    side[IN * h1 + i * h2 + j] = self.w[base2 + j * h1 + i];
+                }
+            }
+        }
+        self.side = side;
     }
 
     pub fn g(&self, x: &[f32; IN]) -> f32 {
@@ -153,8 +193,69 @@ impl RawNet {
         out
     }
 
-    /// The judgment for fighter 0, in hp to come.
+    /// The judgment for fighter 0, in hp to come: g(0's view) - g(1's view), as `value0_ref`
+    /// computes it, to the last bit, in a fraction of the time.
+    ///
+    /// The two views hold the same two fighter blocks in swapped places, so each fighter is
+    /// encoded once (not twice). And both passes run input by input over all hidden units at
+    /// once (`axpy`) instead of unit by unit over all inputs: each unit still adds its terms in
+    /// the same order, so the result is the same, but the compiler can now use vector
+    /// instructions, and an input that is zero (most wall cells, absent shots) costs nothing.
     pub fn value0(&self, e: &Engine, s: &State) -> f32 {
+        let (h1, h2) = (self.h1, self.h2);
+        if h1 > MAX_H || h2 > MAX_H || self.side.len() != IN * h1 + h1 * h2 {
+            return self.value0_ref(e, s);
+        }
+        let mut o = [[0.0f32; OWN]; 2];
+        own(e, s, 0, &mut o[0]);
+        own(e, s, 1, &mut o[1]);
+        let (f0, f1) = (&s.fighters[0], &s.fighters[1]);
+        let (dx, dy) = ((f1.pos[0] - f0.pos[0]) as f32 / 20.0, (f1.pos[1] - f0.pos[1]) as f32 / 20.0);
+        let common = [s.tick as f32 / 600.0, s.zone_radius.clamp(0, 15) as f32 / 15.0, 0.0, 0.0, chebyshev(f0.pos, f1.pos).min(20) as f32 / 20.0, 1.0];
+        let ctx = [[common[0], common[1], dx, dy, common[4], common[5]], [common[0], common[1], -dx, -dy, common[4], common[5]]];
+        let w = &self.w;
+        let t1 = &self.side[..IN * h1];
+        let t2 = &self.side[IN * h1..];
+        let bias1 = &w[h1 * IN..h1 * IN + h1];
+        let base2 = h1 * IN + h1;
+        let bias2 = &w[base2 + h2 * h1..base2 + h2 * h1 + h2];
+        let outw = &w[base2 + h2 * h1 + h2..base2 + h2 * h1 + h2 + h2];
+        let out_bias = w[base2 + h2 * h1 + h2 + h2];
+        let mut g = [0.0f32; 2];
+        for v in 0..2 {
+            // view v: fighter v's block is "mine", the other's is "theirs", then the position
+            let mut z = [0.0f32; MAX_H];
+            let z = &mut z[..h1];
+            z.copy_from_slice(bias1);
+            for (block, xs) in [&o[v][..], &o[1 - v][..], &ctx[v][..]].into_iter().enumerate() {
+                let first = block * OWN;
+                for (i, &x) in xs.iter().enumerate() {
+                    if x != 0.0 {
+                        axpy(z, x, &t1[(first + i) * h1..(first + i + 1) * h1]);
+                    }
+                }
+            }
+            for a in z.iter_mut() {
+                *a = act(*a);
+            }
+            let mut z2 = [0.0f32; MAX_H];
+            let z2 = &mut z2[..h2];
+            z2.copy_from_slice(bias2);
+            for (i, &a) in z.iter().enumerate() {
+                axpy(z2, a, &t2[i * h2..(i + 1) * h2]);
+            }
+            let mut out = out_bias;
+            for j in 0..h2 {
+                out += outw[j] * act(z2[j]);
+            }
+            g[v] = out;
+        }
+        g[0] - g[1]
+    }
+
+    /// `value0` the plain way: both views encoded in full, one pass of `g` each. Kept as the
+    /// reference the fast path is checked against (`tests/rawnet.rs`).
+    pub fn value0_ref(&self, e: &Engine, s: &State) -> f32 {
         let mut a = [0.0f32; IN];
         let mut b = [0.0f32; IN];
         encode(e, s, 0, &mut a);
@@ -174,7 +275,7 @@ impl RawNet {
         if w.len() != Self::params(h1, h2) {
             return None;
         }
-        Some(RawNet { map: v.get("map").and_then(|m| m.as_str()).unwrap_or("").to_string(), h1, h2, w })
+        Some(RawNet::new(v.get("map").and_then(|m| m.as_str()).unwrap_or("").to_string(), h1, h2, w))
     }
 }
 
