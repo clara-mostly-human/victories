@@ -8,6 +8,7 @@
 //! Everything a bot needs is on [`Engine`]: build one from the rules and map in `hello`,
 //! then `new_match`, `step`, and `state_hash`. [`State`] is flat and `Copy`.
 
+pub mod azdata;
 pub mod clone;
 pub mod events;
 pub mod geom;
@@ -19,6 +20,8 @@ pub mod models;
 pub mod models_own;
 pub mod movefeat;
 pub mod observe;
+pub mod pvnet;
+pub mod pvsearch;
 pub mod rawnet;
 pub mod replay;
 pub mod rules;

@@ -78,7 +78,12 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
                         trackers[i].last_mismatch.clone().unwrap_or_default(), Value::Array(told.clone()));
                 }
             }
+            // ARENA_ORACLE=name: that playbook's learned search is told the true state while
+            // the opponent is out of sight (an experiment: the worth of a perfect guess).
+            let oracle = std::env::var("ARENA_ORACLE").map(|n| n == book.name).unwrap_or(false);
+            crate::policy::PV_ORACLE.with(|o| *o.borrow_mut() = if oracle { Some(s) } else { None });
             let d = decide(&trackers[i], &view, book);
+            crate::policy::PV_ORACLE.with(|o| *o.borrow_mut() = None);
             // ARENA_DASHLOG=1: one line for every dash, to see what the dashes are for.
             if matches!(d.turn.dash, victris_engine::turn::DirIn::Dir(_)) && std::env::var_os("ARENA_DASHLOG").is_some() {
                 let (me, en) = (&s.fighters[i], &s.fighters[1 - i]);

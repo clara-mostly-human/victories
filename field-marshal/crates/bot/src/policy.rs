@@ -210,6 +210,24 @@ pub struct Playbook {
     pub tree_turn_model: String,
     /// Raw-board judgments by map: a folder holding <map>.json (`rawnet`); empty: off.
     pub tree_raw_dir: String,
+    /// A folder of networks for the learned search (`pvsearch`), one `<map>.json` each, written
+    /// by `aztrain`. When set and the map has one, that search decides alone while the opponent
+    /// is in sight: the network's win chance at the end of every line, its move shares to choose
+    /// where to look, no play-out and no hp sum. Empty (the default): off.
+    pub tree_pv_dir: String,
+    /// With `tree_pv_dir`: the learned search also decides while the opponent is out of sight
+    /// (about half of all ticks on columns-21 and pillars-21 in ladder games), searching from
+    /// the tracker's guess at where it stands; with `tree_fog_samples` over 1, one search for
+    /// each of that many guesses, our turns pooled. Off (the default): out of sight the plain
+    /// tree search decides if `tree_fog` allows it, else the hand-written policy.
+    ///
+    /// Leave it off for now. Measured with the generation 5 network on columns-21 (arena, fog,
+    /// 20 ms a turn, 40 games) against the same bot without it: 14-23-3. Told the true hidden
+    /// state (`ARENA_ORACLE`): 18-16-6. So the tracker's guess, a ghost that stands still where
+    /// the opponent was last believed to be, costs about 14 points, and with a perfect guess
+    /// this search only matches the hand-written policy, which takes 3.8 power pads a game to
+    /// its 0.8. It needs a guess that moves as an opponent would before it earns these ticks.
+    pub tree_pv_fog: bool,
     /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
     /// past the time cap); 0: by time. For self-play: more games an hour, and the same game
     /// every time from the same seed.
@@ -397,6 +415,8 @@ impl Default for Playbook {
             tree_deadline_ext: 0,
             tree_turn_model: String::new(),
             tree_raw_dir: String::new(),
+            tree_pv_dir: String::new(),
+            tree_pv_fog: false,
             tree_iters: 0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
@@ -559,6 +579,12 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_raw_dir").and_then(Value::as_str) {
             p.tree_raw_dir = x.to_string();
+        }
+        if let Some(x) = v.get("tree_pv_dir").and_then(Value::as_str) {
+            p.tree_pv_dir = x.to_string();
+        }
+        if let Some(x) = v.get("tree_pv_fog").and_then(Value::as_bool) {
+            p.tree_pv_fog = x;
         }
         if let Some(x) = v.get("tree_turn_model").and_then(Value::as_str) {
             p.tree_turn_model = x.to_string();
@@ -1424,6 +1450,18 @@ thread_local! {
     static KEPT: std::cell::RefCell<std::collections::HashMap<(i64, usize), Kept>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// The learned search's tree kept between ticks, per match (seed) and seat.
+struct PvKept {
+    tick: i32,
+    root: State,
+    tree: victris_engine::pvsearch::Tree,
+}
+
+thread_local! {
+    static PV_KEPT: std::cell::RefCell<std::collections::HashMap<(i64, usize), PvKept>> = std::cell::RefCell::new(std::collections::HashMap::new());
+    pub static PV_ORACLE: std::cell::RefCell<Option<State>> = const { std::cell::RefCell::new(None) };
+}
+
 /// What the tree search found at the root of its latest decision on this thread: the position
 /// it searched (the tracker's belief), each side's turns with their visits and average result
 /// in hp for that side, the average result for fighter 0, and the iterations run and reused.
@@ -1472,7 +1510,10 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     // exact engine for `tree_ms`, and we play our most visited turn. Only with `search` on:
     // the gateway's quick fallback calls us with `search` off and wants the plain heuristic.
     let guessed = pb.tree_fog > 0 && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_fog).unwrap_or(s.tick <= pb.tree_fog);
-    if pb.tree_ms > 0 && pb.search && (visible || guessed) && t.think_cap_ms(pb.tree_ms) >= 20 {
+    // `tree_pv_fog`: on a map with a network the learned search takes every tick out of sight,
+    // with no need for `tree_fog`.
+    let pv_hidden = !visible && pb.tree_pv_fog && !pb.tree_pv_dir.is_empty() && pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)).is_some();
+    if pb.tree_ms > 0 && pb.search && (visible || guessed || pv_hidden) && t.think_cap_ms(pb.tree_ms) >= 20 {
         let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, lead_mask: if pb.tree_lead_them { 1u8 << (1 - me) } else { 0 }, expand_at: pb.tree_expand_at, max_nodes: pb.tree_max_nodes, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
         if pb.tree_value != 0.0 || pb.tree_net != 0.0 || pb.tree_net_hp != 0.0 || pb.tree_net_value != 0.0 {
             cfg.buff_value = 0.0;
@@ -1556,6 +1597,101 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         };
         // The starting states, made here: the tracker cannot be shared between threads.
         let starts: Vec<victris_engine::State> = (0..pb.tree_threads.max(1) * per_thread).map(root_for).collect();
+        // The learned search, when this map has a network and the opponent is in sight. Out of
+        // sight the searches below still decide (they search over guesses of where it is),
+        // unless `tree_pv_fog` gives those ticks to the learned search too.
+        let pv = if (visible || pv_hidden) && !pb.tree_pv_dir.is_empty() { pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)) } else { None };
+        if let Some(net) = pv {
+            if !visible {
+                // One search for each guess at where the opponent stands, an equal share of the
+                // time each, and our turns pooled by turn: a turn good against most guesses wins.
+                // No tree is kept: next tick's guesses are other states.
+                PV_KEPT.with(|k| k.borrow_mut().remove(&(t.seed, me)));
+                // For measuring only: the arena can hand over the true state (`ARENA_ORACLE`), to
+                // see what a perfect guess at the hidden opponent would be worth. Never set live.
+                let starts: Vec<victris_engine::State> = match PV_ORACLE.with(|o| *o.borrow()) {
+                    Some(truth) => vec![truth],
+                    None => starts.clone(),
+                };
+                let begun = started.elapsed().as_millis() as u64;
+                let n = starts.len().max(1);
+                let share = if pb.tree_iters > 0 { (pb.tree_iters / n as u32).max(1) } else { 0 };
+                let mut pooled: Vec<(RawTurn, u32, f32)> = Vec::new();
+                let mut first: Option<([Vec<(RawTurn, u32, f64)>; 2], f64)> = None;
+                let mut done = 0u32;
+                for (j, root) in starts.iter().enumerate() {
+                    let until = begun + deadline.saturating_sub(begun) * (j as u64 + 1) / n as u64;
+                    let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig::default());
+                    let mut mine = 0u32;
+                    loop {
+                        let chunk = if share > 0 { (share - mine).min(500) } else { 500 };
+                        search.iterate(root, chunk);
+                        mine += chunk;
+                        if (share > 0 && mine >= share) || started.elapsed().as_millis() as u64 >= until {
+                            break;
+                        }
+                    }
+                    done += mine;
+                    let r = search.root();
+                    for a in r[me].iter() {
+                        match pooled.iter_mut().find(|b| b.0 == a.0) {
+                            Some(b) => {
+                                let sum = b.1 + a.1;
+                                if sum > 0 {
+                                    b.2 = (b.2 * b.1 as f32 + a.2 * a.1 as f32) / sum as f32;
+                                }
+                                b.1 = sum;
+                            }
+                            None => pooled.push(*a),
+                        }
+                    }
+                    if j == 0 {
+                        let wide = |x: usize| r[x].iter().map(|a| (a.0, a.1, a.2 as f64)).collect::<Vec<_>>();
+                        first = Some(([wide(0), wide(1)], search.value() as f64));
+                    }
+                }
+                let Some((turn, _, q)) = pooled.iter().max_by_key(|a| a.1).copied() else { return idle };
+                if let Some((acts, value)) = first {
+                    LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts, value, sims: done, reused: 0 }));
+                }
+                return Decision { turn, sims: done, score: q as f64, note: "pv-fog" };
+            }
+            let key = (t.seed, me);
+            let kept = PV_KEPT.with(|k| k.borrow_mut().remove(&key));
+            let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig::default());
+            let mut reused = 0u32;
+            if let Some(k) = kept {
+                if k.tick + 1 == s.tick {
+                    search.start_from(k.tree);
+                    if search.advance_to(&k.root, &s) {
+                        reused = search.visits();
+                    }
+                }
+            }
+            let mut done = 0u32;
+            loop {
+                let chunk = if pb.tree_iters > 0 { (pb.tree_iters - done).min(500) } else { 500 };
+                search.iterate(&s, chunk);
+                done += chunk;
+                if (pb.tree_iters > 0 && done >= pb.tree_iters) || started.elapsed().as_millis() as u64 >= deadline {
+                    break;
+                }
+            }
+            let root = search.root();
+            let Some((turn, _, q)) = root[me].iter().max_by_key(|a| a.1).copied() else { return idle };
+            let value = search.value() as f64;
+            let wide = |x: usize| root[x].iter().map(|a| (a.0, a.1, a.2 as f64)).collect::<Vec<_>>();
+            LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: [wide(0), wide(1)], value, sims: done, reused }));
+            let tree = search.into_tree();
+            PV_KEPT.with(|k| {
+                let mut k = k.borrow_mut();
+                if k.len() > 16 {
+                    k.clear();
+                }
+                k.insert(key, PvKept { tick: s.tick, root: s, tree });
+            });
+            return Decision { turn, sims: done + reused, score: q as f64, note: "pv" };
+        }
         if pb.tree_reuse && pb.tree_threads <= 1 && per_thread == 1 && visible {
             // One search, seeded with the branch of last tick's tree that the game went into.
             let key = (t.seed, me);
@@ -2282,6 +2418,15 @@ fn raw_net(path: &str) -> Option<&'static victris_engine::rawnet::RawNet> {
     static NETS: OnceLock<Mutex<HashMap<String, Option<&'static victris_engine::rawnet::RawNet>>>> = OnceLock::new();
     let mut m = NETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
     *m.entry(path.to_string()).or_insert_with(|| victris_engine::rawnet::RawNet::load(std::path::Path::new(path)).map(|n| &*Box::leak(Box::new(n))))
+}
+
+/// The learned search's network at `path`, read once and kept (`None` when there is none).
+fn pv_net(path: &str) -> Option<&'static victris_engine::pvnet::PvNet> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NETS: OnceLock<Mutex<HashMap<String, Option<&'static victris_engine::pvnet::PvNet>>>> = OnceLock::new();
+    let mut m = NETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
+    *m.entry(path.to_string()).or_insert_with(|| victris_engine::pvnet::PvNet::load(std::path::Path::new(path)).map(|n| &*Box::leak(Box::new(n))))
 }
 
 /// ARENA_ROOTS=file: for every tree decision, the position's hash and what the search made of it
