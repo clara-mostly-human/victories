@@ -33,9 +33,12 @@ fn main() {
     let t2 = Instant::now();
     for i in 0..n { acc += net.value0(e, &states[i % states.len()]); }
     let v = t2.elapsed().as_secs_f64() / n as f64 * 1e6;
+    let t2b = Instant::now();
+    for i in 0..n { acc += net.value0_ref(e, &states[i % states.len()]); }
+    let vr = t2b.elapsed().as_secs_f64() / n as f64 * 1e6;
     let lw = victris_engine::models::value_weights(13);
     let t3 = Instant::now();
     for i in 0..n { acc += victris_engine::valuefeat::value(e, &states[i % states.len()], 0, lw); }
     let l = t3.elapsed().as_secs_f64() / n as f64 * 1e6;
-    println!("encode {enc:.2} us, network pass {g:.2} us, full judgment {v:.2} us, linear judgment {l:.2} us ({acc})");
+    println!("encode {enc:.2} us, network pass {g:.2} us, full judgment {v:.2} us (the plain way {vr:.2} us), linear judgment {l:.2} us ({acc})");
 }
