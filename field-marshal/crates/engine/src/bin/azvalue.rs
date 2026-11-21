@@ -10,6 +10,10 @@
 //! once (a game's positions all share its result), so a gap of three errors or more is real.
 //! Run on self-play games it shows what self-play taught; run on ladder replays it shows where
 //! the ladder disagrees. The kinds are a list to look through, nothing the bot uses.
+//!
+//! The first line is the whole in two figures, counted as the trainer counts them: the value
+//! loss (cross-entropy of the chance to win against the real result) and how often the value
+//! names the real winner, over every position of the games that had a winner.
 
 use victris_engine::azdata::GameLog;
 use victris_engine::geom::chebyshev;
@@ -63,6 +67,8 @@ fn main() {
         }
     }
     let (mut n, mut value, mut real) = ([0u64; 12], [0.0f64; 12], [0.0f64; 12]);
+    // over every position: summed value loss and positions; right about the winner and positions of won games
+    let (mut loss, mut positions, mut hit, mut decided) = (0.0f64, 0u64, 0u64, 0u64);
     // per game and kind: summed (real - value) and positions
     let mut per: Vec<([f64; 12], [f64; 12])> = Vec::new();
     for (seed, turns) in &games {
@@ -80,6 +86,13 @@ fn main() {
         let slot = per.len() - 1;
         for p in &seen {
             let v0 = net.eval(&e, p).v0 as f64;
+            let (chance, target) = (0.5 * (1.0 + v0), 0.5 * (1.0 + z0 as f64));
+            loss -= target * (chance + 1e-7).ln() + (1.0 - target) * (1.0 - chance + 1e-7).ln();
+            positions += 1;
+            if z0 != 0.0 {
+                decided += 1;
+                hit += ((v0 > 0.0) == (z0 > 0.0)) as u64;
+            }
             for x in 0..2 {
                 let (me, op) = (&p.fighters[x], &p.fighters[1 - x]);
                 if !(me.alive && op.alive) {
@@ -117,7 +130,15 @@ fn main() {
             }
         }
     }
-    println!("azvalue {}: {} games. For fighter X: the network's value, the real result, and the gap (real less value; negative: the network thinks too well of it for X)", net.map, per.len());
+    println!(
+        "azvalue {}: {} games, {} positions: value loss {:.4}, picks the winner {:.1}%",
+        net.map,
+        per.len(),
+        positions,
+        loss / positions.max(1) as f64,
+        100.0 * hit as f64 / decided.max(1) as f64
+    );
+    println!("For fighter X: the network's value, the real result, and the gap (real less value; negative: the network thinks too well of it for X)");
     for k in 0..12 {
         let c = n[k].max(1) as f64;
         let gap = (real[k] - value[k]) / c;
