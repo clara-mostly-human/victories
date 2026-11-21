@@ -366,3 +366,48 @@ fn earned_visits_leave_out_what_the_wide_root_forced() {
     let fresh = Search::new(&e, &net, PvConfig::default());
     assert!(fresh.root_earned().iter().all(|l| l.iter().all(|v| v.1 == 0.0)));
 }
+
+#[test]
+fn a_lesson_without_shares_teaches_the_value_and_leaves_the_moves_alone() {
+    // what azreal writes from a real game: the positions and who won, no shares for the turns
+    let e = Engine::shipped("columns-21");
+    let mut game = random_game(&e, 21, 60);
+    for t in game.ticks.iter_mut() {
+        t.q = None;
+        t.pol = t.pol.map(|_| [[0u8; CLASSES]; 2]);
+    }
+    // it is saved and read back as it was
+    let mut bytes = Vec::new();
+    game.write(&mut bytes);
+    let back = GameLog::read_all(&bytes);
+    assert_eq!(back.len(), 1);
+    let mut samples: Vec<Sample> = Vec::new();
+    assert!(back[0].samples(&e, &mut samples));
+    assert!(samples.len() >= 30, "{} positions", samples.len());
+    let net = random_net(3);
+    let n = layout(net.h1, net.h2).len;
+    let mut sc = Scratch::default();
+    let mut moved_value = false;
+    for r in &samples {
+        // the lesson is the game's result, nothing from a search
+        assert!(!r.has_q && r.z == game.z);
+        assert!(r.pol.iter().all(|f| f.iter().all(|v| *v == 0)));
+        let mut grad = vec![0.0f32; n];
+        let loss = loss_grad(&net, &e, r, 0.5, 1.0, &mut sc, Some(&mut grad));
+        // no moves loss at all, and a value loss with a slope
+        assert_eq!(loss.policy_n, 0);
+        assert_eq!(loss.policy, 0.0);
+        assert!(loss.value > 0.0);
+        moved_value |= grad.iter().any(|g| *g != 0.0);
+        // the same position with shares does carry a moves loss: the lesson above left it out,
+        // the trainer did not lose it
+        let mut with = r.clone();
+        let mut buf = Vec::new();
+        turns(&e, &r.s, 0, &mut buf);
+        if buf.len() >= 2 {
+            with.pol[0][class_of(&buf[0])] = 255;
+            assert_eq!(loss_grad(&net, &e, &with, 0.5, 1.0, &mut sc, None).policy_n, 1);
+        }
+    }
+    assert!(moved_value, "the value was not taught");
+}
