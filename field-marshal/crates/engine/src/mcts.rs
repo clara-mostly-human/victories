@@ -766,6 +766,8 @@ pub struct Search<'a> {
     pub sample_every: u32,
     pub samples: Vec<State>,
     leaves: u32,
+    /// pondering (`ponder`): per side, the index of the turn it must take at the root
+    forced: [Option<usize>; 2],
 }
 
 /// A search tree kept between ticks: the positions below a root, with their statistics.
@@ -793,7 +795,7 @@ pub struct RootResult {
 
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, cfg: Config) -> Search<'a> {
-        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0, pairs: HashMap::new(), plans: Vec::new(), root_plan: [Vec::new(), Vec::new()], plan_kind: Vec::new(), plans_pending: false, goals: if cfg.plan_playout || cfg.heal_value != 0.0 { e.map.pads.iter().map(|p| p.pos).chain(std::iter::once(e.map.center)).map(|p| (p, dist_map(e, p))).collect() } else { Vec::new() }, sample_every: 0, samples: Vec::new(), leaves: 0 }
+        Search { e, cfg, nodes: Vec::new(), children: HashMap::new(), total: 0.0, done: 0, pairs: HashMap::new(), plans: Vec::new(), root_plan: [Vec::new(), Vec::new()], plan_kind: Vec::new(), plans_pending: false, goals: if cfg.plan_playout || cfg.heal_value != 0.0 { e.map.pads.iter().map(|p| p.pos).chain(std::iter::once(e.map.center)).map(|p| (p, dist_map(e, p))).collect() } else { Vec::new() }, sample_every: 0, samples: Vec::new(), leaves: 0, forced: [None, None] }
     }
 
     fn select(&self, node: usize, side: usize) -> usize {
@@ -895,6 +897,46 @@ impl<'a> Search<'a> {
             return Some(Tree { nodes, children });
         }
         None
+    }
+
+    /// Pondering: `count` more iterations from `root`, every one of them under the turn `ours`
+    /// that fighter `me` has already sent for this tick. The bot can run this while it waits for
+    /// the next observation (time the match budget does not count), so the branch the game goes
+    /// into (`reroot`) starts the next tick that much larger.
+    ///
+    /// No iteration is spent on turns we did not play. The opponent chose its turn without
+    /// seeing ours, so its replies do not get the iterations by what answers our turn best (that
+    /// puts nearly all of them on one reply, the best answer to a turn it could not know). Each
+    /// reply gets them in proportion to the visits the search has given it at the root, which is
+    /// how likely the search thinks it is; pondering keeps those proportions, so it can be called
+    /// again and again in small pieces. Below the root the search runs as usual.
+    ///
+    /// False (and nothing done) when `ours` is not one of the root's turns.
+    pub fn ponder(&mut self, root: &State, me: usize, ours: &RawTurn, count: u32) -> bool {
+        let Some(nd) = self.nodes.first() else { return false };
+        let Some(i) = nd.acts[me].iter().position(|a| a.turn == *ours) else { return false };
+        let share: Vec<f64> = nd.acts[1 - me].iter().map(|a| a.n as f64).collect();
+        let total: f64 = share.iter().sum();
+        if total <= 0.0 {
+            return false;
+        }
+        let mut given = vec![0u32; share.len()];
+        for k in 0..count {
+            // the reply furthest behind its share of the pondering so far
+            let mut best = (f64::MIN, 0);
+            for (j, sh) in share.iter().enumerate() {
+                let owed = sh / total * (k + 1) as f64 - given[j] as f64;
+                if owed > best.0 {
+                    best = (owed, j);
+                }
+            }
+            given[best.1] += 1;
+            self.forced[me] = Some(i);
+            self.forced[1 - me] = Some(best.1);
+            self.iterate(root, [None, None], 1);
+        }
+        self.forced = [None, None];
+        true
     }
 
     /// The tree, to keep until the next tick.
@@ -1180,7 +1222,15 @@ impl<'a> Search<'a> {
                     self.add_root_plans(&s, fixed);
                     self.plans_pending = false;
                 }
-                let (i0, i1) = (self.select(node, 0), self.select(node, 1));
+                let (mut i0, mut i1) = (self.select(node, 0), self.select(node, 1));
+                if node == 0 {
+                    if let Some(i) = self.forced[0] {
+                        i0 = i;
+                    }
+                    if let Some(i) = self.forced[1] {
+                        i1 = i;
+                    }
+                }
                 if node == 0 && self.cfg.plans {
                     took = [self.root_plan[0].get(i0).cloned().unwrap_or(0), self.root_plan[1].get(i1).cloned().unwrap_or(0)];
                 }
