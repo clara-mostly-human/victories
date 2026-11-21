@@ -1,13 +1,13 @@
 # Grows the replay corpus from GitHub's network, not from the address the live bots play
-# from (replay downloads from there came with dropped bot connections). Every three hours
-# it fetches up to 300 new replays (the top bots' games and our own) and commits them to
+# from (replay downloads from there came with dropped bot connections). Every hour
+# (every three until 2026-11-21, when the learned-search trial needed fresher games) it fetches up to 300 new replays (the top bots' games and our own) and commits them to
 # the `corpus` branch. The Mac pulls that branch, verifies every replay on the exact engine
 # and indexes it (`fleet collect import`, run by the health pass).
 name: Replay corpus
 
 on:
   schedule:
-    - cron: "17 */3 * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
     inputs:
       max:
