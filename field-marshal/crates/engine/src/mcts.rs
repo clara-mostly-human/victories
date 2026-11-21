@@ -123,11 +123,30 @@ pub struct Config {
     /// games against 2400+ bots: they play such a turn on 22.8% of the ticks they have one, where
     /// the fitted move model gives those turns 3.9%.
     pub slam_prior: f32,
+    /// per mode (`strategy::MODE_NAMES` order), the worth in hp of one unit of that mode's goal
+    /// score, fitted from replays by `stratfit`; used instead of the single `strategy` weight
+    /// when any is non-zero (modes still need `strategy` != 0)
+    pub strategy_w: [f64; 5],
+    /// not 0: in the top three plies, this share of each side's prior goes to the turns that move
+    /// it toward its mode's goal (in proportion to the goal score gained), so the strategy steers
+    /// what the search looks at, not how it judges
+    pub strategy_prior: f32,
+    /// correct every move list by the class table `models::CALIB` (movement x attack, per distance
+    /// band), fitted by `calib --emit` on what 2400+ ladder bots played against the uncorrected model
+    pub calib: bool,
+    /// not 0: a new position at the tick a power pad spawns is
+    /// not judged directly: both sides' `deadline_k` likeliest turns are played against each other
+    /// (every pair, one tick) and the position gets the value of that small simultaneous game,
+    /// each outcome judged as usual. The spawn fight is read move by move, not guessed at.
+    pub deadline_k: usize,
+    /// not 0: a line that reaches the tick a power pad restocks is not judged until this many
+    /// ticks later; the search reads those ticks move by move (past `depth` if need be)
+    pub deadline_ext: i32,
 }
 
 impl Default for Config {
     fn default() -> Config {
-        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], strategy: 0.0, strategy_side: 2, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0, slam_prior: 0.0 }
+        Config { iterations: 20_000, depth: 12, c: 1.5, quiet: 6, buff_value: 0.3, even: 0.25, value_weight: 0.0, value_gen: 0, net_weight: 0.0, net_hp: 0.0, net_value: 0.0, net_cap: 0.0, plans: false, plan_playout: false, win_shape: 0.0, slam_value: 0.0, loaded_value: 0.0, heal_value: 0.0, phase_gens: [0; crate::valuefeat::PHASES], strategy: 0.0, strategy_side: 2, lead: false, lead_mask: 0, quiet_slam: false, own_priors: false, dash_burst: false, expand_at: 0, max_nodes: 0, noise_seed: 0, forcing_depth: 0, slam_prior: 0.0, strategy_w: [0.0; 5], strategy_prior: 0.0, calib: false, deadline_k: 0, deadline_ext: 0 }
     }
 }
 
@@ -327,6 +346,12 @@ pub fn actions(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: 
 
 #[allow(clippy::too_many_arguments)]
 pub fn actions_with(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: bool, own: bool, dash_burst: bool) -> Vec<Act> {
+    actions_cal(e, s, x, even, forcing, lead, own, dash_burst, false)
+}
+
+/// `actions_with`, and with `calib` the class correction `models::CALIB` (`Config::calib`).
+#[allow(clippy::too_many_arguments)]
+pub fn actions_cal(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, lead: bool, own: bool, dash_burst: bool, calib: bool) -> Vec<Act> {
     let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
     let idle = vec![Act { turn: RawTurn::IDLE, prior: 1.0, n: 0, w: 0.0 }];
     if f.state != FState::Idle || !f.alive || !o.alive {
@@ -419,6 +444,12 @@ pub fn actions_with(e: &Engine, s: &State, x: usize, even: f32, forcing: bool, l
         }
         if let Some(a) = frost {
             out.push(Act { turn: mv.with_attack(a, o.pos), prior: pm * attack_p[3], n: 0, w: 0.0 });
+        }
+    }
+    if calib {
+        let band = calib_band(d);
+        for a in out.iter_mut() {
+            a.prior *= crate::models::CALIB[band][turn_class(e, s, x, &a.turn)];
         }
     }
     let total: f32 = out.iter().map(|a| a.prior).sum();
@@ -679,7 +710,11 @@ pub fn leaf_value(e: &Engine, s: &State, cfg: &Config, plans: [Option<&[u16]>; 2
     if let (Some(m), true) = (modes, cfg.strategy != 0.0 && st.result.is_none()) {
         let s0 = if cfg.strategy_side != 1 { crate::strategy::score(e, &st, 0, m[0], 6.0) } else { 0.0 };
         let s1 = if cfg.strategy_side != 0 { crate::strategy::score(e, &st, 1, m[1], 6.0) } else { 0.0 };
-        v += cfg.strategy * (s0 - s1);
+        if cfg.strategy_w.iter().any(|w| *w != 0.0) {
+            v += cfg.strategy_w[crate::strategy::mode_index(m[0])] * s0 - cfg.strategy_w[crate::strategy::mode_index(m[1])] * s1;
+        } else {
+            v += cfg.strategy * (s0 - s1);
+        }
     }
     if cfg.heal_value != 0.0 && st.result.is_none() {
         v += cfg.heal_value * heal_race(e, &st, goals);
@@ -987,6 +1022,33 @@ impl<'a> Search<'a> {
     }
 
     /// The distance maps of the plans in `ids` (1-based; 0 for none).
+    /// `Config::deadline_k`: the value for fighter 0 of the one-tick simultaneous game between
+    /// both sides' likeliest turns at `s`, each outcome being the tick's reward plus the usual
+    /// leaf judgment. Solved by regret matching.
+    fn deadline_value(&self, s: &State, acts: &[Vec<Act>; 2], leaf_cfg: &Config, took: [u8; 2], modes: Option<[crate::strategy::Mode; 2]>) -> f64 {
+        let k = self.cfg.deadline_k;
+        let pick = |v: &Vec<Act>| -> Vec<RawTurn> {
+            let mut idx: Vec<usize> = (0..v.len()).collect();
+            idx.sort_by(|a, b| v[*b].prior.partial_cmp(&v[*a].prior).unwrap_or(std::cmp::Ordering::Equal));
+            idx.into_iter().take(k).map(|i| v[i].turn).collect()
+        };
+        let (t0, t1) = (pick(&acts[0]), pick(&acts[1]));
+        if t0.is_empty() || t1.is_empty() {
+            return leaf_value(self.e, s, leaf_cfg, self.dists(took), &self.goals, modes);
+        }
+        let mut m = vec![vec![0.0f64; t1.len()]; t0.len()];
+        for (i, a) in t0.iter().enumerate() {
+            for (j, b) in t1.iter().enumerate() {
+                let mut st = *s;
+                let before = (st.fighters[0].hp, st.fighters[1].hp);
+                self.e.step(&mut st, &[*a, *b]);
+                let r = reward(&st, before);
+                m[i][j] = r + if st.result.is_some() { 0.0 } else { leaf_value(self.e, &st, leaf_cfg, self.dists(took), &self.goals, modes) };
+            }
+        }
+        matrix_value(&m, 200)
+    }
+
     fn dists(&self, ids: [u8; 2]) -> [Option<&[u16]>; 2] {
         let get = |id: u8| if id == 0 { None } else { self.plans.get(id as usize - 1).map(|v| v.as_slice()) };
         [get(ids[0]), get(ids[1])]
@@ -1021,7 +1083,7 @@ impl<'a> Search<'a> {
         // the root for the whole search lost 12-23-1 against the flagship).
         let leaf_cfg = self.cfg;
         // the strategy layer: both sides' modes from the position at the root
-        let modes = if self.cfg.strategy != 0.0 { Some([crate::strategy::choose(self.e, root, 0), crate::strategy::choose(self.e, root, 1)]) } else { None };
+        let modes = if self.cfg.strategy != 0.0 || self.cfg.strategy_prior > 0.0 { Some([crate::strategy::choose(self.e, root, 0), crate::strategy::choose(self.e, root, 1)]) } else { None };
         let mut total = 0.0;
         for _ in 0..count {
             let mut s = *root;
@@ -1030,7 +1092,7 @@ impl<'a> Search<'a> {
             let mut leaf = 0.0;
             // the plans the two sides took at the root in this iteration, carried into the play-out
             let mut took = [0u8; 2];
-            for depth in 0..self.cfg.depth {
+            for depth in 0..self.cfg.depth + self.cfg.deadline_ext.max(0) as u32 {
                 if self.nodes[node].acts[0].is_empty() {
                     // With `expand_at`, a new position is first only judged; it gets its
                     // move lists (the costly part, in time and memory) once visited again.
@@ -1049,9 +1111,9 @@ impl<'a> Search<'a> {
                                 x,
                                 &self.plans[pid as usize - 1],
                                 self.cfg.quiet_slam,
-                                actions_with(self.e, &s, x, self.cfg.even, false, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst),
+                                actions_cal(self.e, &s, x, self.cfg.even, false, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst, self.cfg.calib),
                             ),
-                            _ => actions_with(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst),
+                            _ => actions_cal(self.e, &s, x, self.cfg.even, depth < self.cfg.forcing_depth, self.cfg.lead || (self.cfg.lead_mask >> x) & 1 == 1, self.cfg.own_priors, self.cfg.dash_burst, self.cfg.calib),
                         };
                     }
                     if self.cfg.slam_prior > 0.0 {
@@ -1059,12 +1121,22 @@ impl<'a> Search<'a> {
                             slam_reweight(self.e, &s, x, &mut self.nodes[node].acts[x], self.cfg.slam_prior);
                         }
                     }
+                    if let (Some(m), true) = (modes, self.cfg.strategy_prior > 0.0 && depth < 3) {
+                        for x in 0..2 {
+                            strategy_reweight(self.e, &s, x, &mut self.nodes[node].acts[x], m[x], self.cfg.strategy_prior);
+                        }
+                    }
                     if depth == 0 && self.cfg.plans {
                         self.add_root_plans(&s, fixed);
                         self.plans_pending = false;
                     }
-                    if depth > 0 && self.cfg.expand_at == 0 {
-                        leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals, modes);
+                    if depth > 0 && self.cfg.expand_at == 0 && !in_spawn_fight(self.e, &s, self.cfg.deadline_ext) {
+                        leaf = if self.cfg.deadline_k > 0 && spawn_due(self.e, &s) {
+                            let acts = [self.nodes[node].acts[0].clone(), self.nodes[node].acts[1].clone()];
+                            self.deadline_value(&s, &acts, &leaf_cfg, took, modes)
+                        } else {
+                            leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals, modes)
+                        };
                         break;
                     }
                     if depth == 0 && self.cfg.noise_seed != 0 {
@@ -1100,7 +1172,7 @@ impl<'a> Search<'a> {
                     }
                     break;
                 }
-                if depth + 1 == self.cfg.depth {
+                if depth + 1 >= self.cfg.depth && (!in_spawn_fight(self.e, &s, self.cfg.deadline_ext) || depth + 1 >= self.cfg.depth + self.cfg.deadline_ext.max(0) as u32) {
                     leaf = leaf_value(self.e, &s, &leaf_cfg, self.dists(took), &self.goals, modes);
                     break;
                 }
@@ -1191,4 +1263,111 @@ fn slam_reweight(e: &Engine, s: &State, x: usize, acts: &mut [Act], target: f32)
     for (a, &b) in acts.iter_mut().zip(&slams) {
         a.prior *= if b { up } else { down };
     }
+}
+
+/// `Config::strategy_prior`: moves the share `share` of the prior onto the turns that raise
+/// fighter `x`'s goal score for mode `m` (the other side holding), in proportion to the gain.
+fn strategy_reweight(e: &Engine, s: &State, x: usize, acts: &mut [Act], m: crate::strategy::Mode, share: f32) {
+    if acts.len() < 2 || s.fighters[x].state != FState::Idle {
+        return;
+    }
+    let now = crate::strategy::score(e, s, x, m, 6.0);
+    let gains: Vec<f32> = acts
+        .iter()
+        .map(|a| {
+            let mut st = *s;
+            let mut turns = [RawTurn::IDLE; 2];
+            turns[x] = a.turn;
+            e.step(&mut st, &turns);
+            if st.result.is_some() {
+                return 0.0;
+            }
+            (crate::strategy::score(e, &st, x, m, 6.0) - now).max(0.0) as f32
+        })
+        .collect();
+    let sum: f32 = gains.iter().sum();
+    if sum <= 0.0 {
+        return;
+    }
+    let total: f32 = acts.iter().map(|a| a.prior).sum();
+    for (a, g) in acts.iter_mut().zip(&gains) {
+        a.prior = (1.0 - share) * a.prior + share * total * g / sum;
+    }
+}
+
+/// Distance band of the class table: 1-2, 3-4, 5-7, 8 and more.
+pub fn calib_band(d: i32) -> usize {
+    if d <= 2 { 0 } else if d <= 4 { 1 } else if d <= 7 { 2 } else { 3 }
+}
+
+pub const CLASS_MOVES: [&str; 7] = ["hold", "step in", "step out", "step side", "dash in", "dash out", "dash side"];
+pub const CLASS_ATTACKS: [&str; 4] = ["", "+shot", "+frost", "+repulsor"];
+pub const CLASSES: usize = 28;
+
+/// A turn's class for `models::CALIB`: movement (relative to the opponent) x 4 + attack.
+pub fn turn_class(e: &Engine, s: &State, x: usize, t: &RawTurn) -> usize {
+    let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
+    let d = chebyshev(f.pos, o.pos);
+    let rel = |dir: u8, n: i32| {
+        let mut p = f.pos;
+        for _ in 0..n {
+            p = add(p, DIR_VEC[dir as usize]);
+        }
+        let a = chebyshev(p, o.pos);
+        if a < d { 0 } else if a > d { 1 } else { 2 }
+    };
+    let mv = match (t.mv, t.dash) {
+        (_, DirIn::Dir(dd)) => 4 + rel(dd, 2),
+        (DirIn::Dir(m), _) => 1 + rel(m, 1),
+        _ => 0,
+    };
+    let atk = match t.attack {
+        crate::turn::AttackIn::Named { attack, .. } => match e.rules.attacks[attack as usize].kind {
+            AttackKind::Projectile { .. } => 1,
+            AttackKind::Area { .. } => 2,
+            AttackKind::Burst { .. } => 3,
+            #[allow(unreachable_patterns)]
+            _ => 0,
+        },
+        _ => 0,
+    };
+    mv * 4 + atk
+}
+
+/// A power pad has just restocked: this is its first tick up (`Config::deadline_k`).
+pub fn spawn_due(e: &Engine, s: &State) -> bool {
+    e.map.pads.iter().enumerate().any(|(i, d)| d.kind == PadKind::Power && s.pads[i].available && s.pads[i].respawn_tick == s.tick)
+}
+
+/// Value for the row player (maximising) of the zero-sum matrix game `m`, by regret matching:
+/// the average strategies' expected payoff after `rounds` rounds.
+pub fn matrix_value(m: &[Vec<f64>], rounds: usize) -> f64 {
+    let (r, c) = (m.len(), m[0].len());
+    let (mut reg_r, mut reg_c) = (vec![0.0f64; r], vec![0.0f64; c]);
+    let (mut avg_r, mut avg_c) = (vec![0.0f64; r], vec![0.0f64; c]);
+    let strat = |reg: &[f64]| -> Vec<f64> {
+        let pos: f64 = reg.iter().map(|x| x.max(0.0)).sum();
+        if pos > 0.0 { reg.iter().map(|x| x.max(0.0) / pos).collect() } else { vec![1.0 / reg.len() as f64; reg.len()] }
+    };
+    for _ in 0..rounds {
+        let (p, q) = (strat(&reg_r), strat(&reg_c));
+        let row_u: Vec<f64> = (0..r).map(|i| (0..c).map(|j| q[j] * m[i][j]).sum()).collect();
+        let col_u: Vec<f64> = (0..c).map(|j| (0..r).map(|i| p[i] * m[i][j]).sum()).collect();
+        let v: f64 = (0..r).map(|i| p[i] * row_u[i]).sum();
+        for i in 0..r {
+            reg_r[i] += row_u[i] - v;
+            avg_r[i] += p[i];
+        }
+        for j in 0..c {
+            reg_c[j] += v - col_u[j];
+            avg_c[j] += q[j];
+        }
+    }
+    let (sr, sc): (f64, f64) = (avg_r.iter().sum(), avg_c.iter().sum());
+    (0..r).map(|i| (0..c).map(|j| avg_r[i] / sr * avg_c[j] / sc * m[i][j]).sum::<f64>()).sum()
+}
+
+/// Within the first `ext` ticks of a power pad being up again (`Config::deadline_ext`).
+pub fn in_spawn_fight(e: &Engine, s: &State, ext: i32) -> bool {
+    ext > 0 && e.map.pads.iter().enumerate().any(|(i, d)| d.kind == PadKind::Power && s.pads[i].available && (0..ext).contains(&(s.tick - s.pads[i].respawn_tick)))
 }

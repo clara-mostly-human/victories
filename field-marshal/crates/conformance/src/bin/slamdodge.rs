@@ -61,6 +61,8 @@ fn main() {
     // ticks where the actor (k = 0: the opponent acting on us; 1: us acting on the opponent) has a
     // turn that slams the other if it holds: how often it plays one, and the move model's mass on them
     let (mut chances, mut took, mut mass) = ([0usize; 2], [0usize; 2], [0.0f64; 2]);
+    // the same for turns that hurt the other at once if it holds, without a slam
+    let (mut hchances, mut htook, mut hmass) = ([0usize; 2], [0usize; 2], [0.0f64; 2]);
     for path in &files {
         let mut text = String::new();
         if path.to_string_lossy().ends_with(".gz") {
@@ -102,6 +104,21 @@ fn main() {
                 {
                     let model = actions_with(e, &s, o, 0.25, false, false, false, true);
                     let slamming: Vec<bool> = model.iter().map(|a| slams_with(RawTurn::IDLE, a.turn)).collect();
+                    let hurt_with = |their: RawTurn| {
+                        let mut c = s;
+                        let mut turns = [RawTurn::IDLE; 2];
+                        turns[o] = their;
+                        let sum = e.step(&mut c, &turns);
+                        sum.hp_lost[x] > 0 && !sum.slammed[x]
+                    };
+                    let hurting: Vec<bool> = model.iter().map(|a| hurt_with(a.turn)).collect();
+                    if hurting.iter().any(|&b| b) {
+                        hchances[k] += 1;
+                        hmass[k] += model.iter().zip(&hurting).filter(|(_, &b)| b).map(|(a, _)| a.prior as f64).sum::<f64>();
+                        if hurt_with(t.turns[o]) {
+                            htook[k] += 1;
+                        }
+                    }
                     if slamming.iter().any(|&b| b) {
                         chances[k] += 1;
                         mass[k] += model.iter().zip(&slamming).filter(|(_, &b)| b).map(|(a, _)| a.prior as f64).sum::<f64>();
@@ -161,6 +178,14 @@ fn main() {
             chances[k] as f64 / g,
             100.0 * took[k] as f64 / chances[k].max(1) as f64,
             100.0 * mass[k] / chances[k].max(1) as f64
+        );
+    }
+    for (k, who) in ["opponents hurting us", "us hurting them"].iter().enumerate() {
+        println!(
+            "  {who}: {:.1} chances a game (a turn that hurts without a slam if the other holds); took one {:.1}% of them; the move model's mass on those turns {:.1}%",
+            hchances[k] as f64 / g,
+            100.0 * htook[k] as f64 / hchances[k].max(1) as f64,
+            100.0 * hmass[k] / hchances[k].max(1) as f64
         );
     }
     println!(

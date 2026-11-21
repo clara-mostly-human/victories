@@ -233,7 +233,9 @@ pub fn run_match(a: &Playbook, b: &Playbook, pairs: u32, first_seed: i64, thread
 
 /// As `run_match`; with no `b`, A plays the clone of the ladder's strong bots.
 pub fn run_match_with(a: &Playbook, b: Option<&Playbook>, pairs: u32, first_seed: i64, threads: usize) -> Tally {
-    let engines: Vec<Engine> = victris_engine::shipped::MAP_NAMES.iter().map(|n| Engine::shipped(n)).collect();
+    // ARENA_MAPS=columns-21,pillars-21 keeps only those maps (default: all three)
+    let only: Vec<String> = std::env::var("ARENA_MAPS").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
+    let engines: Vec<Engine> = victris_engine::shipped::MAP_NAMES.iter().filter(|n| only.is_empty() || only.iter().any(|o| o == *n)).map(|n| Engine::shipped(n)).collect();
     let jobs: Vec<(usize, i64, bool)> = (0..pairs)
         .flat_map(|k| (0..engines.len()).flat_map(move |m| [(m, first_seed + k as i64, false), (m, first_seed + k as i64, true)]))
         .collect();

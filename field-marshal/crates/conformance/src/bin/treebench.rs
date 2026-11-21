@@ -42,6 +42,7 @@ fn main() {
         ("dash + repulsor", Config { dash_burst: true, ..base }),
         ("flagship (row 13, dash + repulsor)", Config { value_gen: 13, dash_burst: true, ..base }),
         ("flagship + slam prior 0.228", Config { value_gen: 13, dash_burst: true, slam_prior: 0.228, ..base }),
+        ("flagship + slam prior + strategy prior 0.3", Config { value_gen: 13, dash_burst: true, slam_prior: 0.228, strategy_prior: 0.3, ..base }),
         ("win-probability judgment only (40)", Config { value_weight: 0.0, net_weight: 40.0, dash_burst: true, ..base }),
     ];
     for (name, cfg) in variants {

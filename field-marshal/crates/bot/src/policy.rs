@@ -196,6 +196,16 @@ pub struct Playbook {
     /// Share of the move prior for turns whose repulsor slams the opponent if it holds
     /// (`mcts::Config::slam_prior`; 0: off; measured on the ladder: 0.228).
     pub tree_slam_prior: f64,
+    /// Per-mode goal worth (`mcts::Config::strategy_w`), five numbers; empty: off.
+    pub tree_strategy_w: Vec<f64>,
+    /// Share of the prior steered toward each side's mode goal near the root (`mcts::Config::strategy_prior`; 0: off).
+    pub tree_strategy_prior: f64,
+    /// Correct move lists by the class table fitted on 2400+ ladder bots (`mcts::Config::calib`).
+    pub tree_calib: bool,
+    /// Read the power-pad spawn fight move by move (`mcts::Config::deadline_k`; 0: off).
+    pub tree_deadline_k: u32,
+    /// Lines reaching a power pad's first tick up are read this many ticks further (`mcts::Config::deadline_ext`; 0: off).
+    pub tree_deadline_ext: u32,
     /// Opening book (part 5): per "<map>/<seat>", the turn to play at a tick when we stand on
     /// the book's tile then (written by `openbook`); off the line, the search decides.
     pub book: std::collections::HashMap<String, Vec<(i32, P, Value)>>,
@@ -372,6 +382,11 @@ impl Default for Playbook {
             tree_strategy: 0.0,
             tree_strategy_own: false,
             tree_slam_prior: 0.0,
+            tree_strategy_w: Vec::new(),
+            tree_strategy_prior: 0.0,
+            tree_calib: false,
+            tree_deadline_k: 0,
+            tree_deadline_ext: 0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
             tree_quiet: 6,
@@ -460,6 +475,10 @@ impl Playbook {
         f("tree_heal_value", &mut p.tree_heal_value);
         f("tree_strategy", &mut p.tree_strategy);
         f("tree_slam_prior", &mut p.tree_slam_prior);
+        f("tree_strategy_prior", &mut p.tree_strategy_prior);
+        if let Some(a) = v.get("tree_strategy_w").and_then(Value::as_array) {
+            p.tree_strategy_w = a.iter().filter_map(Value::as_f64).collect();
+        }
         if let Some(a) = v.get("tree_phase_gens").and_then(Value::as_array) {
             p.tree_phase_gens = a.iter().filter_map(|x| x.as_u64().map(|n| n as usize)).collect();
         }
@@ -510,7 +529,7 @@ impl Playbook {
         if let Some(x) = v.get("search").and_then(Value::as_bool) {
             p.search = x;
         }
-        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them), ("tree_reuse", &mut p.tree_reuse), ("tree_plans", &mut p.tree_plans), ("tree_plan_playout", &mut p.tree_plan_playout), ("tree_strategy_own", &mut p.tree_strategy_own)] {
+        for (key, slot) in [("model_attacks", &mut p.model_attacks), ("sample", &mut p.sample), ("lead_shots", &mut p.lead_shots), ("model_repulsor", &mut p.model_repulsor), ("dash_slam", &mut p.dash_slam), ("model_shots", &mut p.model_shots), ("model_slams", &mut p.model_slams), ("rollout_punish", &mut p.rollout_punish), ("prior_model", &mut p.prior_model), ("pad_race", &mut p.pad_race), ("tree_lead", &mut p.tree_lead), ("tree_slam", &mut p.tree_slam), ("tree_own_priors", &mut p.tree_own_priors), ("tree_dash_burst", &mut p.tree_dash_burst), ("tree_lead_them", &mut p.tree_lead_them), ("tree_reuse", &mut p.tree_reuse), ("tree_plans", &mut p.tree_plans), ("tree_plan_playout", &mut p.tree_plan_playout), ("tree_strategy_own", &mut p.tree_strategy_own), ("tree_calib", &mut p.tree_calib)] {
             if let Some(x) = v.get(key).and_then(Value::as_bool) {
                 *slot = x;
             }
@@ -523,6 +542,12 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_depth_buff").and_then(Value::as_u64) {
             p.tree_depth_buff = x as u32;
+        }
+        if let Some(x) = v.get("tree_deadline_ext").and_then(Value::as_u64) {
+            p.tree_deadline_ext = x as u32;
+        }
+        if let Some(x) = v.get("tree_deadline_k").and_then(Value::as_u64) {
+            p.tree_deadline_k = x as u32;
         }
         if let Some(x) = v.get("tree_quiet_buff").and_then(Value::as_u64) {
             p.tree_quiet_buff = x as u32;
@@ -1444,6 +1469,13 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         cfg.heal_value = pb.tree_heal_value;
         cfg.strategy = pb.tree_strategy;
         cfg.slam_prior = pb.tree_slam_prior as f32;
+        cfg.strategy_prior = pb.tree_strategy_prior as f32;
+        cfg.calib = pb.tree_calib;
+        cfg.deadline_k = pb.tree_deadline_k as usize;
+        cfg.deadline_ext = pb.tree_deadline_ext as i32;
+        for (k, w) in pb.tree_strategy_w.iter().take(5).enumerate() {
+            cfg.strategy_w[k] = *w;
+        }
         cfg.strategy_side = if pb.tree_strategy_own { me as u8 } else { 2 };
         for (k, g) in pb.tree_phase_gens.iter().take(victris_engine::valuefeat::PHASES).enumerate() {
             cfg.phase_gens[k] = *g;
