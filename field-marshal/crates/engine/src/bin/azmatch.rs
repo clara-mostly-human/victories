@@ -1,15 +1,17 @@
 //! azmatch: plays two searches against each other on the exact engine, everything in sight.
 //!
-//!   azmatch --a SPEC --b SPEC [--games 100] [--seed 1] [--threads 4] [--map columns-21]
+//!   azmatch --a SPEC --b SPEC [--games 100] [--seed 1] [--threads 4] [--map columns-21] [--open 10]
 //!
 //! SPEC is `flag:N` (the flagship's search, the live playbook's settings, N lines a tick),
 //! `pv:NET.json:N` (the network-led search), or either with `Nms` in place of N for a time
 //! limit a tick. Each fighter runs its own search every tick it can act, fresh, and plays its
-//! most visited turn. Sides alternate game by game and each seed is played from both sides.
+//! most visited turn. Both searches are repeatable, so without help every game would be one of
+//! two: each pair of games starts with --open ticks of random steps (no attacks, no dashes),
+//! the same steps for both games of the pair, and the two players swap sides between them.
 
 use victris_engine::mcts;
 use victris_engine::pvnet::PvNet;
-use victris_engine::pvsearch::{self, outcome, PvConfig};
+use victris_engine::pvsearch::{self, outcome, PvConfig, Rng};
 use victris_engine::state::{FState, State};
 use victris_engine::{Engine, RawTurn};
 
@@ -90,6 +92,7 @@ fn main() {
     let seed: i64 = arg(&args, "--seed", 1);
     let threads: usize = arg(&args, "--threads", 4);
     let map: String = arg(&args, "--map", String::from("columns-21"));
+    let open: i32 = arg(&args, "--open", 10);
     let players = [parse(&sa), parse(&sb)];
     let e = Engine::shipped(&map);
     let flag = mcts::Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, slam_prior: 0.228, ..Default::default() };
@@ -109,10 +112,16 @@ fn main() {
                         // player a is fighter `side`; games 2k and 2k+1 share a seed with the sides swapped
                         let side = g % 2;
                         let mut s = e.new_match(seed.wrapping_mul(7919).wrapping_add((g / 2) as i64));
+                        let mut rng = Rng::new((seed as u64).wrapping_mul(104_729).wrapping_add((g / 2) as u64));
+                        let mut buf = Vec::new();
                         while s.result.is_none() {
                             let mut pair = [RawTurn::IDLE, RawTurn::IDLE];
                             for x in 0..2 {
-                                if s.fighters[x].alive && s.fighters[x].state == FState::Idle {
+                                if s.tick < open {
+                                    victris_engine::pvnet::turns(&e, &s, x, &mut buf);
+                                    buf.retain(|t| t.attack == victris_engine::turn::AttackIn::None && t.dash == victris_engine::turn::DirIn::None);
+                                    pair[x] = buf[rng.below(buf.len())];
+                                } else if s.fighters[x].alive && s.fighters[x].state == FState::Idle {
                                     let who = if x == side { 0 } else { 1 };
                                     let (t, lines, depth) = think(&e, &players[who], flag, &s, x);
                                     pair[x] = t;

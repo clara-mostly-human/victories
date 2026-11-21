@@ -68,6 +68,19 @@ pub struct Search<'a> {
     pub depth_hist: [u64; 64],
 }
 
+/// A search's tree on its own, to keep between ticks (`Search::into_tree`, `Search::start_from`).
+pub struct Tree {
+    nodes: Vec<Node>,
+    index: HashMap<u64, u32>,
+}
+
+impl Tree {
+    /// Lines that ran through the root.
+    pub fn visits(&self) -> u32 {
+        self.nodes.first().map(|n| n.n).unwrap_or(0)
+    }
+}
+
 /// A finished game's result for fighter 0.
 pub fn outcome(s: &State) -> Option<f32> {
     s.result.map(|r| match r.winner {
@@ -80,6 +93,24 @@ pub fn outcome(s: &State) -> Option<f32> {
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, net: &'a PvNet, cfg: PvConfig) -> Search<'a> {
         Search { e, net, cfg, nodes: Vec::new(), index: HashMap::new(), path: Vec::new(), pass: Pass::default(), x: Inputs::default(), buf: Vec::new(), depth_hist: [0; 64] }
+    }
+
+    /// Takes the tree out, to keep while the search itself (which borrows the engine and the
+    /// network) is dropped.
+    pub fn into_tree(self) -> Tree {
+        Tree { nodes: self.nodes, index: self.index }
+    }
+
+    /// Continues from a kept tree. Follow with `advance` or `advance_to` to move its root to
+    /// the position now on the board.
+    pub fn start_from(&mut self, tree: Tree) {
+        self.nodes = tree.nodes;
+        self.index = tree.index;
+    }
+
+    /// Lines that ran through the root so far.
+    pub fn visits(&self) -> u32 {
+        self.nodes.first().map(|n| n.n).unwrap_or(0)
     }
 
     pub fn clear(&mut self) {
@@ -220,6 +251,34 @@ impl<'a> Search<'a> {
     /// The most visited turn of fighter `x`.
     pub fn best(&self, x: usize) -> RawTurn {
         self.nodes.first().and_then(|nd| nd.acts[x].iter().max_by_key(|a| a.n).map(|a| a.turn)).unwrap_or(RawTurn::IDLE)
+    }
+
+    /// Keeps what was searched under the position the game actually moved to, when the turns
+    /// that led there are not known (a live bot sees the new position, not the opponent's
+    /// turn): of the pairs of turns searched from `old_root`, the most visited one that leads
+    /// to `now` becomes the root. False (and an empty search) when none does.
+    pub fn advance_to(&mut self, old_root: &State, now: &State) -> bool {
+        let mut best: Option<(u32, RawTurn, RawTurn)> = None;
+        if let Some(nd) = self.nodes.first() {
+            for &(pair, child) in &nd.kids {
+                let (t0, t1) = (nd.acts[0][(pair >> 16) as usize].turn, nd.acts[1][(pair & 0xffff) as usize].turn);
+                let n = self.nodes[child as usize].n;
+                if best.map(|b| n > b.0).unwrap_or(true) {
+                    let mut s = *old_root;
+                    self.e.step(&mut s, &[t0, t1]);
+                    if s == *now {
+                        best = Some((n, t0, t1));
+                    }
+                }
+            }
+        }
+        match best {
+            Some((_, t0, t1)) => self.advance(&t0, &t1),
+            None => {
+                self.clear();
+                false
+            }
+        }
     }
 
     /// Keeps what was searched under the pair of turns that was played: that position becomes

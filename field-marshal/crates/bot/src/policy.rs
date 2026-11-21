@@ -210,6 +210,11 @@ pub struct Playbook {
     pub tree_turn_model: String,
     /// Raw-board judgments by map: a folder holding <map>.json (`rawnet`); empty: off.
     pub tree_raw_dir: String,
+    /// A folder of networks for the learned search (`pvsearch`), one `<map>.json` each, written
+    /// by `aztrain`. When set and the map has one, that search decides alone while the opponent
+    /// is in sight: the network's win chance at the end of every line, its move shares to choose
+    /// where to look, no play-out and no hp sum. Empty (the default): off.
+    pub tree_pv_dir: String,
     /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
     /// past the time cap); 0: by time. For self-play: more games an hour, and the same game
     /// every time from the same seed.
@@ -397,6 +402,7 @@ impl Default for Playbook {
             tree_deadline_ext: 0,
             tree_turn_model: String::new(),
             tree_raw_dir: String::new(),
+            tree_pv_dir: String::new(),
             tree_iters: 0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
@@ -559,6 +565,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_raw_dir").and_then(Value::as_str) {
             p.tree_raw_dir = x.to_string();
+        }
+        if let Some(x) = v.get("tree_pv_dir").and_then(Value::as_str) {
+            p.tree_pv_dir = x.to_string();
         }
         if let Some(x) = v.get("tree_turn_model").and_then(Value::as_str) {
             p.tree_turn_model = x.to_string();
@@ -1424,6 +1433,17 @@ thread_local! {
     static KEPT: std::cell::RefCell<std::collections::HashMap<(i64, usize), Kept>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// The learned search's tree kept between ticks, per match (seed) and seat.
+struct PvKept {
+    tick: i32,
+    root: State,
+    tree: victris_engine::pvsearch::Tree,
+}
+
+thread_local! {
+    static PV_KEPT: std::cell::RefCell<std::collections::HashMap<(i64, usize), PvKept>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// What the tree search found at the root of its latest decision on this thread: the position
 /// it searched (the tracker's belief), each side's turns with their visits and average result
 /// in hp for that side, the average result for fighter 0, and the iterations run and reused.
@@ -1556,6 +1576,46 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         };
         // The starting states, made here: the tracker cannot be shared between threads.
         let starts: Vec<victris_engine::State> = (0..pb.tree_threads.max(1) * per_thread).map(root_for).collect();
+        // The learned search, when this map has a network and the opponent is in sight. Out of
+        // sight the searches below still decide (they search over guesses of where it is).
+        let pv = if visible && !pb.tree_pv_dir.is_empty() { pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)) } else { None };
+        if let Some(net) = pv {
+            let key = (t.seed, me);
+            let kept = PV_KEPT.with(|k| k.borrow_mut().remove(&key));
+            let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig::default());
+            let mut reused = 0u32;
+            if let Some(k) = kept {
+                if k.tick + 1 == s.tick {
+                    search.start_from(k.tree);
+                    if search.advance_to(&k.root, &s) {
+                        reused = search.visits();
+                    }
+                }
+            }
+            let mut done = 0u32;
+            loop {
+                let chunk = if pb.tree_iters > 0 { (pb.tree_iters - done).min(500) } else { 500 };
+                search.iterate(&s, chunk);
+                done += chunk;
+                if (pb.tree_iters > 0 && done >= pb.tree_iters) || started.elapsed().as_millis() as u64 >= deadline {
+                    break;
+                }
+            }
+            let root = search.root();
+            let Some((turn, _, q)) = root[me].iter().max_by_key(|a| a.1).copied() else { return idle };
+            let value = search.value() as f64;
+            let wide = |x: usize| root[x].iter().map(|a| (a.0, a.1, a.2 as f64)).collect::<Vec<_>>();
+            LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: [wide(0), wide(1)], value, sims: done, reused }));
+            let tree = search.into_tree();
+            PV_KEPT.with(|k| {
+                let mut k = k.borrow_mut();
+                if k.len() > 16 {
+                    k.clear();
+                }
+                k.insert(key, PvKept { tick: s.tick, root: s, tree });
+            });
+            return Decision { turn, sims: done + reused, score: q as f64, note: "pv" };
+        }
         if pb.tree_reuse && pb.tree_threads <= 1 && per_thread == 1 && visible {
             // One search, seeded with the branch of last tick's tree that the game went into.
             let key = (t.seed, me);
@@ -2282,6 +2342,15 @@ fn raw_net(path: &str) -> Option<&'static victris_engine::rawnet::RawNet> {
     static NETS: OnceLock<Mutex<HashMap<String, Option<&'static victris_engine::rawnet::RawNet>>>> = OnceLock::new();
     let mut m = NETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
     *m.entry(path.to_string()).or_insert_with(|| victris_engine::rawnet::RawNet::load(std::path::Path::new(path)).map(|n| &*Box::leak(Box::new(n))))
+}
+
+/// The learned search's network at `path`, read once and kept (`None` when there is none).
+fn pv_net(path: &str) -> Option<&'static victris_engine::pvnet::PvNet> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static NETS: OnceLock<Mutex<HashMap<String, Option<&'static victris_engine::pvnet::PvNet>>>> = OnceLock::new();
+    let mut m = NETS.get_or_init(|| Mutex::new(HashMap::new())).lock().ok()?;
+    *m.entry(path.to_string()).or_insert_with(|| victris_engine::pvnet::PvNet::load(std::path::Path::new(path)).map(|n| &*Box::leak(Box::new(n))))
 }
 
 /// ARENA_ROOTS=file: for every tree decision, the position's hash and what the search made of it

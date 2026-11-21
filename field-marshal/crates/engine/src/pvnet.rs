@@ -15,7 +15,7 @@
 //!
 //! The inputs are facts of the board, mostly yes/no, laid out so that "the opponent is two tiles
 //! north-east of me" is one input of its own: no input is a judgment of whether something is
-//! good. Only the inputs that are not zero are passed on (`Inputs`), about 60 of 602.
+//! good. Only the inputs that are not zero are passed on (`Inputs`), about 60 of 611.
 
 use crate::geom::{add, chebyshev, DIR_VEC, SUB};
 use crate::map::PadKind;
@@ -45,7 +45,10 @@ const B_OPP: usize = 2 * FS;
 const B_OFF: usize = B_OPP + N_OPP;
 const B_DIST: usize = B_OFF + 2;
 const B_SEE: usize = B_DIST + 13;
-const B_WALL: usize = B_SEE + 1;
+/// Which way the opponent lies at any distance: left / level / right, above / level / below,
+/// and whether it is farther off sideways, the same, or farther off up and down.
+const B_SIDE: usize = B_SEE + 1;
+const B_WALL: usize = B_SIDE + 9;
 const B_WALL_T: usize = B_WALL + N_WALL;
 const B_THREAT: usize = B_WALL_T + N_WALL_T;
 const B_PADS: usize = B_THREAT + 2 * TH;
@@ -213,6 +216,9 @@ pub fn encode(e: &Engine, s: &State, x: usize, out: &mut Inputs) {
         out.on(B_DIST + (d.min(13) - 1) as usize);
     }
     out.put(B_SEE, can_see(&e.rules, &e.map, f.pos, o.pos) as u8 as f32);
+    out.on(B_SIDE + (dx.signum() + 1) as usize);
+    out.on(B_SIDE + 3 + (dy.signum() + 1) as usize);
+    out.on(B_SIDE + 6 + ((dx.abs() - dy.abs()).signum() + 1) as usize);
     let wall = |p: [i32; 2]| p[0] < 0 || p[1] < 0 || p[0] >= e.map.w || p[1] >= e.map.h || e.map.is_wall(p);
     for wy in -R_WALL..=R_WALL {
         for wx in -R_WALL..=R_WALL {

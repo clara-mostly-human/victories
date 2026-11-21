@@ -252,14 +252,26 @@ fn the_search_keeps_its_tree_between_ticks() {
         assert!(search.value().abs() <= 1.0);
         let pair = [search.best(0), search.best(1)];
         let before = search.nodes();
+        let old = s;
         e.step(&mut s, &pair);
-        if search.advance(&pair[0], &pair[1]) {
+        // every other tick the search is told only where the game went, as a live bot is
+        let kept = if s.tick % 2 == 0 {
+            search.advance(&pair[0], &pair[1])
+        } else {
+            // the way a bot keeps it: the tree alone is carried over, and a new search takes it up
+            let tree = search.into_tree();
+            search = Search::new(&e, &net, PvConfig::default());
+            search.start_from(tree);
+            search.advance_to(&old, &s)
+        };
+        if kept {
             kept_any = true;
             assert!(search.nodes() < before);
             // what was kept is the tree under the new root: its counts must add up
             let root = search.root();
             let (n0, n1): (u32, u32) = (root[0].iter().map(|a| a.1).sum(), root[1].iter().map(|a| a.1).sum());
             assert_eq!(n0, n1);
+            assert_eq!(n0, search.visits());
         }
     }
     assert!(kept_any, "the most visited pair of turns should have been searched at least once");
