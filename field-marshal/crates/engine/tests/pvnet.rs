@@ -411,3 +411,64 @@ fn a_lesson_without_shares_teaches_the_value_and_leaves_the_moves_alone() {
     }
     assert!(moved_value, "the value was not taught");
 }
+
+#[test]
+fn weighing_compares_our_turns_against_what_is_expected_and_their_best_answer() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(17);
+    let mut s = e.new_match(5);
+    let mut weighed_ticks = 0;
+    for _ in 0..40 {
+        if s.result.is_some() {
+            break;
+        }
+        let mut search = Search::new(&e, &net, PvConfig::default());
+        search.iterate(&s, 600);
+        let before = search.root();
+        let total: u32 = before[0].iter().map(|a| a.1).sum();
+        let w = search.weigh(&s, 0, 400, 0.5);
+        assert!(!w.is_empty() && w.len() <= 8);
+        if w.len() > 1 {
+            weighed_ticks += 1;
+            // only turns the search took seriously are weighed, and no turn twice
+            for (k, a) in w.iter().enumerate() {
+                let seen = before[0].iter().find(|b| b.0 == a.turn).expect("a weighed turn is one of the root's");
+                assert!(seen.1 as u64 * 50 >= total as u64, "a turn with {} of {} visits was weighed", seen.1, total);
+                assert!(w[..k].iter().all(|b| b.turn != a.turn));
+                // what it is worth lies between its expected result and its result against their answer
+                let (lo, hi) = (a.expected.min(a.worst), a.expected.max(a.worst));
+                assert!(a.worth >= lo - 1e-4 && a.worth <= hi + 1e-4, "worth {} outside {} to {}", a.worth, lo, hi);
+                assert!((-1.0..=1.0).contains(&a.expected) && (-1.0..=1.0).contains(&a.worst));
+                // their answer is one turn, the same against every turn of ours
+                assert_eq!(a.worst_to, w[0].worst_to);
+            }
+            // the most visited turn is always among them
+            let top = before[0].iter().max_by_key(|a| a.1).unwrap().0;
+            assert!(w.iter().any(|a| a.turn == top));
+            // the turn to play is the search's own choice, unless another did better against the mix
+            assert!(w[0].turn == top || w[0].worth > w.iter().find(|a| a.turn == top).unwrap().worth);
+            // it spent lines, and no more than it was given
+            let after: u32 = search.root()[0].iter().map(|a| a.1).sum();
+            assert!(after > total && after <= total + 400, "{} lines spent of 400", after - total);
+            // the same search weighed again the same way gives the same turn
+            let mut again = Search::new(&e, &net, PvConfig::default());
+            again.iterate(&s, 600);
+            assert_eq!(again.weigh(&s, 0, 400, 0.5)[0].turn, w[0].turn);
+            // all trust: worth is the expected result, and no answer is looked for
+            let mut all = Search::new(&e, &net, PvConfig::default());
+            all.iterate(&s, 600);
+            assert!(all.weigh(&s, 0, 400, 1.0).iter().all(|a| (a.worth - a.expected).abs() < 1e-6 && a.worst_to == RawTurn::IDLE));
+            // none: the result against their best answer alone
+            let mut none = Search::new(&e, &net, PvConfig::default());
+            none.iterate(&s, 600);
+            let n = none.weigh(&s, 0, 400, 0.0);
+            assert!(n.iter().all(|a| (a.worth - a.worst).abs() < 1e-6));
+        }
+        let pair = [w[0].turn, search.best(1)];
+        e.step(&mut s, &pair);
+    }
+    assert!(weighed_ticks > 10, "most ticks give a choice to weigh");
+    // nothing searched: the plain answer, no lines
+    let mut empty = Search::new(&e, &net, PvConfig::default());
+    assert_eq!(empty.weigh(&e.new_match(5), 0, 100, 0.5).len(), 1);
+}

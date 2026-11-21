@@ -232,6 +232,17 @@ pub struct Playbook {
     /// under the turn it sent (`pv_ponder`), standing in for the live bot's wait for the next
     /// tick. 0 (the default): none. A live session ponders by time instead.
     pub tree_pv_ponder: u32,
+    /// The learned search's turn chosen by `pvsearch::Search::weigh`: this share (0 to 0.5) of
+    /// each tick's search is held back and spent setting our likely turns against the
+    /// opponent's turns, pair by pair; the turn that does best is sent in place of the most
+    /// visited one. 0: off.
+    pub tree_pv_weigh: f64,
+    /// With `tree_pv_weigh`: how much of the opponent's play our turns are set against is
+    /// what the search expects of it; the rest is its one best answer to our usual play.
+    /// 1 (the default): all expectation. Against the turns real bots played, guarding
+    /// against that answer as well (0.5) chose worse than the plain search on both maps
+    /// tested, and all expectation chose a little better.
+    pub tree_pv_trust: f64,
     /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
     /// past the time cap); 0: by time. For self-play: more games an hour, and the same game
     /// every time from the same seed.
@@ -422,6 +433,8 @@ impl Default for Playbook {
             tree_pv_dir: String::new(),
             tree_pv_fog: false,
             tree_pv_ponder: 0,
+            tree_pv_weigh: 0.0,
+            tree_pv_trust: 1.0,
             tree_iters: 0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
@@ -593,6 +606,12 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_pv_ponder").and_then(Value::as_u64) {
             p.tree_pv_ponder = x as u32;
+        }
+        if let Some(x) = v.get("tree_pv_weigh").and_then(Value::as_f64) {
+            p.tree_pv_weigh = x.clamp(0.0, 0.5);
+        }
+        if let Some(x) = v.get("tree_pv_trust").and_then(Value::as_f64) {
+            p.tree_pv_trust = x.clamp(0.0, 1.0);
         }
         if let Some(x) = v.get("tree_turn_model").and_then(Value::as_str) {
             p.tree_turn_model = x.to_string();
@@ -1482,6 +1501,9 @@ pub struct RootSeen {
     pub value: f64,
     pub sims: u32,
     pub reused: u32,
+    /// with `tree_pv_weigh`: our turns as `pvsearch::Search::weigh` left them, the one played
+    /// first; empty otherwise
+    pub weighed: Vec<victris_engine::pvsearch::WeighedTurn>,
 }
 
 thread_local! {
@@ -1662,7 +1684,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 }
                 let Some((turn, _, q)) = pooled.iter().max_by_key(|a| a.1).copied() else { return idle };
                 if let Some((acts, value)) = first {
-                    LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts, value, sims: done, reused: 0 }));
+                    LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts, value, sims: done, reused: 0, weighed: Vec::new() }));
                 }
                 return Decision { turn, sims: done, score: q as f64, note: "pv-fog" };
             }
@@ -1678,20 +1700,32 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                     }
                 }
             }
+            // with `tree_pv_weigh`, that share of the lines (or of the time) is held back for it
+            let hold = pb.tree_pv_weigh.clamp(0.0, 0.5);
+            let (plain_iters, plain_until) = (((pb.tree_iters as f64) * (1.0 - hold)).round() as u32, ((deadline as f64) * (1.0 - hold)) as u64);
             let mut done = 0u32;
             loop {
-                let chunk = if pb.tree_iters > 0 { (pb.tree_iters - done).min(500) } else { 500 };
+                let chunk = if pb.tree_iters > 0 { (plain_iters.max(1) - done).min(500) } else { 500 };
                 search.iterate(&s, chunk);
                 done += chunk;
-                if (pb.tree_iters > 0 && done >= pb.tree_iters) || started.elapsed().as_millis() as u64 >= deadline {
+                if (pb.tree_iters > 0 && done >= plain_iters) || started.elapsed().as_millis() as u64 >= plain_until {
                     break;
                 }
             }
             let root = search.root();
-            let Some((turn, _, q)) = root[me].iter().max_by_key(|a| a.1).copied() else { return idle };
+            let Some((mut turn, _, mut q)) = root[me].iter().max_by_key(|a| a.1).copied() else { return idle };
             let value = search.value() as f64;
+            let mut weighed: Vec<victris_engine::pvsearch::WeighedTurn> = Vec::new();
+            if hold > 0.0 {
+                let lines = if pb.tree_iters > 0 { pb.tree_iters.saturating_sub(done) } else { ((done as f64) * hold / (1.0 - hold)).round() as u32 };
+                weighed = search.weigh(&s, me, lines.max(1), pb.tree_pv_trust as f32);
+                done += lines.max(1);
+                if let Some(first) = weighed.first() {
+                    (turn, q) = (first.turn, first.worth);
+                }
+            }
             let wide = |x: usize| root[x].iter().map(|a| (a.0, a.1, a.2 as f64)).collect::<Vec<_>>();
-            LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: [wide(0), wide(1)], value, sims: done, reused }));
+            LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: [wide(0), wide(1)], value, sims: done, reused, weighed }));
             let tree = search.into_tree();
             PV_KEPT.with(|k| {
                 let mut k = k.borrow_mut();
@@ -1734,7 +1768,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             dump_visits(e, &s, me, &root.acts[me]);
             dump_root(e, &s, root.value);
             let Some((turn, _, q)) = root.acts[me].iter().max_by_key(|a| a.1).copied() else { return idle };
-            LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: root.acts, value: root.value, sims: done, reused }));
+            LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: root.acts, value: root.value, sims: done, reused, weighed: Vec::new() }));
             let tree = search.into_tree();
             KEPT.with(|k| {
                 let mut k = k.borrow_mut();
@@ -1805,7 +1839,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
                 best = Some(*a);
             }
         }
-        LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: root.acts, value: root.value, sims: done, reused: 0 }));
+        LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: s, acts: root.acts, value: root.value, sims: done, reused: 0, weighed: Vec::new() }));
         return match best {
             Some((turn, _, q)) => Decision { turn, sims: done, score: q, note: "tree" },
             None => idle,
