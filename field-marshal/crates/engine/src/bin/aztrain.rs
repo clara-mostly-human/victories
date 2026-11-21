@@ -10,7 +10,8 @@
 //! With --mirror (on by default) every position is shown in a mirror image of the map drawn
 //! afresh each time (`pvnet::Sym`), where the map mirrors onto itself.
 
-use victris_engine::pvnet::{layout, loss_grad, Loss, PvNet, Rec, Scratch, Sym, REC};
+use victris_engine::azdata::GameLog;
+use victris_engine::pvnet::{layout, loss_grad, Loss, PvNet, Sample, Scratch, Sym};
 use victris_engine::pvsearch::Rng;
 
 fn arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
@@ -72,51 +73,79 @@ fn main() {
     let batch: usize = arg(&args, "--batch", 512);
     let lambda: f32 = arg(&args, "--lambda", 0.5);
     let pw: f32 = arg(&args, "--pw", 1.0);
+    let eps: f32 = arg(&args, "--eps", 1e-3);
     let threads: usize = arg(&args, "--threads", 4);
     let holdout: f64 = arg(&args, "--holdout", 0.05);
     let seed: u64 = arg(&args, "--seed", 1);
     let map: String = arg(&args, "--map", String::from("columns-21"));
     let mirror: u32 = arg(&args, "--mirror", 1);
-    let sym = Sym::of(&victris_engine::Engine::shipped(&map));
+    let e = victris_engine::Engine::shipped(&map);
+    let sym = Sym::of(&e);
     let images: Vec<usize> = (0..4).filter(|k| *k == 0 || (mirror != 0 && sym.ok[*k])).collect();
     let files: Vec<String> = match args.iter().position(|a| a == "--data") {
         Some(i) => args[i + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect(),
         None => Vec::new(),
     };
-    let mut data: Vec<u8> = Vec::new();
+    // replay every saved game to get its positions back
+    let mut data: Vec<Sample> = Vec::new();
+    let mut game_start: Vec<usize> = Vec::new();
+    let mut bad = 0;
     for f in &files {
         let b = std::fs::read(f).unwrap_or_else(|_| panic!("cannot read {f}"));
-        data.extend_from_slice(&b[..b.len() / REC * REC]);
+        for g in GameLog::read_all(&b) {
+            let at = data.len();
+            if g.samples(&e, &mut data) {
+                game_start.push(at);
+            } else {
+                bad += 1;
+            }
+        }
     }
-    let total = data.len() / REC;
+    let total = data.len();
     assert!(total > 0, "no positions to learn from");
     let mut rng = Rng::new(seed);
-    // positions of one game sit together in the file: hold out whole runs of 256, so the check
-    // is on games the network did not train on
+    // hold out whole games, so the check is on games the network did not train on
     let mut train: Vec<u32> = Vec::new();
     let mut held: Vec<u32> = Vec::new();
-    let mut block_held = false;
-    for i in 0..total {
-        if i % 256 == 0 {
-            block_held = rng.unit() < holdout;
-        }
-        if block_held {
-            held.push(i as u32);
-        } else {
-            train.push(i as u32);
-        }
+    for (k, &at) in game_start.iter().enumerate() {
+        let end = game_start.get(k + 1).copied().unwrap_or(total);
+        let to = if rng.unit() < holdout { &mut held } else { &mut train };
+        to.extend((at..end).map(|i| i as u32));
     }
     let mut net = if init.is_empty() { PvNet::blank(&map, h1, h2, seed) } else { PvNet::load(std::path::Path::new(&init)).expect("cannot read --init") };
     let len = layout(net.h1, net.h2).len;
-    println!("aztrain: {} positions ({} held out) from {} files, network {}x{} ({} weights), {} epochs, {} mirror images", total, held.len(), files.len(), net.h1, net.h2, len, epochs, images.len());
-    let rec = |i: u32| Rec::read(&data[i as usize * REC..(i as usize + 1) * REC]);
+    if init.is_empty() {
+        // Start every kind of turn at its overall share of the search's visits. Left at zero,
+        // the rare kinds need thousands of steps to sink, and all that time every weight is
+        // pushed the same way: the hidden units end up pinned at their limits acting as one
+        // more constant, and learn nothing about the position.
+        let mut share = vec![1e-4f64; victris_engine::pvnet::CLASSES];
+        for r in data.iter().step_by(7) {
+            for f in 0..2 {
+                let sum: u32 = r.pol[f].iter().map(|v| *v as u32).sum();
+                if sum > 0 {
+                    for c in 0..share.len() {
+                        share[c] += r.pol[f][c] as f64 / sum as f64;
+                    }
+                }
+            }
+        }
+        let all: f64 = share.iter().sum();
+        let pb = layout(net.h1, net.h2).pb;
+        for c in 0..share.len() {
+            net.w[pb + c] = (share[c] / all).ln() as f32;
+        }
+    }
+    println!("aztrain: {} positions ({} held out) from {} games in {} files{}, network {}x{} ({} weights), {} epochs, {} mirror images", total, held.len(), game_start.len(), files.len(), if bad > 0 { format!(" ({bad} games did not replay and were left out)") } else { String::new() }, net.h1, net.h2, len, epochs, images.len());
+    let (data_ref, e_ref) = (&data, &e);
+    let rec = move |i: u32| &data_ref[i as usize];
     let check = |net: &PvNet, ids: &[u32]| -> Sum {
         let chunk = ids.len().div_ceil(threads.max(1)).max(1);
         std::thread::scope(|sc| {
             let hs: Vec<_> = ids.chunks(chunk).map(|part| sc.spawn(move || {
                 let (mut sum, mut scr) = (Sum::default(), Scratch::default());
                 for &i in part {
-                    sum.add(&loss_grad(net, &rec(i), lambda, pw, &mut scr, None));
+                    sum.add(&loss_grad(net, e_ref, rec(i), lambda, pw, &mut scr, None));
                 }
                 sum
             })).collect();
@@ -151,8 +180,8 @@ fn main() {
                     let (mut sum, mut scr) = (Sum::default(), Scratch::default());
                     for &i in part {
                         let k = images_ref[((draw ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15)) >> 33) as usize % images_ref.len()];
-                        let r = if k == 0 { rec(i) } else { sym_ref.image(k, &rec(i)) };
-                        sum.add(&loss_grad(net_ref, &r, lambda, pw, &mut scr, Some(&mut grad)));
+                        let l = if k == 0 { loss_grad(net_ref, e_ref, rec(i), lambda, pw, &mut scr, Some(&mut grad)) } else { loss_grad(net_ref, e_ref, &sym_ref.image(k, rec(i)), lambda, pw, &mut scr, Some(&mut grad)) };
+                        sum.add(&l);
                     }
                     (grad, sum)
                 })).collect();
@@ -165,11 +194,31 @@ fn main() {
                 let g: f32 = parts.iter().map(|p| p.0[k]).sum::<f32>() * scale;
                 m[k] = b1 * m[k] + (1.0 - b1) * g;
                 v[k] = b2 * v[k] + (1.0 - b2) * g * g;
-                net.w[k] -= lr * (m[k] / c1) / ((v[k] / c2).sqrt() + 1e-8);
+                net.w[k] -= lr * (m[k] / c1) / ((v[k] / c2).sqrt() + eps);
             }
             for p in &parts {
                 seen.merge(&p.1);
             }
+        }
+        if std::env::var("AZ_DEBUG").is_ok() {
+            let l = layout(net.h1, net.h2);
+            let norm = |a: usize, b: usize| (net.w[a..b].iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / (b - a).max(1) as f64).sqrt();
+            let (mut sat1, mut sat2, mut n1, mut n2) = (0u64, 0u64, 0u64, 0u64);
+            let mut pass = victris_engine::pvnet::Pass::default();
+            let mut x = victris_engine::pvnet::Inputs::default();
+            for &i in train.iter().take(2000) {
+                victris_engine::pvnet::encode(&e, &rec(i).s, 0, &mut x);
+                net.forward(&x, &mut pass);
+                for j in 0..net.h1 {
+                    sat1 += (pass.z1[j].abs() > 4.0) as u64;
+                    n1 += 1;
+                }
+                for j in 0..net.h2 {
+                    sat2 += (pass.z2[j].abs() > 4.0) as u64;
+                    n2 += 1;
+                }
+            }
+            println!("      debug: rms weights t1 {:.3} t2 {:.3} vw {:.3} tp {:.3}; units past 4: layer 1 {:.1}%, layer 2 {:.1}%", norm(l.t1, l.b1), norm(l.t2, l.b2), norm(l.vw, l.vb), norm(l.tp, l.pb), 100.0 * sat1 as f64 / n1 as f64, 100.0 * sat2 as f64 / n2 as f64);
         }
         let held_line = if held.is_empty() { String::new() } else { format!("\n      held out: {}", check(&net, &held).line()) };
         println!("  epoch {} ({:.0} s): training: {}{}", epoch + 1, started.elapsed().as_secs_f64(), seen.line(), held_line);

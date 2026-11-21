@@ -2,24 +2,251 @@
 //! here, and what each fighter does here. Trained on the search's own conclusions (`aztrain`):
 //! the value on who went on to win, the moves on where the search put its visits. It is the
 //! search's memory: a kind of position searched once is known the next time it comes up,
-//! wherever on the map and whenever in the game, because the inputs describe the position
-//! (`rawnet::encode`: distances, cooldowns, statuses, the walls around each fighter), not the
-//! path that led to it.
+//! wherever on the map and whenever in the game, because the inputs describe the position as
+//! the fighter stands in it (where the opponent is from here, the walls around both, shots and
+//! blasts on their way, every cooldown and status), not the path that led to it.
 //!
-//! A trunk `h` reads (mine, theirs, position) and gives a score `g` and one number per kind of
-//! turn. Fighter 0 wins with chance sigmoid(g(0's view) - g(1's view)), so the two fighters'
-//! chances add up to one by construction. Fighter x's turns are weighted by the trunk on x's view.
+//! A trunk reads one fighter's view and gives a score `g` and one number per kind of turn.
+//! Fighter 0 wins with chance sigmoid(g(0's view) - g(1's view)), so the two fighters' chances
+//! add up to one by construction. Fighter x's turns are weighted by the trunk on x's view.
 //!
 //! A kind of turn is a movement (none, a step in one of 8 directions, a dash in one of 8) with an
 //! attack (none, or one of up to three attacks by its place in the rules): 17 x 4 = 68 kinds.
+//!
+//! The inputs are facts of the board, mostly yes/no, laid out so that "the opponent is two tiles
+//! north-east of me" is one input of its own: no input is a judgment of whether something is
+//! good. Only the inputs that are not zero are passed on (`Inputs`), about 60 of 602.
 
-use crate::geom::{add, chebyshev, DIR_VEC};
+use crate::geom::{add, chebyshev, DIR_VEC, SUB};
+use crate::map::PadKind;
 use crate::observe::can_see;
-use crate::rawnet::{act, encode, IN};
 use crate::rules::AttackKind;
-use crate::state::{FState, State};
+use crate::state::{FState, State, NO_BUFF};
 use crate::turn::{AttackIn, DirIn, RawTurn};
 use crate::Engine;
+
+/// Per fighter: hp, buff, status, every cooldown, where it stands against the zone.
+const FS: usize = 27;
+const R_OPP: i32 = 6;
+const R_WALL: i32 = 3;
+const R_WALL_T: i32 = 2;
+const R_SHOT: i32 = 4;
+const R_AREA: i32 = 2;
+const N_OPP: usize = ((2 * R_OPP + 1) * (2 * R_OPP + 1)) as usize;
+const N_WALL: usize = ((2 * R_WALL + 1) * (2 * R_WALL + 1)) as usize;
+const N_WALL_T: usize = ((2 * R_WALL_T + 1) * (2 * R_WALL_T + 1)) as usize;
+const N_SHOT: usize = ((2 * R_SHOT + 1) * (2 * R_SHOT + 1)) as usize;
+const N_AREA: usize = ((2 * R_AREA + 1) * (2 * R_AREA + 1)) as usize;
+/// What is on its way to one fighter: the other's shots around it, whether one is on course and
+/// how soon, the nearest one's heading, a blast it stands in and its fuse, the nearest blast.
+const TH: usize = N_SHOT + 1 + 4 + 8 + 1 + 7 + N_AREA;
+const PADS: usize = 4;
+const B_OPP: usize = 2 * FS;
+const B_OFF: usize = B_OPP + N_OPP;
+const B_DIST: usize = B_OFF + 2;
+const B_SEE: usize = B_DIST + 13;
+const B_WALL: usize = B_SEE + 1;
+const B_WALL_T: usize = B_WALL + N_WALL;
+const B_THREAT: usize = B_WALL_T + N_WALL_T;
+const B_PADS: usize = B_THREAT + 2 * TH;
+const B_CTX: usize = B_PADS + 8 * PADS;
+/// Number of inputs of one view.
+pub const IN: usize = B_CTX + 3;
+/// The most inputs that can be other than zero at once.
+pub const CAP: usize = 192;
+
+/// One view's inputs: only those that are not zero.
+#[derive(Clone)]
+pub struct Inputs {
+    pub n: usize,
+    pub idx: [u16; CAP],
+    pub val: [f32; CAP],
+}
+
+impl Default for Inputs {
+    fn default() -> Inputs {
+        Inputs { n: 0, idx: [0; CAP], val: [0.0; CAP] }
+    }
+}
+
+impl Inputs {
+    #[inline]
+    fn put(&mut self, i: usize, v: f32) {
+        if v != 0.0 && self.n < CAP {
+            debug_assert!(i < IN);
+            self.idx[self.n] = i as u16;
+            self.val[self.n] = v;
+            self.n += 1;
+        }
+    }
+    #[inline]
+    fn on(&mut self, i: usize) {
+        self.put(i, 1.0);
+    }
+    /// All inputs, zeros included (for tests).
+    pub fn dense(&self) -> Vec<f32> {
+        let mut v = vec![0.0; IN];
+        for k in 0..self.n {
+            v[self.idx[k] as usize] += self.val[k];
+        }
+        v
+    }
+}
+
+fn fighter_inputs(e: &Engine, s: &State, x: usize, b: usize, out: &mut Inputs) {
+    let f = &s.fighters[x];
+    out.put(b, f.hp.max(0) as f32 / e.rules.max_hp.max(1) as f32);
+    let buff = if f.power_until == NO_BUFF { 0 } else { (f.power_until - s.tick).max(0) };
+    out.put(b + 1, buff as f32 / 50.0);
+    out.put(b + 2, (buff > 0) as u8 as f32);
+    out.put(b + 3, (f.state == FState::Idle) as u8 as f32);
+    out.put(b + 4, (f.state == FState::Stunned) as u8 as f32);
+    out.put(b + 5, (f.state == FState::Recovering || f.state == FState::Dashing) as u8 as f32);
+    out.put(b + 6, if f.state == FState::Idle { 0.0 } else { (f.state_end - s.tick).clamp(0, 12) as f32 / 12.0 });
+    out.on(b + 7 + f.cd_move.clamp(0, 4) as usize);
+    out.put(b + 12, f.cd_dash.clamp(0, 12) as f32 / 12.0);
+    out.put(b + 13, (f.cd_dash == 0) as u8 as f32);
+    out.put(b + 14, (f.cd_dash > 0 && f.cd_dash <= 2) as u8 as f32);
+    for want in 0..3usize {
+        let cd = e.rules.attacks.iter().enumerate().find(|(_, a)| matches!((&a.kind, want), (AttackKind::Projectile { .. }, 0) | (AttackKind::Area { .. }, 1) | (AttackKind::Burst { .. }, 2))).map(|(i, a)| (f.cd_attack[i], a.cooldown.max(1)));
+        if let Some((c, m)) = cd {
+            out.put(b + 15 + want, c.min(m) as f32 / m as f32);
+            out.put(b + 18 + want, (c == 0) as u8 as f32);
+            out.put(b + 21 + want, (c > 0 && c <= 2) as u8 as f32);
+        }
+    }
+    let far = chebyshev(f.pos, e.map.center);
+    out.put(b + 24, far.min(15) as f32 / 15.0);
+    out.put(b + 25, (far > s.zone_radius) as u8 as f32);
+    out.put(b + 26, (s.zone_radius - far).clamp(-5, 10) as f32 / 10.0);
+}
+
+/// What fighter `a` has on its way to the fighter standing at `v`.
+fn threat_inputs(e: &Engine, s: &State, a: usize, v: [i32; 2], b: usize, out: &mut Inputs) {
+    let side = 2 * R_SHOT + 1;
+    let mut soonest: Option<i32> = None;
+    let mut nearest: Option<(i32, usize)> = None;
+    let mut seen = [false; N_SHOT];
+    for (k, p) in s.projectiles().iter().enumerate() {
+        if p.owner as usize != a {
+            continue;
+        }
+        let (dx, dy) = (p.pos[0] - v[0], p.pos[1] - v[1]);
+        if dx.abs() <= R_SHOT && dy.abs() <= R_SHOT {
+            let cell = ((dy + R_SHOT) * side + dx + R_SHOT) as usize;
+            if !seen[cell] {
+                seen[cell] = true;
+                out.on(b + cell);
+            }
+        }
+        let d = dx.abs().max(dy.abs());
+        if nearest.map(|n| d < n.0).unwrap_or(true) {
+            nearest = Some((d, k));
+        }
+        // on course: its line passes within half a tile of the fighter, ahead of it, in reach
+        let (lx, ly) = ((p.target[0] - p.origin[0]) as f64, (p.target[1] - p.origin[1]) as f64);
+        let len = (lx * lx + ly * ly).sqrt();
+        if len > 0.0 {
+            let (rx, ry) = (v[0] as f64 * SUB as f64 - p.exact_pos[0] as f64, v[1] as f64 * SUB as f64 - p.exact_pos[1] as f64);
+            let along = (rx * lx + ry * ly) / len;
+            let off = (rx * ly - ry * lx).abs() / len;
+            let reach = (p.max_travel - p.traveled) as f64;
+            if along >= 0.0 && along <= reach + 0.5 * SUB as f64 && off < 0.5 * SUB as f64 {
+                let ticks = (along / (p.speed.max(1) as f64 * SUB as f64)).ceil().max(1.0) as i32;
+                soonest = Some(soonest.map(|t| t.min(ticks)).unwrap_or(ticks));
+            }
+        }
+    }
+    let mut at = b + N_SHOT;
+    if let Some(t) = soonest {
+        out.on(at);
+        out.on(at + 1 + (t.clamp(1, 4) - 1) as usize);
+    }
+    at += 5;
+    if let Some((_, k)) = nearest {
+        let p = &s.projectiles()[k];
+        let (lx, ly) = ((p.target[0] - p.origin[0]) as f64, (p.target[1] - p.origin[1]) as f64);
+        if lx != 0.0 || ly != 0.0 {
+            let o = ((ly.atan2(lx) / std::f64::consts::FRAC_PI_4).round() as i32).rem_euclid(8);
+            out.on(at + o as usize);
+        }
+    }
+    at += 8;
+    let mut fuse: Option<i32> = None;
+    let mut near: Option<(i32, [i32; 2])> = None;
+    for ar in s.areas().iter().filter(|ar| ar.owner as usize == a) {
+        if e.map.in_blast(ar.pos, ar.radius, v) {
+            let t = (ar.explodes_tick - s.tick).clamp(0, 6);
+            fuse = Some(fuse.map(|f| f.min(t)).unwrap_or(t));
+        }
+        let d = chebyshev(ar.pos, v);
+        if near.map(|n| d < n.0).unwrap_or(true) {
+            near = Some((d, [ar.pos[0] - v[0], ar.pos[1] - v[1]]));
+        }
+    }
+    if let Some(t) = fuse {
+        out.on(at);
+        out.on(at + 1 + t as usize);
+    }
+    at += 8;
+    if let Some((_, [dx, dy])) = near {
+        if dx.abs() <= R_AREA && dy.abs() <= R_AREA {
+            out.on(at + ((dy + R_AREA) * (2 * R_AREA + 1) + dx + R_AREA) as usize);
+        }
+    }
+}
+
+/// The board as fighter `x` stands in it.
+pub fn encode(e: &Engine, s: &State, x: usize, out: &mut Inputs) {
+    out.n = 0;
+    let (f, o) = (&s.fighters[x], &s.fighters[1 - x]);
+    fighter_inputs(e, s, x, 0, out);
+    fighter_inputs(e, s, 1 - x, FS, out);
+    let (dx, dy) = (o.pos[0] - f.pos[0], o.pos[1] - f.pos[1]);
+    if dx.abs() <= R_OPP && dy.abs() <= R_OPP {
+        out.on(B_OPP + ((dy + R_OPP) * (2 * R_OPP + 1) + dx + R_OPP) as usize);
+    }
+    out.put(B_OFF, dx as f32 / 20.0);
+    out.put(B_OFF + 1, dy as f32 / 20.0);
+    let d = dx.abs().max(dy.abs());
+    if d >= 1 {
+        out.on(B_DIST + (d.min(13) - 1) as usize);
+    }
+    out.put(B_SEE, can_see(&e.rules, &e.map, f.pos, o.pos) as u8 as f32);
+    let wall = |p: [i32; 2]| p[0] < 0 || p[1] < 0 || p[0] >= e.map.w || p[1] >= e.map.h || e.map.is_wall(p);
+    for wy in -R_WALL..=R_WALL {
+        for wx in -R_WALL..=R_WALL {
+            if wall([f.pos[0] + wx, f.pos[1] + wy]) {
+                out.on(B_WALL + ((wy + R_WALL) * (2 * R_WALL + 1) + wx + R_WALL) as usize);
+            }
+        }
+    }
+    for wy in -R_WALL_T..=R_WALL_T {
+        for wx in -R_WALL_T..=R_WALL_T {
+            if wall([o.pos[0] + wx, o.pos[1] + wy]) {
+                out.on(B_WALL_T + ((wy + R_WALL_T) * (2 * R_WALL_T + 1) + wx + R_WALL_T) as usize);
+            }
+        }
+    }
+    threat_inputs(e, s, 1 - x, f.pos, B_THREAT, out);
+    threat_inputs(e, s, x, o.pos, B_THREAT + TH, out);
+    for i in 0..PADS {
+        let Some(pd) = e.map.pads.get(i) else { continue };
+        let b = B_PADS + 8 * i;
+        out.put(b, (pd.pos[0] - f.pos[0]) as f32 / e.map.w.max(1) as f32);
+        out.put(b + 1, (pd.pos[1] - f.pos[1]) as f32 / e.map.h.max(1) as f32);
+        out.put(b + 2, if s.pads[i].available { 0.0 } else { (s.pads[i].respawn_tick - s.tick).clamp(0, 200) as f32 / 200.0 });
+        out.put(b + 3, if pd.kind == PadKind::Power { 1.0 } else { -1.0 });
+        out.put(b + 4, s.pads[i].available as u8 as f32);
+        let (mine, theirs) = (chebyshev(pd.pos, f.pos), chebyshev(pd.pos, o.pos));
+        out.put(b + 5, mine.min(20) as f32 / 20.0);
+        out.put(b + 6, theirs.min(20) as f32 / 20.0);
+        out.put(b + 7, (mine < theirs) as u8 as f32);
+    }
+    out.put(B_CTX, s.tick as f32 / 600.0);
+    out.put(B_CTX + 1, s.zone_radius.clamp(0, 15) as f32 / 15.0);
+    out.on(B_CTX + 2);
+}
 
 pub const MOVES: usize = 17;
 pub const ATTACKS: usize = 4;
@@ -101,15 +328,20 @@ pub fn turns(e: &Engine, s: &State, x: usize, out: &mut Vec<RawTurn>) {
     }
 }
 
-/// The slope of `rawnet::act` at `z`.
+/// The hidden units' curve: z / (1 + |z|). It flattens toward -1 and 1 but its slope never
+/// reaches zero, so a unit pushed far out during training can still come back (with a curve
+/// clamped flat, as `rawnet::act` is, two thirds of the second layer went dead in the first
+/// epoch and stayed there).
+#[inline]
+pub fn act(z: f32) -> f32 {
+    z / (1.0 + z.abs())
+}
+
+/// The slope of `act` at `z`.
 #[inline]
 pub fn act_d(z: f32) -> f32 {
-    if !(-3.0..=3.0).contains(&z) {
-        return 0.0;
-    }
-    let z2 = z * z;
-    let (a, b) = (9.0 - z2, 3.0 + z2);
-    a * a / (9.0 * b * b)
+    let d = 1.0 + z.abs();
+    1.0 / (d * d)
 }
 
 #[inline(always)]
@@ -222,16 +454,15 @@ impl PvNet {
     }
 
     /// One pass over one view's inputs.
-    pub fn forward(&self, x: &[f32; IN], p: &mut Pass) {
+    pub fn forward(&self, x: &Inputs, p: &mut Pass) {
         let (h1, h2) = (self.h1, self.h2);
         let l = layout(h1, h2);
         let w = &self.w;
         let z1 = &mut p.z1[..h1];
         z1.copy_from_slice(&w[l.b1..l.b1 + h1]);
-        for (i, &xi) in x.iter().enumerate() {
-            if xi != 0.0 {
-                axpy(z1, xi, &w[l.t1 + i * h1..l.t1 + (i + 1) * h1]);
-            }
+        for k in 0..x.n {
+            let i = x.idx[k] as usize;
+            axpy(z1, x.val[k], &w[l.t1 + i * h1..l.t1 + (i + 1) * h1]);
         }
         for j in 0..h1 {
             p.a1[j] = act(p.z1[j]);
@@ -253,7 +484,7 @@ impl PvNet {
 
     /// Adds to `grad` the slope of a loss with respect to every weight, given the loss's slope
     /// with respect to this view's score (`dg`) and to its number for each kind of turn.
-    pub fn backward(&self, x: &[f32; IN], p: &Pass, dg: f32, dlogits: &[f32; CLASSES], grad: &mut [f32]) {
+    pub fn backward(&self, x: &Inputs, p: &Pass, dg: f32, dlogits: &[f32; CLASSES], grad: &mut [f32]) {
         let (h1, h2) = (self.h1, self.h2);
         let l = layout(h1, h2);
         let w = &self.w;
@@ -277,16 +508,15 @@ impl PvNet {
             dz1[i] = dot(&w[l.t2 + i * h2..l.t2 + (i + 1) * h2], &dz2[..h2]) * act_d(p.z1[i]);
         }
         axpy(&mut grad[l.b1..l.b1 + h1], 1.0, &dz1[..h1]);
-        for (i, &xi) in x.iter().enumerate() {
-            if xi != 0.0 {
-                axpy(&mut grad[l.t1 + i * h1..l.t1 + (i + 1) * h1], xi, &dz1[..h1]);
-            }
+        for k in 0..x.n {
+            let i = x.idx[k] as usize;
+            axpy(&mut grad[l.t1 + i * h1..l.t1 + (i + 1) * h1], x.val[k], &dz1[..h1]);
         }
     }
 
     /// Reads a position: fighter 0's result to come and both fighters' turn numbers.
     pub fn eval(&self, e: &Engine, s: &State) -> Eval {
-        let mut x = [0.0f32; IN];
+        let mut x = Inputs::default();
         let mut p = Pass::default();
         encode(e, s, 0, &mut x);
         self.forward(&x, &mut p);
@@ -317,70 +547,17 @@ impl PvNet {
     }
 }
 
-/// One saved position of a self-play game, as `azgen` writes it and `aztrain` reads it:
-/// both views' inputs (as `rawnet::encode`, times 100), per fighter the share of the search's
-/// visits on each kind of turn (times 255) and which kinds it could play, the search's own value
-/// for fighter 0 (times 127; `has_q` 0 when the search does not count in wins), and who won.
-pub const REC: usize = 2 * IN + 2 * CLASSES + 2 * 9 + 6;
-
-pub struct Rec {
-    pub a: [i8; IN],
-    pub b: [i8; IN],
+/// One searched position of a self-play game, for the trainer: the position itself, per fighter
+/// the share of the search's visits on each kind of turn (out of 255), the search's own value
+/// for fighter 0 (when the search counts in wins), and who won the game.
+#[derive(Clone)]
+pub struct Sample {
+    pub s: State,
     pub pol: [[u8; CLASSES]; 2],
-    pub legal: [[bool; CLASSES]; 2],
     pub q: f32,
     pub has_q: bool,
     /// 1 fighter 0 won, -1 fighter 1 won, 0 a draw
     pub z: i8,
-    pub tick: u16,
-}
-
-impl Rec {
-    pub fn write(&self, out: &mut Vec<u8>) {
-        out.extend(self.a.iter().map(|v| *v as u8));
-        out.extend(self.b.iter().map(|v| *v as u8));
-        for x in 0..2 {
-            out.extend_from_slice(&self.pol[x]);
-        }
-        for x in 0..2 {
-            let mut bits = [0u8; 9];
-            for c in 0..CLASSES {
-                if self.legal[x][c] {
-                    bits[c / 8] |= 1 << (c % 8);
-                }
-            }
-            out.extend_from_slice(&bits);
-        }
-        out.push((self.q.clamp(-1.0, 1.0) * 127.0).round() as i8 as u8);
-        out.push(self.has_q as u8);
-        out.push(self.z as u8);
-        out.extend_from_slice(&self.tick.to_le_bytes());
-        out.push(0);
-    }
-
-    pub fn read(b: &[u8]) -> Rec {
-        let mut r = Rec { a: [0; IN], b: [0; IN], pol: [[0; CLASSES]; 2], legal: [[false; CLASSES]; 2], q: 0.0, has_q: false, z: 0, tick: 0 };
-        for i in 0..IN {
-            r.a[i] = b[i] as i8;
-            r.b[i] = b[IN + i] as i8;
-        }
-        let mut k = 2 * IN;
-        for x in 0..2 {
-            r.pol[x].copy_from_slice(&b[k..k + CLASSES]);
-            k += CLASSES;
-        }
-        for x in 0..2 {
-            for c in 0..CLASSES {
-                r.legal[x][c] = b[k + c / 8] >> (c % 8) & 1 == 1;
-            }
-            k += 9;
-        }
-        r.q = b[k] as i8 as f32 / 127.0;
-        r.has_q = b[k + 1] != 0;
-        r.z = b[k + 2] as i8;
-        r.tick = u16::from_le_bytes([b[k + 3], b[k + 4]]);
-        r
-    }
 }
 
 /// Working room for `loss_grad`.
@@ -388,6 +565,9 @@ impl Rec {
 pub struct Scratch {
     pa: Pass,
     pb: Pass,
+    xa: Inputs,
+    xb: Inputs,
+    turns: Vec<RawTurn>,
 }
 
 /// What one saved position costs under the network, for the trainer's reports.
@@ -409,7 +589,7 @@ pub struct Loss {
 
 /// The value target for a saved position, as fighter 0's chance to win: the game's result,
 /// mixed (`lambda`) with the search's own value where the search counted in wins.
-pub fn value_target(r: &Rec, lambda: f32) -> f32 {
+pub fn value_target(r: &Sample, lambda: f32) -> f32 {
     let z = r.z as f32;
     let mix = if r.has_q { (1.0 - lambda) * z + lambda * r.q } else { z };
     0.5 * (1.0 + mix)
@@ -418,15 +598,11 @@ pub fn value_target(r: &Rec, lambda: f32) -> f32 {
 /// The loss of one saved position, and (with `grad`) its slope added for every weight:
 /// cross-entropy of the chance to win against `value_target`, plus `pw` times the cross-entropy
 /// of each fighter's turn shares against the search's visit shares.
-pub fn loss_grad(net: &PvNet, r: &Rec, lambda: f32, pw: f32, sc: &mut Scratch, grad: Option<&mut [f32]>) -> Loss {
-    let mut xa = [0.0f32; IN];
-    let mut xb = [0.0f32; IN];
-    for i in 0..IN {
-        xa[i] = r.a[i] as f32 / 100.0;
-        xb[i] = r.b[i] as f32 / 100.0;
-    }
-    net.forward(&xa, &mut sc.pa);
-    net.forward(&xb, &mut sc.pb);
+pub fn loss_grad(net: &PvNet, e: &Engine, r: &Sample, lambda: f32, pw: f32, sc: &mut Scratch, grad: Option<&mut [f32]>) -> Loss {
+    encode(e, &r.s, 0, &mut sc.xa);
+    encode(e, &r.s, 1, &mut sc.xb);
+    net.forward(&sc.xa, &mut sc.pa);
+    net.forward(&sc.xb, &mut sc.pb);
     let d = sc.pa.g - sc.pb.g;
     let p = 1.0 / (1.0 + (-d).exp());
     let t = value_target(r, lambda);
@@ -435,23 +611,34 @@ pub fn loss_grad(net: &PvNet, r: &Rec, lambda: f32, pw: f32, sc: &mut Scratch, g
     let mut dl = [[0.0f32; CLASSES]; 2];
     for f in 0..2 {
         let logits = if f == 0 { &sc.pa.logits } else { &sc.pb.logits };
-        let legal = r.legal[f].iter().filter(|l| **l).count();
         let total: u32 = r.pol[f].iter().map(|v| *v as u32).sum();
-        if legal < 2 || total == 0 {
+        if total == 0 {
             continue;
         }
-        let top = (0..CLASSES).filter(|c| r.legal[f][*c]).map(|c| logits[c]).fold(f32::MIN, f32::max);
+        // on offer: every turn the fighter may play here, and any kind the search visited
+        let mut legal = [false; CLASSES];
+        turns(e, &r.s, f, &mut sc.turns);
+        for t in &sc.turns {
+            legal[class_of(t)] = true;
+        }
+        for c in 0..CLASSES {
+            legal[c] |= r.pol[f][c] > 0;
+        }
+        if legal.iter().filter(|l| **l).count() < 2 {
+            continue;
+        }
+        let top = (0..CLASSES).filter(|c| legal[*c]).map(|c| logits[c]).fold(f32::MIN, f32::max);
         let mut sum = 0.0f32;
         let mut sm = [0.0f32; CLASSES];
         for c in 0..CLASSES {
-            if r.legal[f][c] {
+            if legal[c] {
                 sm[c] = (logits[c] - top).exp();
                 sum += sm[c];
             }
         }
         let (mut best_net, mut best_pi) = ((f32::MIN, 0), (0u8, 0));
         for c in 0..CLASSES {
-            if !r.legal[f][c] {
+            if !legal[c] {
                 continue;
             }
             let q = sm[c] / sum;
@@ -472,8 +659,8 @@ pub fn loss_grad(net: &PvNet, r: &Rec, lambda: f32, pw: f32, sc: &mut Scratch, g
         out.top_hit += (best_net.1 == best_pi.1) as u32;
     }
     if let Some(grad) = grad {
-        net.backward(&xa, &sc.pa, p - t, &dl[0], grad);
-        net.backward(&xb, &sc.pb, t - p, &dl[1], grad);
+        net.backward(&sc.xa, &sc.pa, p - t, &dl[0], grad);
+        net.backward(&sc.xb, &sc.pb, t - p, &dl[1], grad);
     }
     out
 }
@@ -487,7 +674,7 @@ pub struct Sym {
     /// which image: bit 0 mirrors x, bit 1 mirrors y; whether the map allows it
     pub ok: [bool; 4],
     /// for each image, the pad that lands where pad i stands
-    pad: [[usize; crate::rawnet::MAX_PADS_USED]; 4],
+    pad: [Vec<usize>; 4],
     /// for each image, the direction each direction becomes
     dir: [[usize; 8]; 4],
 }
@@ -496,7 +683,7 @@ impl Sym {
     pub fn of(e: &Engine) -> Sym {
         let (w, h) = (e.map.w, e.map.h);
         let flip = |k: usize, p: [i32; 2]| [if k & 1 != 0 { w - 1 - p[0] } else { p[0] }, if k & 2 != 0 { h - 1 - p[1] } else { p[1] }];
-        let mut s = Sym { w, h, ok: [true; 4], pad: [[0; crate::rawnet::MAX_PADS_USED]; 4], dir: [[0; 8]; 4] };
+        let mut s = Sym { w, h, ok: [true; 4], pad: [Vec::new(), Vec::new(), Vec::new(), Vec::new()], dir: [[0; 8]; 4] };
         for k in 0..4 {
             for y in 0..h {
                 for x in 0..w {
@@ -505,16 +692,16 @@ impl Sym {
                     }
                 }
             }
-            if e.map.pads.len() > crate::rawnet::MAX_PADS_USED {
-                s.ok[k] = k == 0;
+            if flip(k, e.map.center) != e.map.center {
+                s.ok[k] = false;
             }
-            for i in 0..crate::rawnet::MAX_PADS_USED {
-                s.pad[k][i] = i;
-                if let Some(pd) = e.map.pads.get(i) {
-                    // the pad whose image stands on pad i
-                    match e.map.pads.iter().position(|q| flip(k, q.pos) == pd.pos && q.kind == pd.kind) {
-                        Some(j) if j < crate::rawnet::MAX_PADS_USED => s.pad[k][i] = j,
-                        _ => s.ok[k] = false,
+            for (i, pd) in e.map.pads.iter().enumerate() {
+                // the pad whose image stands on pad i
+                match e.map.pads.iter().position(|q| flip(k, q.pos) == pd.pos && q.kind == pd.kind) {
+                    Some(j) => s.pad[k].push(j),
+                    None => {
+                        s.pad[k].push(i);
+                        s.ok[k] = false;
                     }
                 }
             }
@@ -538,72 +725,58 @@ impl Sym {
         m2 * ATTACKS + a
     }
 
-    fn view(&self, k: usize, v: &[i8; IN]) -> [i8; IN] {
-        use crate::rawnet::{MAX_PADS_USED, OWN, PATCH};
-        let (mx, my) = (k & 1 != 0, k & 2 != 0);
-        let mut out = *v;
-        let side = (2 * PATCH + 1) as usize;
-        let pos = |q: i8, n: i32| -> i8 {
-            let x = (q as f32 * n as f32 / 100.0).round() as i32;
-            (((n - 1 - x) as f32 / n as f32) * 100.0).round().clamp(-127.0, 127.0) as i8
+    /// The turn `t` as played in image `k`.
+    pub fn turn(&self, k: usize, t: &RawTurn) -> RawTurn {
+        let dir = |d: DirIn| match d {
+            DirIn::Dir(d) => DirIn::Dir(self.dir[k][d as usize & 7] as u8),
+            other => other,
         };
-        for b in 0..2 {
-            let o = b * OWN;
-            if mx {
-                out[o] = pos(v[o], self.w);
-            }
-            if my {
-                out[o + 1] = pos(v[o + 1], self.h);
-            }
-            // the walls around the fighter
-            let patch = o + 14;
-            for y in 0..side {
-                for x in 0..side {
-                    let (sx, sy) = (if mx { side - 1 - x } else { x }, if my { side - 1 - y } else { y });
-                    out[patch + y * side + x] = v[patch + sy * side + sx];
-                }
-            }
-            // the pads, each in the slot of the pad its image stands on
-            let pads = patch + side * side;
-            for i in 0..MAX_PADS_USED {
-                let j = self.pad[k][i];
-                for f in 0..4 {
-                    out[pads + 4 * i + f] = v[pads + 4 * j + f];
-                }
-                if mx {
-                    out[pads + 4 * i] = out[pads + 4 * i].saturating_neg();
-                }
-                if my {
-                    out[pads + 4 * i + 1] = out[pads + 4 * i + 1].saturating_neg();
-                }
-            }
-            // the nearest shot
-            let shot = pads + 4 * MAX_PADS_USED;
-            if mx {
-                out[shot] = v[shot].saturating_neg();
-            }
-            if my {
-                out[shot + 1] = v[shot + 1].saturating_neg();
-            }
+        let attack = match t.attack {
+            AttackIn::Named { attack, target: crate::turn::TargetIn::Tile(p) } => AttackIn::Named { attack, target: crate::turn::TargetIn::Tile(self.tile(k, p)) },
+            other => other,
+        };
+        RawTurn { mv: dir(t.mv), dash: dir(t.dash), attack, ..*t }
+    }
+
+    fn tile(&self, k: usize, p: [i32; 2]) -> [i32; 2] {
+        [if k & 1 != 0 { self.w - 1 - p[0] } else { p[0] }, if k & 2 != 0 { self.h - 1 - p[1] } else { p[1] }]
+    }
+
+    /// The position `s` in image `k`: everything on the board mirrored, each pad's state moved
+    /// to the pad its image stands on.
+    pub fn state(&self, k: usize, s: &State) -> State {
+        if k == 0 {
+            return *s;
         }
-        // where the other fighter is from here
-        if mx {
-            out[2 * OWN + 2] = v[2 * OWN + 2].saturating_neg();
+        let sub = SUB as i32;
+        let exact = |p: [i32; 2]| [if k & 1 != 0 { (self.w - 1) * sub - p[0] } else { p[0] }, if k & 2 != 0 { (self.h - 1) * sub - p[1] } else { p[1] }];
+        let mut t = *s;
+        for f in t.fighters.iter_mut() {
+            f.pos = self.tile(k, f.pos);
         }
-        if my {
-            out[2 * OWN + 3] = v[2 * OWN + 3].saturating_neg();
+        for i in 0..t.n_projectiles as usize {
+            let p = &mut t.projectiles[i];
+            p.pos = self.tile(k, p.pos);
+            p.origin = self.tile(k, p.origin);
+            p.target = self.tile(k, p.target);
+            p.exact_pos = exact(p.exact_pos);
         }
-        out
+        for i in 0..t.n_areas as usize {
+            t.areas[i].pos = self.tile(k, t.areas[i].pos);
+            t.areas[i].origin = self.tile(k, t.areas[i].origin);
+        }
+        for (i, j) in self.pad[k].iter().enumerate() {
+            t.pads[i] = s.pads[*j];
+        }
+        t
     }
 
     /// The saved position `r` in image `k`.
-    pub fn image(&self, k: usize, r: &Rec) -> Rec {
-        let mut out = Rec { a: self.view(k, &r.a), b: self.view(k, &r.b), pol: [[0; CLASSES]; 2], legal: [[false; CLASSES]; 2], q: r.q, has_q: r.has_q, z: r.z, tick: r.tick };
+    pub fn image(&self, k: usize, r: &Sample) -> Sample {
+        let mut out = Sample { s: self.state(k, &r.s), pol: [[0; CLASSES]; 2], q: r.q, has_q: r.has_q, z: r.z };
         for f in 0..2 {
             for c in 0..CLASSES {
-                let c2 = self.class(k, c);
-                out.pol[f][c2] = r.pol[f][c];
-                out.legal[f][c2] = r.legal[f][c];
+                out.pol[f][self.class(k, c)] = r.pol[f][c];
             }
         }
         out

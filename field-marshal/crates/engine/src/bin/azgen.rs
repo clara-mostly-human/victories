@@ -1,8 +1,9 @@
 //! azgen: self-play that saves every search's conclusion.
 //!
 //! Both fighters are played by one search on the exact engine, with everything in sight. At every
-//! tick it saves the position, where the search put its visits for each fighter, the search's
-//! value, and (when the game ends) who won. `aztrain` learns from these files.
+//! tick it saves the turns played, where the search put its visits for each fighter and the
+//! search's value, and (when the game ends) who won (`azdata`). `aztrain` learns from these
+//! files.
 //!
 //!   azgen --out FILE --games N [--net NET.json] [--iters 800] [--seed 1] [--threads 4]
 //!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25]
@@ -13,8 +14,9 @@
 
 use std::io::Write;
 use victris_engine::mcts;
-use victris_engine::pvnet::{PvNet, Rec, REC};
-use victris_engine::pvsearch::{self, outcome, pick, record, PvConfig, Rng};
+use victris_engine::azdata::{shares, GameLog, TickLog};
+use victris_engine::pvnet::PvNet;
+use victris_engine::pvsearch::{self, outcome, pick, PvConfig, Rng};
 use victris_engine::state::FState;
 use victris_engine::{Engine, RawTurn};
 
@@ -53,12 +55,15 @@ fn main() {
                         }
                         let mut rng = Rng::new(seed.wrapping_mul(1_000_003).wrapping_add(g as u64));
                         let mut s = e.new_match((seed as i64).wrapping_mul(7919).wrapping_add(g as i64));
-                        let mut recs: Vec<Rec> = Vec::new();
+                        let match_seed = (seed as i64).wrapping_mul(7919).wrapping_add(g as i64);
+                        let mut log = GameLog { seed: match_seed, z: 0, ticks: Vec::new() };
+                        let mut searched = 0u64;
                         let mut pv = net.as_ref().map(|n| pvsearch::Search::new(&e, n, PvConfig { even_root: wide, ..Default::default() }));
                         while s.result.is_none() {
                             let free = |x: usize| s.fighters[x].alive && s.fighters[x].state == FState::Idle;
                             if !free(0) && !free(1) {
                                 e.step(&mut s, &[RawTurn::IDLE, RawTurn::IDLE]);
+                                log.ticks.push(TickLog { turns: [RawTurn::IDLE, RawTurn::IDLE], q: None, pol: None });
                                 if let Some(p) = pv.as_mut() {
                                     p.advance(&RawTurn::IDLE, &RawTurn::IDLE);
                                 }
@@ -79,9 +84,10 @@ fn main() {
                                 }
                             };
                             st[5] += iters as u64;
-                            recs.push(record(&e, &s, [&visits[0], &visits[1]], q));
+                            searched += 1;
                             let w = if s.tick < open { 1.0 } else { wander };
                             let pair = [pick(&visits[0], w, &mut rng), pick(&visits[1], w, &mut rng)];
+                            log.ticks.push(TickLog { turns: pair, q, pol: Some([shares(&visits[0]), shares(&visits[1])]) });
                             e.step(&mut s, &pair);
                             if let Some(p) = pv.as_mut() {
                                 p.advance(&pair[0], &pair[1]);
@@ -89,14 +95,12 @@ fn main() {
                         }
                         let z = outcome(&s).unwrap_or(0.0) as i8;
                         st[0] += 1;
-                        st[1] += recs.len() as u64;
+                        st[1] += searched;
                         st[2] += s.tick.max(0) as u64;
                         st[3] += (z > 0) as u64;
                         st[4] += (z < 0) as u64;
-                        for r in recs.iter_mut() {
-                            r.z = z;
-                            r.write(&mut bytes);
-                        }
+                        log.z = z;
+                        log.write(&mut bytes);
                     }
                     (bytes, st)
                 })
@@ -107,7 +111,6 @@ fn main() {
     let mut file = std::io::BufWriter::new(std::fs::File::create(&out).expect("cannot write the output"));
     let mut st = [0u64; 6];
     for (bytes, s) in &parts {
-        debug_assert_eq!(bytes.len() % REC, 0);
         file.write_all(bytes).unwrap();
         for i in 0..6 {
             st[i] += s[i];

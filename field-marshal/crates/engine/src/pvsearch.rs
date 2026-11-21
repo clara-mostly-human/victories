@@ -10,8 +10,7 @@
 //! visit counts and results; each fighter picks by its own list (as `mcts` does), and the pair
 //! of picks leads to the next position.
 
-use crate::pvnet::{class_of, turns, Pass, PvNet, Rec, CLASSES};
-use crate::rawnet::{encode, IN};
+use crate::pvnet::{class_of, encode, turns, Inputs, Pass, PvNet};
 use crate::state::State;
 use crate::turn::RawTurn;
 use crate::Engine;
@@ -63,6 +62,7 @@ pub struct Search<'a> {
     index: HashMap<u64, u32>,
     path: Vec<(u32, u16, u16)>,
     pass: Pass,
+    x: Inputs,
     buf: Vec<RawTurn>,
     /// length of every line searched, by ticks (the last slot holds that and longer)
     pub depth_hist: [u64; 64],
@@ -79,7 +79,7 @@ pub fn outcome(s: &State) -> Option<f32> {
 
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, net: &'a PvNet, cfg: PvConfig) -> Search<'a> {
-        Search { e, net, cfg, nodes: Vec::new(), index: HashMap::new(), path: Vec::new(), pass: Pass::default(), buf: Vec::new(), depth_hist: [0; 64] }
+        Search { e, net, cfg, nodes: Vec::new(), index: HashMap::new(), path: Vec::new(), pass: Pass::default(), x: Inputs::default(), buf: Vec::new(), depth_hist: [0; 64] }
     }
 
     pub fn clear(&mut self) {
@@ -92,12 +92,11 @@ impl<'a> Search<'a> {
     }
 
     fn expand(&mut self, s: &State, even: f32) -> Node {
-        let mut x = [0.0f32; IN];
         let mut g = [0.0f32; 2];
         let mut acts: [Vec<Act>; 2] = [Vec::new(), Vec::new()];
         for f in 0..2 {
-            encode(self.e, s, f, &mut x);
-            self.net.forward(&x, &mut self.pass);
+            encode(self.e, s, f, &mut self.x);
+            self.net.forward(&self.x, &mut self.pass);
             g[f] = self.pass.g;
             turns(self.e, s, f, &mut self.buf);
             let logits = &self.pass.logits;
@@ -269,41 +268,6 @@ impl<'a> Search<'a> {
         }
         true
     }
-}
-
-/// One self-play position for the trainer: both views of `s`, each fighter's visits by kind of
-/// turn, and the search's value for fighter 0 (`None` when the search does not count in wins).
-/// The game's result (`z`) is filled in when the game ends.
-pub fn record(e: &Engine, s: &State, visits: [&[(RawTurn, u32)]; 2], q: Option<f32>) -> Rec {
-    let mut r = Rec { a: [0; IN], b: [0; IN], pol: [[0; CLASSES]; 2], legal: [[false; CLASSES]; 2], q: q.unwrap_or(0.0), has_q: q.is_some(), z: 0, tick: s.tick.clamp(0, 65535) as u16 };
-    let mut x = [0.0f32; IN];
-    encode(e, s, 0, &mut x);
-    for i in 0..IN {
-        r.a[i] = (x[i] * 100.0).round().clamp(-127.0, 127.0) as i8;
-    }
-    encode(e, s, 1, &mut x);
-    for i in 0..IN {
-        r.b[i] = (x[i] * 100.0).round().clamp(-127.0, 127.0) as i8;
-    }
-    let mut buf = Vec::new();
-    for f in 0..2 {
-        turns(e, s, f, &mut buf);
-        for t in &buf {
-            r.legal[f][class_of(t)] = true;
-        }
-        let mut by = [0u32; CLASSES];
-        for (t, n) in visits[f] {
-            by[class_of(t)] += *n;
-        }
-        let total: u32 = by.iter().sum();
-        for c in 0..CLASSES {
-            if by[c] > 0 {
-                r.legal[f][c] = true;
-                r.pol[f][c] = ((by[c] as f64 / total as f64) * 255.0).round().max(1.0) as u8;
-            }
-        }
-    }
-    r
 }
 
 /// A small fast random number source for self-play and training (xorshift).

@@ -1,27 +1,29 @@
 //! The learning network's arithmetic: the slopes the trainer follows are the true slopes of its
-//! loss, saved positions read back as written, every turn the search may play has its own kind,
-//! and the search keeps its tree from one tick to the next.
+//! loss, saved games replay to the positions they were played from, every turn the search may
+//! play has its own kind, the map's mirror images are the same game, and the search keeps its
+//! tree from one tick to the next.
 
-use victris_engine::pvnet::{class_of, layout, loss_grad, turns, PvNet, Rec, Scratch, CLASSES, REC};
-use victris_engine::pvsearch::{pick, record, PvConfig, Rng, Search};
+use victris_engine::azdata::{shares, GameLog, TickLog};
+use victris_engine::pvnet::{class_of, encode, layout, loss_grad, turns, Inputs, PvNet, Sample, Scratch, Sym, CLASSES, IN};
+use victris_engine::pvsearch::{pick, PvConfig, Rng, Search};
 use victris_engine::{Engine, RawTurn};
 
 fn random_net(seed: u64) -> PvNet {
     let mut net = PvNet::blank("columns-21", 24, 12, seed);
     let mut rng = Rng::new(seed + 7);
     for w in net.w.iter_mut() {
-        *w += (rng.unit() as f32 - 0.5) * 0.3;
+        *w += (rng.unit() as f32 - 0.5) * 0.5;
     }
     net
 }
 
-/// Plays a short random game and returns saved positions from it, with made-up visits.
-fn positions(e: &Engine, seed: u64, want: usize) -> Vec<Rec> {
+/// Plays a random game and returns it as it would be saved, with made-up visits.
+fn random_game(e: &Engine, seed: u64, max_ticks: i32) -> GameLog {
     let mut rng = Rng::new(seed);
     let mut s = e.new_match(seed as i64);
-    let mut out = Vec::new();
+    let mut log = GameLog { seed: seed as i64, z: 0, ticks: Vec::new() };
     let mut buf = Vec::new();
-    while s.result.is_none() && out.len() < want {
+    while s.result.is_none() && s.tick < max_ticks {
         let mut pair = [RawTurn::IDLE; 2];
         let mut visits: [Vec<(RawTurn, u32)>; 2] = [Vec::new(), Vec::new()];
         for x in 0..2 {
@@ -29,14 +31,16 @@ fn positions(e: &Engine, seed: u64, want: usize) -> Vec<Rec> {
             visits[x] = buf.iter().map(|t| (*t, 1 + rng.below(40) as u32)).collect();
             pair[x] = pick(&visits[x], 1.0, &mut rng);
         }
-        if s.tick % 3 == 0 {
-            let mut r = record(e, &s, [&visits[0], &visits[1]], Some(rng.unit() as f32 - 0.5));
-            r.z = (rng.below(3) as i8) - 1;
-            out.push(r);
-        }
+        log.ticks.push(TickLog { turns: pair, q: Some(rng.unit() as f32 - 0.5), pol: Some([shares(&visits[0]), shares(&visits[1])]) });
         e.step(&mut s, &pair);
     }
-    out
+    // play on with idle turns to the end, as unsearched ticks
+    while s.result.is_none() {
+        log.ticks.push(TickLog { turns: [RawTurn::IDLE; 2], q: None, pol: None });
+        e.step(&mut s, &[RawTurn::IDLE; 2]);
+    }
+    log.z = victris_engine::pvsearch::outcome(&s).unwrap() as i8;
+    log
 }
 
 #[test]
@@ -66,43 +70,92 @@ fn every_turn_has_its_own_kind() {
 }
 
 #[test]
-fn saved_positions_read_back_as_written() {
+fn saved_games_replay_to_the_positions_they_were_played_from() {
     let e = Engine::shipped("columns-21");
-    for r in positions(&e, 11, 20) {
-        let mut bytes = Vec::new();
-        r.write(&mut bytes);
-        assert_eq!(bytes.len(), REC);
-        let back = Rec::read(&bytes);
-        assert_eq!(back.a, r.a);
-        assert_eq!(back.b, r.b);
-        assert_eq!(back.pol, r.pol);
-        assert_eq!(back.legal, r.legal);
-        assert_eq!(back.z, r.z);
-        assert_eq!(back.has_q, r.has_q);
-        assert_eq!(back.tick, r.tick);
-        assert!((back.q - r.q).abs() < 0.01);
+    let mut bytes = Vec::new();
+    let games: Vec<GameLog> = (0..4).map(|k| random_game(&e, 11 + k, 150)).collect();
+    for g in &games {
+        g.write(&mut bytes);
     }
+    let back = GameLog::read_all(&bytes);
+    assert_eq!(back.len(), games.len());
+    for (a, b) in games.iter().zip(&back) {
+        assert_eq!((a.seed, a.z, a.ticks.len()), (b.seed, b.z, b.ticks.len()));
+        for (x, y) in a.ticks.iter().zip(&b.ticks) {
+            assert_eq!(x.turns, y.turns);
+            assert_eq!(x.pol, y.pol);
+            assert_eq!(x.q.is_some(), y.q.is_some());
+            assert!((x.q.unwrap_or(0.0) - y.q.unwrap_or(0.0)).abs() < 0.01);
+        }
+        let mut samples = Vec::new();
+        assert!(b.samples(&e, &mut samples), "the saved game replays to its own result");
+        assert_eq!(samples.len(), a.ticks.iter().filter(|t| t.pol.is_some()).count());
+        // the positions are the ones the game went through
+        let mut s = e.new_match(a.seed);
+        for (k, t) in a.ticks.iter().take(samples.len()).enumerate() {
+            assert_eq!(samples[k].s, s);
+            e.step(&mut s, &t.turns);
+        }
+    }
+    // a game cut off mid-file is left out, the ones before it are read
+    assert_eq!(GameLog::read_all(&bytes[..bytes.len() - 5]).len(), games.len() - 1);
+    // a game whose result does not match its replay is refused
+    let mut wrong = back[0].clone();
+    wrong.z = if wrong.z == 1 { -1 } else { 1 };
+    assert!(!wrong.samples(&e, &mut Vec::new()));
+}
+
+#[test]
+fn the_inputs_stay_in_range_and_few() {
+    let e = Engine::shipped("columns-21");
+    let mut samples = Vec::new();
+    for seed in 0..4 {
+        assert!(random_game(&e, 60 + seed, 400).samples(&e, &mut samples));
+    }
+    let mut x = Inputs::default();
+    let mut most = 0;
+    for r in &samples {
+        for f in 0..2 {
+            encode(&e, &r.s, f, &mut x);
+            most = most.max(x.n);
+            let mut seen = vec![false; IN];
+            for k in 0..x.n {
+                let i = x.idx[k] as usize;
+                assert!(i < IN && !seen[i], "input {i} given twice or out of range");
+                seen[i] = true;
+                assert!(x.val[k].abs() <= 1.5, "input {i} = {}", x.val[k]);
+            }
+        }
+    }
+    println!("{} positions, at most {most} of {IN} inputs set", samples.len());
+    assert!(most < 150);
 }
 
 #[test]
 fn the_trainers_slopes_are_the_true_slopes() {
     let e = Engine::shipped("columns-21");
     let mut net = random_net(5);
-    let recs = positions(&e, 23, 12);
+    let mut all = Vec::new();
+    assert!(random_game(&e, 23, 200).samples(&e, &mut all));
+    let recs: Vec<Sample> = all.into_iter().step_by(9).take(16).collect();
     assert!(recs.len() >= 8);
     let (lambda, pw) = (0.5f32, 1.0f32);
     let len = layout(net.h1, net.h2).len;
     let mut grad = vec![0.0f32; len];
     let mut sc = Scratch::default();
-    let total = |net: &PvNet, sc: &mut Scratch| -> f64 { recs.iter().map(|r| { let l = loss_grad(net, r, lambda, pw, sc, None); (l.value + pw * l.policy) as f64 }).sum() };
+    let total = |net: &PvNet, sc: &mut Scratch| -> f64 { recs.iter().map(|r| { let l = loss_grad(net, &e, r, lambda, pw, sc, None); (l.value + pw * l.policy) as f64 }).sum() };
     for r in &recs {
-        loss_grad(&net, r, lambda, pw, &mut sc, Some(&mut grad));
+        loss_grad(&net, &e, r, lambda, pw, &mut sc, Some(&mut grad));
     }
+    // the weights with the steepest slopes: the loss is summed in single precision, so a numeric
+    // slope is only good to about 1e-3, and only steep ones can be compared closely
+    let mut order: Vec<usize> = (0..len).collect();
+    order.sort_by(|a, b| grad[*b].abs().partial_cmp(&grad[*a].abs()).unwrap());
     let mut rng = Rng::new(99);
-    let mut checked = 0;
-    let mut worst = 0.0f64;
-    for _ in 0..1500 {
-        let k = rng.below(len);
+    let mut picks: Vec<usize> = order[..300].to_vec();
+    picks.extend((0..300).map(|_| rng.below(len)));
+    let (mut checked, mut worst) = (0, 0.0f64);
+    for k in picks {
         let was = net.w[k];
         let h = 2e-3f32;
         net.w[k] = was + h;
@@ -112,18 +165,71 @@ fn the_trainers_slopes_are_the_true_slopes() {
         net.w[k] = was;
         let numeric = (up - down) / (2.0 * h as f64);
         let exact = grad[k] as f64;
-        // the loss is summed in single precision, so the numeric slope is only good to about 1e-3
-        if numeric.abs() < 0.02 && exact.abs() < 0.02 {
-            assert!((numeric - exact).abs() < 4e-3, "weight {k}: numeric slope {numeric}, the trainer's {exact}");
+        if numeric.abs() < 0.05 && exact.abs() < 0.05 {
+            assert!((numeric - exact).abs() < 5e-3, "weight {k}: numeric slope {numeric}, the trainer's {exact}");
             continue;
         }
         let off = (numeric - exact).abs() / numeric.abs().max(exact.abs());
         worst = worst.max(off);
         checked += 1;
-        assert!(off < 0.08, "weight {k}: numeric slope {numeric}, the trainer's {exact}");
+        assert!(off < 0.05, "weight {k}: numeric slope {numeric}, the trainer's {exact}");
     }
-    assert!(checked > 100, "only {checked} weights had a slope to check");
-    println!("checked {checked} weights, worst relative gap {worst:.4}");
+    println!("checked {checked} steep weights, worst relative gap {worst:.4}");
+    assert!(checked > 100, "only {checked} weights had a slope steep enough to check");
+}
+
+#[test]
+fn a_mirror_image_is_the_same_game() {
+    let e = Engine::shipped("columns-21");
+    let sym = Sym::of(&e);
+    assert_eq!(sym.ok, [true; 4], "columns-21 mirrors both ways");
+    let (mut steps, mut differs) = (0u32, 0u32);
+    let mut x = Inputs::default();
+    for seed in 0..6u64 {
+        let mut rng = Rng::new(seed + 40);
+        let mut s = e.new_match(seed as i64);
+        let mut buf = Vec::new();
+        while s.result.is_none() && s.tick < 400 {
+            let mut pair = [RawTurn::IDLE; 2];
+            for f in 0..2 {
+                turns(&e, &s, f, &mut buf);
+                pair[f] = buf[rng.below(buf.len())];
+            }
+            let mut next = s;
+            e.step(&mut next, &pair);
+            for k in 1..4 {
+                let image = sym.state(k, &s);
+                // mirrored twice is the position itself
+                assert_eq!(sym.state(k, &image), s);
+                // the same turns are on offer, mirrored
+                for f in 0..2 {
+                    turns(&e, &s, f, &mut buf);
+                    let mut here: Vec<usize> = buf.iter().map(|t| sym.class(k, class_of(t))).collect();
+                    assert!(buf.iter().all(|t| class_of(&sym.turn(k, t)) == sym.class(k, class_of(t))));
+                    turns(&e, &image, f, &mut buf);
+                    let mut there: Vec<usize> = buf.iter().map(class_of).collect();
+                    here.sort();
+                    there.sort();
+                    assert_eq!(here, there, "seed {seed} tick {} image {k} fighter {f}", s.tick);
+                    // and the fighter sees as much of the board in the image as here
+                    encode(&e, &s, f, &mut x);
+                    let n = x.n;
+                    encode(&e, &image, f, &mut x);
+                    assert_eq!(n, x.n, "seed {seed} tick {} image {k} fighter {f}: inputs set", s.tick);
+                }
+                // playing the mirrored turns in the image gives the image of what happened here
+                let mut image_next = image;
+                e.step(&mut image_next, &[sym.turn(k, &pair[0]), sym.turn(k, &pair[1])]);
+                steps += 1;
+                if image_next != sym.state(k, &next) {
+                    differs += 1;
+                }
+            }
+            s = next;
+        }
+    }
+    println!("{steps} mirrored steps, {differs} came out different from the mirrored result");
+    assert!(steps > 1000 && differs * 20 < steps, "{differs} of {steps} mirrored steps differ");
 }
 
 #[test]
@@ -157,83 +263,4 @@ fn the_search_keeps_its_tree_between_ticks() {
         }
     }
     assert!(kept_any, "the most visited pair of turns should have been searched at least once");
-}
-
-/// The state mirrored (bit 0 of `k`: left to right, bit 1: top to bottom), built by hand from the
-/// engine's own fields, to check the trainer's mirror images against.
-fn mirrored(e: &Engine, s: &victris_engine::State, k: usize) -> victris_engine::State {
-    let flip = |p: [i32; 2]| [if k & 1 != 0 { e.map.w - 1 - p[0] } else { p[0] }, if k & 2 != 0 { e.map.h - 1 - p[1] } else { p[1] }];
-    let mut t = *s;
-    for f in t.fighters.iter_mut() {
-        f.pos = flip(f.pos);
-    }
-    for i in 0..t.n_projectiles as usize {
-        t.projectiles[i].pos = flip(t.projectiles[i].pos);
-    }
-    for i in 0..t.n_areas as usize {
-        t.areas[i].pos = flip(t.areas[i].pos);
-    }
-    for (i, pd) in e.map.pads.iter().enumerate() {
-        let j = e.map.pads.iter().position(|q| flip(q.pos) == pd.pos).expect("the map's pads mirror onto each other");
-        t.pads[i] = s.pads[j];
-    }
-    t
-}
-
-fn mirrored_turn(k: usize, t: &RawTurn) -> RawTurn {
-    use victris_engine::geom::DIR_VEC;
-    use victris_engine::turn::DirIn;
-    let dir = |d: DirIn| match d {
-        DirIn::Dir(d) => {
-            let v = DIR_VEC[d as usize];
-            let m = [if k & 1 != 0 { -v[0] } else { v[0] }, if k & 2 != 0 { -v[1] } else { v[1] }];
-            DirIn::Dir(DIR_VEC.iter().position(|u| *u == m).unwrap() as u8)
-        }
-        other => other,
-    };
-    RawTurn { mv: dir(t.mv), dash: dir(t.dash), ..*t }
-}
-
-#[test]
-fn a_mirror_image_of_a_saved_position_is_the_mirrored_position_saved() {
-    use victris_engine::pvnet::Sym;
-    use victris_engine::rawnet::OWN;
-    let e = Engine::shipped("columns-21");
-    let sym = Sym::of(&e);
-    assert_eq!(sym.ok, [true; 4], "columns-21 mirrors both ways");
-    let (mut checked, mut sight_differs) = (0u32, 0u32);
-    for seed in 0..6u64 {
-        let mut rng = Rng::new(seed + 40);
-        let mut s = e.new_match(seed as i64);
-        let mut buf = Vec::new();
-        while s.result.is_none() && s.tick < 400 {
-            let mut pair = [RawTurn::IDLE; 2];
-            let mut visits: [Vec<(RawTurn, u32)>; 2] = [Vec::new(), Vec::new()];
-            for x in 0..2 {
-                turns(&e, &s, x, &mut buf);
-                visits[x] = buf.iter().map(|t| (*t, 1 + rng.below(40) as u32)).collect();
-                pair[x] = pick(&visits[x], 1.0, &mut rng);
-            }
-            let here = record(&e, &s, [&visits[0], &visits[1]], Some(0.25));
-            for k in 1..4 {
-                let image = sym.image(k, &here);
-                let there_visits: [Vec<(RawTurn, u32)>; 2] = [visits[0].iter().map(|v| (mirrored_turn(k, &v.0), v.1)).collect(), visits[1].iter().map(|v| (mirrored_turn(k, &v.0), v.1)).collect()];
-                let there = record(&e, &mirrored(&e, &s, k), [&there_visits[0], &there_visits[1]], Some(0.25));
-                checked += 1;
-                // line of sight is the engine's own walk from tile to tile; if it is not the same
-                // mirrored, the two positions really differ, and so may the attacks on offer
-                if image.a[OWN - 1] != there.a[OWN - 1] || image.a[2 * OWN - 1] != there.a[2 * OWN - 1] {
-                    sight_differs += 1;
-                    continue;
-                }
-                assert_eq!(image.a, there.a, "seed {seed} tick {} image {k}: fighter 0's view", s.tick);
-                assert_eq!(image.b, there.b, "seed {seed} tick {} image {k}: fighter 1's view", s.tick);
-                assert_eq!(image.legal, there.legal, "seed {seed} tick {} image {k}: turns on offer", s.tick);
-                assert_eq!(image.pol, there.pol, "seed {seed} tick {} image {k}: visit shares", s.tick);
-            }
-            e.step(&mut s, &pair);
-        }
-    }
-    println!("{checked} images checked, line of sight differed in {sight_differs}");
-    assert!(checked > 1000 && sight_differs * 50 < checked);
 }
