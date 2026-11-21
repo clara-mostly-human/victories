@@ -19,6 +19,8 @@ pub mod models;
 pub mod models_own;
 pub mod movefeat;
 pub mod observe;
+pub mod pvnet;
+pub mod pvsearch;
 pub mod rawnet;
 pub mod replay;
 pub mod rules;
