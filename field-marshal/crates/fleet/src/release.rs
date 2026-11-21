@@ -540,6 +540,11 @@ pub fn promote(root: &Path, store: &Store, cfg: &Config, id: &str, force: Option
         if b.managed {
             out.push((b.name.clone(), deploy(root, store, cfg, &b.name, id, None, force.or(Some("promote")))?));
         } else {
+            // Not deployed by us, but the store should still say which release it is on (the
+            // status page and the gateway's label bookkeeping read it); its label stays.
+            if let Some(version) = store.bot_state(&b.name).ok().flatten().and_then(|s| s.version) {
+                store.set_deployment(&b.name, id, &version, "promote (follows data/releases/live)").map_err(|e| e.to_string())?;
+            }
             eprintln!("{} follows data/releases/live, which now points at {}; its own thread restarts it", b.name, PathBuf::from(&r.path).display());
         }
     }

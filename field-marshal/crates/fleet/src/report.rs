@@ -294,7 +294,22 @@ fn snapshot_inner(root: &Path, store: &Store, cfg: &Config, games: Vec<GameLine>
             managed: b.managed,
             running: b.managed.then(|| bot_pid(root, &b.name).is_some()),
             halted: st.as_ref().and_then(|s| s.halted.clone()),
-            release: st.as_ref().and_then(|s| s.release.clone()).or_else(|| last("release")).unwrap_or_else(|| "-".into()),
+            // What the attached process says it runs is the truth (a flagship its own thread
+            // runs follows data/releases/live and is never deployed, so the store can lag);
+            // then the store; then the last game.
+            release: health
+                .as_ref()
+                .filter(|h| h.age_s <= 15)
+                .and_then(|h| h.detail.get(&b.name))
+                .and_then(|d| d.get("process"))
+                .filter(|p| p.get("attached").and_then(serde_json::Value::as_bool).unwrap_or(false))
+                .and_then(|p| p.get("release"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|r| !r.is_empty() && *r != "unmanaged")
+                .map(str::to_string)
+                .or_else(|| st.as_ref().and_then(|s| s.release.clone()))
+                .or_else(|| last("release"))
+                .unwrap_or_else(|| "-".into()),
             version: st.as_ref().and_then(|s| s.version.clone()).or_else(|| last("version")).unwrap_or_else(|| "-".into()),
             day: rec.map(|r| r.0).unwrap_or_default(),
             hour_games: one(store, "SELECT COUNT(*) FROM matches WHERE bot = ?1 AND result IS NOT NULL AND started_ms >= ?2", rusqlite::params![b.name, now - 3_600_000]).unwrap_or(0),
