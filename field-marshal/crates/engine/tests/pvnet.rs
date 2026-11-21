@@ -3,7 +3,7 @@
 //! play has its own kind, the map's mirror images are the same game, and the search keeps its
 //! tree from one tick to the next.
 
-use victris_engine::azdata::{shares, GameLog, TickLog};
+use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
 use victris_engine::pvnet::{class_of, encode, layout, loss_grad, turns, Inputs, PvNet, Sample, Scratch, Sym, CLASSES, IN};
 use victris_engine::pvsearch::{pick, PvConfig, Rng, Search};
 use victris_engine::{Engine, RawTurn};
@@ -326,4 +326,43 @@ fn pondering_fills_the_tree_under_the_turn_already_sent() {
     // a turn that is not at the root is refused
     let mut search = Search::new(&e, &net, PvConfig::default());
     assert!(!search.ponder(&s, 0, &RawTurn::IDLE, 10), "nothing searched yet");
+}
+
+#[test]
+fn earned_visits_leave_out_what_the_wide_root_forced() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(11);
+    let mut s = e.new_match(3);
+    // a few ticks in, so both fighters have a choice of turns
+    for _ in 0..6 {
+        e.step(&mut s, &[RawTurn::IDLE, RawTurn::IDLE]);
+    }
+    let mut wide = Search::new(&e, &net, PvConfig { even_root: 0.25, ..Default::default() });
+    wide.iterate(&s, 800);
+    let (plain, earned) = (wide.root(), wide.root_earned());
+    for x in 0..2 {
+        assert_eq!(plain[x].len(), earned[x].len());
+        let top = (0..plain[x].len()).max_by_key(|i| plain[x][*i].1).unwrap();
+        let mut kept = 0.0f32;
+        for i in 0..plain[x].len() {
+            assert_eq!(plain[x][i].0, earned[x][i].0);
+            assert!(earned[x][i].1 >= 0.0 && earned[x][i].1 <= plain[x][i].1 as f32, "fighter {x} turn {i}: earned {} of {}", earned[x][i].1, plain[x][i].1);
+            kept += earned[x][i].1;
+        }
+        // the most visited turn keeps every visit; the width's visits are gone from the others
+        assert_eq!(earned[x][top].1, plain[x][top].1 as f32);
+        let all: u32 = plain[x].iter().map(|a| a.1).sum();
+        assert!(kept < all as f32, "fighter {x}: nothing was taken out ({kept} of {all})");
+        // saved as shares: they add up to the whole, and fewer kinds of turn carry any
+        let (a, b) = (shares(&plain[x].iter().map(|v| (v.0, v.1)).collect::<Vec<_>>()), shares_earned(&earned[x]));
+        let total: u32 = b.iter().map(|v| *v as u32).sum();
+        assert!((230..=290).contains(&total), "fighter {x}: shares add up to {total}");
+        assert!(b.iter().filter(|v| **v > 0).count() <= a.iter().filter(|v| **v > 0).count());
+        for c in 0..CLASSES {
+            assert!(a[c] > 0 || b[c] == 0, "a kind of turn with no visits has earned some");
+        }
+    }
+    // before any line is searched there is nothing to earn
+    let fresh = Search::new(&e, &net, PvConfig::default());
+    assert!(fresh.root_earned().iter().all(|l| l.iter().all(|v| v.1 == 0.0)));
 }

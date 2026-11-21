@@ -277,6 +277,44 @@ impl<'a> Search<'a> {
         [list(0), list(1)]
     }
 
+    /// Each fighter's turns at the root with the visits each one earned: its visits less the
+    /// ones it only got because the root was made to look wider than the search looks
+    /// anywhere else (`even_root` above `even`, as self-play asks). A turn other than the most
+    /// visited keeps at most the visits that bring its upper bound, counted with its ordinary
+    /// share, level with the most visited turn's. What is left is what the search found, not
+    /// what it was told to try: a network taught the plain visits learns the extra width as if
+    /// it were a finding, and its shares stay blurred however many generations it trains.
+    pub fn root_earned(&self) -> [Vec<(RawTurn, f32)>; 2] {
+        let list = |x: usize| -> Vec<(RawTurn, f32)> {
+            let Some(nd) = self.nodes.first() else {
+                return vec![(RawTurn::IDLE, 0.0)];
+            };
+            let acts = &nd.acts[x];
+            let (even, wide) = (self.cfg.even, self.cfg.even_root);
+            let flat = 1.0 / acts.len().max(1) as f32;
+            // the share this turn would have anywhere but at the root
+            let share = |a: &Act| (1.0 - even) * ((a.prior - wide * flat) / (1.0 - wide).max(1e-6)).max(0.0) + even * flat;
+            let root_n = (nd.n.max(1) as f32).sqrt();
+            let top = (0..acts.len()).max_by_key(|i| acts[*i].n).unwrap_or(0);
+            if acts.is_empty() || acts[top].n == 0 {
+                return acts.iter().map(|a| (a.turn, 0.0)).collect();
+            }
+            let bound = acts[top].w / acts[top].n as f32 + self.cfg.c * share(&acts[top]) * root_n / (1.0 + acts[top].n as f32);
+            acts.iter()
+                .enumerate()
+                .map(|(i, a)| {
+                    if i == top || a.n == 0 {
+                        return (a.turn, a.n as f32);
+                    }
+                    let gap = bound - a.w / a.n as f32;
+                    let earned = if gap > 1e-6 { (self.cfg.c * share(a) * root_n / gap - 1.0).clamp(0.0, a.n as f32) } else { a.n as f32 };
+                    (a.turn, earned)
+                })
+                .collect()
+        };
+        [list(0), list(1)]
+    }
+
     /// The search's value of the root for fighter 0: the mean result of every line.
     pub fn value(&self) -> f32 {
         match self.nodes.first() {

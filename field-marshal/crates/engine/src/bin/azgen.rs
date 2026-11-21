@@ -6,7 +6,12 @@
 //! files.
 //!
 //!   azgen --out FILE --games N [--net NET.json] [--iters 800] [--seed 1] [--threads 4]
-//!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25]
+//!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25] [--earned 0]
+//!
+//! --wide makes the search look wider at the root than anywhere else, so self-play tries turns
+//! the network thinks little of. With --earned 1 what is saved for the trainer is the visits
+//! each turn earned (`Search::root_earned`), without the ones that width alone gave it; the
+//! turns played are still picked from the plain visits.
 //!
 //! With --net the search is `pvsearch` led by that network. Without it the search is the
 //! flagship's (`mcts`, the live playbook's settings): the first generation learns from the
@@ -14,8 +19,8 @@
 
 use std::io::Write;
 use victris_engine::mcts;
-use victris_engine::azdata::{shares, GameLog, TickLog};
-use victris_engine::pvnet::PvNet;
+use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
+use victris_engine::pvnet::{PvNet, CLASSES};
 use victris_engine::pvsearch::{self, outcome, pick, PvConfig, Rng};
 use victris_engine::state::FState;
 use victris_engine::{Engine, RawTurn};
@@ -35,6 +40,7 @@ fn main() {
     let wander: f64 = arg(&args, "--wander", 0.25);
     let open: i32 = arg(&args, "--open", 12);
     let wide: f32 = arg(&args, "--wide", 0.25);
+    let earned: u32 = arg(&args, "--earned", 0);
     let net_path: String = arg(&args, "--net", String::new());
     let net = if net_path.is_empty() { None } else { Some(PvNet::load(std::path::Path::new(&net_path)).expect("cannot read the network")) };
     let e = Engine::shipped(&map);
@@ -69,10 +75,15 @@ fn main() {
                                 }
                                 continue;
                             }
+                            let mut pol: Option<[[u8; CLASSES]; 2]> = None;
                             let (visits, q): ([Vec<(RawTurn, u32)>; 2], Option<f32>) = match pv.as_mut() {
                                 Some(p) => {
                                     p.iterate(&s, iters);
                                     let r = p.root();
+                                    if earned > 0 {
+                                        let k = p.root_earned();
+                                        pol = Some([shares_earned(&k[0]), shares_earned(&k[1])]);
+                                    }
                                     ([r[0].iter().map(|a| (a.0, a.1)).collect(), r[1].iter().map(|a| (a.0, a.1)).collect()], Some(p.value()))
                                 }
                                 None => {
@@ -87,7 +98,7 @@ fn main() {
                             searched += 1;
                             let w = if s.tick < open { 1.0 } else { wander };
                             let pair = [pick(&visits[0], w, &mut rng), pick(&visits[1], w, &mut rng)];
-                            log.ticks.push(TickLog { turns: pair, q, pol: Some([shares(&visits[0]), shares(&visits[1])]) });
+                            log.ticks.push(TickLog { turns: pair, q, pol: Some(pol.unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])])) });
                             e.step(&mut s, &pair);
                             if let Some(p) = pv.as_mut() {
                                 p.advance(&pair[0], &pair[1]);
