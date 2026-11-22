@@ -250,6 +250,11 @@ pub struct Playbook {
     /// true hidden state instead (`ARENA_ORACLE=A`) the same bot scores 35-5-0, so better
     /// guesses are worth more still.
     pub tree_pv_fog_ticks: u32,
+    /// With `tree_pv_fog_ticks`: the maps it applies on; empty (the default): every map. On
+    /// arena-21 the fixed window lost its real-bot gate (10-21-5) while it won on columns-21
+    /// (27-8-1) and pillars-21 (35-13-4): guesses at a hidden opponent are much worse on the
+    /// open map.
+    pub tree_pv_fog_maps: Vec<String>,
     /// With `tree_pv_fog_ticks`: how many guesses at the hidden opponent are searched (1 to 8).
     pub tree_pv_fog_guesses: u32,
     /// For the arena only: after each decision of the learned search, this many more lines
@@ -477,6 +482,7 @@ impl Default for Playbook {
             tree_pv_dir: String::new(),
             tree_pv_fog: false,
             tree_pv_fog_ticks: 0,
+            tree_pv_fog_maps: Vec::new(),
             tree_pv_fog_guesses: 3,
             tree_pv_ponder: 0,
             tree_pv_weigh: 0.0,
@@ -652,6 +658,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_pv_fog").and_then(Value::as_bool) {
             p.tree_pv_fog = x;
+        }
+        if let Some(a) = v.get("tree_pv_fog_maps").and_then(Value::as_array) {
+            p.tree_pv_fog_maps = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
         }
         if let Some(x) = v.get("tree_pv_fog_ticks").and_then(Value::as_u64) {
             p.tree_pv_fog_ticks = x as u32;
@@ -1640,6 +1649,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     // search decides over its own guesses of where the opponent stands.
     let pv_guess = !visible
         && pb.tree_pv_fog_ticks > 0
+        && (pb.tree_pv_fog_maps.is_empty() || pb.tree_pv_fog_maps.iter().any(|m| *m == e.map.name))
         && !pb.tree_pv_dir.is_empty()
         && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_pv_fog_ticks as i32).unwrap_or(false)
         && pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)).is_some();
