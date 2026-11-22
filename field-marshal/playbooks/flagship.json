@@ -1,7 +1,7 @@
 {
   "default": {
     "name": "learned",
-    "tree_ms": 300,
+    "tree_ms": 150,
     "tree_value": 1.0,
     "tree_gen": 13,
     "tree_dash_burst": true,
@@ -11,7 +11,10 @@
     "tree_reuse": true,
     "tree_slam_prior": 0.228,
     "tree_pv_dir": "/Users/clara/Projects/victris/field-marshal/models/pv",
-    "tree_pv_weigh": 0.2
+    "tree_pv_weigh": 0.2,
+    "tree_pv_lead": 256,
+    "tree_pv_nodes": 150000,
+    "tree_pv_fog_ticks": 10
   },
   "opponents": {}
 }
