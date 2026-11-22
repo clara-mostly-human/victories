@@ -1,7 +1,7 @@
 {
   "default": {
     "name": "learned",
-    "tree_ms": 300,
+    "tree_ms": 450,
     "tree_value": 1.0,
     "tree_gen": 13,
     "tree_dash_burst": true,
@@ -21,5 +21,5 @@
     ]
   },
   "opponents": {},
-  "_note": "foot-soldier's own playbook (the fleet's canary): field-marshal's flagship.json, with only the settings the search thread has cleared (tree_pv_lead stays 0 until cleared). Keep in step with flagship.json otherwise."
+  "_note": "foot-soldier's own playbook (the fleet's canary): field-marshal's flagship.json, with only the settings the search thread has cleared. Keep in step with flagship.json otherwise. Since 2026-11-22 ~22:30Z (Mike approved) it thinks 450 ms (tree_ms) against field-marshal's 300, for a ladder comparison; back to 300 if turns are lost."
 }
