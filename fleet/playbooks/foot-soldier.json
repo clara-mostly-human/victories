@@ -14,7 +14,11 @@
     "tree_pv_weigh": 0.0,
     "tree_pv_nodes": 150000,
     "tree_pv_fog_ticks": 10,
-    "tree_pv_lead": 256
+    "tree_pv_lead": 256,
+    "tree_pv_fog_maps": [
+      "columns-21",
+      "pillars-21"
+    ]
   },
   "opponents": {},
   "_note": "foot-soldier's own playbook (the fleet's canary): field-marshal's flagship.json, with only the settings the search thread has cleared (tree_pv_lead stays 0 until cleared). Keep in step with flagship.json otherwise."
