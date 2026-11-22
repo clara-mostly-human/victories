@@ -64,7 +64,7 @@ fn main() {
             // a lesson with no shares: the position and, from the game, who won
             let both = s.fighters[0].alive && s.fighters[1].alive;
             positions += both as u64;
-            log.ticks.push(TickLog { turns: t.turns, q: None, pol: if both { Some([[0u8; CLASSES]; 2]) } else { None } });
+            log.ticks.push(TickLog { turns: t.turns, q: None, pol: if both { Some([[0u8; CLASSES]; 2]) } else { None }, side: Vec::new() });
             e.step(&mut s, &t.turns);
         }
         let Some(z) = outcome(&s) else {

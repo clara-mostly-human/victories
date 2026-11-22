@@ -674,6 +674,9 @@ pub struct Sample {
     pub has_q: bool,
     /// 1 fighter 0 won, -1 fighter 1 won, 0 a draw
     pub z: i8,
+    /// A position beside a game's path (`azdata::SideLog`): the game did not go through it, so
+    /// there is no result and no turn shares to learn; its value target is `q` alone.
+    pub side: bool,
 }
 
 /// Working room for `loss_grad`.
@@ -694,6 +697,8 @@ pub struct Loss {
     /// the game had a winner, and whether the network's favourite was that winner
     pub decided: bool,
     pub value_hit: bool,
+    /// the position was one beside a game's path (`Sample::side`)
+    pub side: bool,
     /// summed over the fighters that had a choice: cross-entropy between the search's visit
     /// shares and the network's turn shares, the visit shares' own entropy, how many fighters,
     /// and for how many the network's first choice was the search's
@@ -704,10 +709,11 @@ pub struct Loss {
 }
 
 /// The value target for a saved position, as fighter 0's chance to win: the game's result,
-/// mixed (`lambda`) with the search's own value where the search counted in wins.
+/// mixed (`lambda`) with the search's own value where the search counted in wins. For a
+/// position beside the game's path it is the search's value of that position alone.
 pub fn value_target(r: &Sample, lambda: f32) -> f32 {
     let z = r.z as f32;
-    let mix = if r.has_q { (1.0 - lambda) * z + lambda * r.q } else { z };
+    let mix = if r.side { r.q } else if r.has_q { (1.0 - lambda) * z + lambda * r.q } else { z };
     0.5 * (1.0 + mix)
 }
 
@@ -723,7 +729,7 @@ pub fn loss_grad(net: &PvNet, e: &Engine, r: &Sample, lambda: f32, pw: f32, sc: 
     let p = 1.0 / (1.0 + (-d).exp());
     let t = value_target(r, lambda);
     let eps = 1e-7f32;
-    let mut out = Loss { value: -(t * (p + eps).ln() + (1.0 - t) * (1.0 - p + eps).ln()), decided: r.z != 0, value_hit: (d > 0.0) == (r.z > 0), ..Default::default() };
+    let mut out = Loss { value: -(t * (p + eps).ln() + (1.0 - t) * (1.0 - p + eps).ln()), decided: r.z != 0, value_hit: (d > 0.0) == (r.z > 0), side: r.side, ..Default::default() };
     let mut dl = [[0.0f32; CLASSES]; 2];
     for f in 0..2 {
         let logits = if f == 0 { &sc.pa.logits } else { &sc.pb.logits };
@@ -889,7 +895,7 @@ impl Sym {
 
     /// The saved position `r` in image `k`.
     pub fn image(&self, k: usize, r: &Sample) -> Sample {
-        let mut out = Sample { s: self.state(k, &r.s), pol: [[0; CLASSES]; 2], q: r.q, has_q: r.has_q, z: r.z };
+        let mut out = Sample { s: self.state(k, &r.s), pol: [[0; CLASSES]; 2], q: r.q, has_q: r.has_q, z: r.z, side: r.side };
         for f in 0..2 {
             for c in 0..CLASSES {
                 out.pol[f][self.class(k, c)] = r.pol[f][c];

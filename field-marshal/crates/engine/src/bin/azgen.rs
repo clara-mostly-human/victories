@@ -7,7 +7,7 @@
 //!
 //!   azgen --out FILE --games N [--net NET.json] [--iters 800] [--seed 1] [--threads 4]
 //!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25] [--earned 0] [--mix 0]
-//!         [--lead 0]
+//!         [--lead 0] [--side 0[:64]]
 //!
 //! Which turn is played: before tick --open one drawn in proportion to the search's visits;
 //! after it the most visited one, or with chance --wander a drawn one. That plays a turn the
@@ -26,13 +26,19 @@
 //! With --lead N (the network-led search only) the search may lead its shots, and expects the
 //! other fighter to, from N lines through the root on (`Search::lead`).
 //!
+//! With --side K (the network-led search only) every searched tick also saves K positions
+//! beside the game's path: positions the search tried from the tick's position but the game
+//! did not go to, each looked at until 64 lines (--side K:LINES for another count) began with
+//! it, with the search's value of it (`Search::beside`). The trainer learns their value. The
+//! games played are the same games as without it.
+//!
 //! With --net the search is `pvsearch` led by that network. Without it the search is the
 //! flagship's (`mcts`, the live playbook's settings): the first generation learns from the
 //! search we already have, the following ones from their own play.
 
 use std::io::Write;
 use victris_engine::mcts;
-use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
+use victris_engine::azdata::{shares, shares_earned, GameLog, SideLog, TickLog};
 use victris_engine::pvnet::{PvNet, CLASSES};
 use victris_engine::pvsearch::{self, outcome, pick, PvConfig, Rng};
 use victris_engine::state::FState;
@@ -56,25 +62,34 @@ fn main() {
     let earned: u32 = arg(&args, "--earned", 0);
     let mix: u32 = arg(&args, "--mix", 0);
     let lead: u32 = arg(&args, "--lead", 0);
+    let side: String = arg(&args, "--side", String::from("0"));
+    let (side_count, side_lines): (usize, u32) = match side.split_once(':') {
+        Some((k, l)) => (k.parse().expect("--side K:LINES"), l.parse().expect("--side K:LINES")),
+        None => (side.parse().expect("--side K"), 64),
+    };
+    assert!(side_count <= 255, "--side: at most 255 positions a tick");
     let net_path: String = arg(&args, "--net", String::new());
     let net = if net_path.is_empty() { None } else { Some(PvNet::load(std::path::Path::new(&net_path)).expect("cannot read the network")) };
     let e = Engine::shipped(&map);
     let flag = mcts::Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, slam_prior: 0.228, ..Default::default() };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let started = std::time::Instant::now();
-    let parts: Vec<(Vec<u8>, [u64; 6])> = std::thread::scope(|sc| {
+    let parts: Vec<(Vec<u8>, [u64; 8])> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 sc.spawn(|| {
                     let mut bytes: Vec<u8> = Vec::new();
-                    // games, positions, ticks, fighter 0 wins, fighter 1 wins, search lines
-                    let mut st = [0u64; 6];
+                    // games, positions, ticks, fighter 0 wins, fighter 1 wins, search lines,
+                    // positions beside the path, the lines behind those
+                    let mut st = [0u64; 8];
                     loop {
                         let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if g >= games {
                             break;
                         }
                         let mut rng = Rng::new(seed.wrapping_mul(1_000_003).wrapping_add(g as u64));
+                        // the draws of positions beside the path, apart from the game's own draws
+                        let mut rng_side = Rng::new(seed.wrapping_mul(2_000_003).wrapping_add(g as u64) ^ 0x51DE);
                         let mut s = e.new_match((seed as i64).wrapping_mul(7919).wrapping_add(g as i64));
                         let match_seed = (seed as i64).wrapping_mul(7919).wrapping_add(g as i64);
                         let mut log = GameLog { seed: match_seed, z: 0, ticks: Vec::new() };
@@ -84,7 +99,7 @@ fn main() {
                             let free = |x: usize| s.fighters[x].alive && s.fighters[x].state == FState::Idle;
                             if !free(0) && !free(1) {
                                 e.step(&mut s, &[RawTurn::IDLE, RawTurn::IDLE]);
-                                log.ticks.push(TickLog { turns: [RawTurn::IDLE, RawTurn::IDLE], q: None, pol: None });
+                                log.ticks.push(TickLog { turns: [RawTurn::IDLE, RawTurn::IDLE], q: None, pol: None, side: Vec::new() });
                                 if let Some(p) = pv.as_mut() {
                                     p.advance(&RawTurn::IDLE, &RawTurn::IDLE);
                                 }
@@ -124,7 +139,17 @@ fn main() {
                                 Some(d) => [pick(&d[0], 1.0, &mut rng), pick(&d[1], 1.0, &mut rng)],
                                 None => [pick(&visits[0], w, &mut rng), pick(&visits[1], w, &mut rng)],
                             };
-                            log.ticks.push(TickLog { turns: pair, q, pol: Some(pol.unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])])) });
+                            let mut beside: Vec<SideLog> = Vec::new();
+                            if side_count > 0 {
+                                if let Some(p) = pv.as_mut() {
+                                    for (turns, q, lines) in p.beside(&s, &pair, side_count, side_lines, &mut rng_side) {
+                                        st[6] += 1;
+                                        st[7] += lines as u64;
+                                        beside.push(SideLog { turns, q, lines });
+                                    }
+                                }
+                            }
+                            log.ticks.push(TickLog { turns: pair, q, pol: Some(pol.unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])])), side: beside });
                             e.step(&mut s, &pair);
                             if let Some(p) = pv.as_mut() {
                                 p.advance(&pair[0], &pair[1]);
@@ -146,10 +171,10 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut file = std::io::BufWriter::new(std::fs::File::create(&out).expect("cannot write the output"));
-    let mut st = [0u64; 6];
+    let mut st = [0u64; 8];
     for (bytes, s) in &parts {
         file.write_all(bytes).unwrap();
-        for i in 0..6 {
+        for i in 0..8 {
             st[i] += s[i];
         }
     }
@@ -168,4 +193,7 @@ fn main() {
         st[0] as f64 / secs * 60.0,
         st[5] as f64 / secs / threads as f64
     );
+    if st[6] > 0 {
+        println!("  beside the games: {} positions, {:.0} lines behind each", st[6], st[7] as f64 / st[6] as f64);
+    }
 }
