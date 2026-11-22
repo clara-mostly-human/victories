@@ -17,6 +17,8 @@
 //! positions its own play reaches; ladder opponents take the bot to others (the small last
 //! zone, an opponent that keeps away while we hold a power pad). With --from-level H only
 //! positions with the two fighters' hp within H are taken, so the game that follows is long.
+//! With --from-until T the tick is drawn from --from-tick up to T (the opening before the first
+//! power pads appear, say), not up to the game's end.
 //! The replayed ticks are saved with no lesson, so the trainer replays the whole game and
 //! learns from the searched ticks only.
 //!
@@ -92,6 +94,7 @@ fn main() {
     let from_share: f64 = arg(&args, "--from-share", 0.5);
     let from_tick: usize = arg(&args, "--from-tick", 0);
     let from_level: i32 = arg(&args, "--from-level", 1000);
+    let from_until: usize = arg(&args, "--from-until", 0);
     let read: f64 = arg(&args, "--read", 0.0);
     let read_lines: u32 = arg(&args, "--read-lines", iters / 2);
     let read_teach: u32 = arg(&args, "--read-teach", 0);
@@ -124,7 +127,8 @@ fn main() {
                                 if real.ticks.len() < from_tick + 10 {
                                     continue;
                                 }
-                                let at = from_tick + rng.below(real.ticks.len() - 5 - from_tick);
+                                let last = if from_until > from_tick { from_until.min(real.ticks.len() - 5) } else { real.ticks.len() - 5 };
+                                let at = from_tick + rng.below((last - from_tick).max(1));
                                 let mut t = e.new_match(real.seed);
                                 for k in &real.ticks[..at] {
                                     if t.result.is_some() {

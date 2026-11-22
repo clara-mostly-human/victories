@@ -257,6 +257,20 @@ pub struct Playbook {
     pub tree_pv_fog_maps: Vec<String>,
     /// With `tree_pv_fog_ticks`: how many guesses at the hidden opponent are searched (1 to 8).
     pub tree_pv_fog_guesses: u32,
+    /// With `tree_pv_dir`: the learned search also decides the ticks before the opponent is
+    /// first seen, over its guesses as under `tree_pv_fog_ticks` (on every map with a network,
+    /// whatever `tree_pv_fog_maps` says). The first guess is the opponent on its spawn, which
+    /// is known; each later one is moved on by what the search of the guess before expected.
+    /// Off (the default): the hand-written policy plays those ticks, as it always has.
+    ///
+    /// Why: `tree_pv_fog_ticks` counts from the last tick in sight, and before first sight
+    /// there is none, so the opening was left to the hand-written policy: 6 to 10 ticks on
+    /// arena-21 and 12 to 24 on columns-21 and pillars-21, which is the whole walk to the two
+    /// power pads that appear at tick 20. In foot-soldier's ladder games of Nov 22 it took
+    /// neither of those two pads in 33% of games on columns-21 and 31% on pillars-21, against
+    /// 2% and 6% for Slopracle. What this is worth depends on a network that has learned the
+    /// walk to the pads; measure it with one.
+    pub tree_pv_open: bool,
     /// For the arena only: after each decision of the learned search, this many more lines
     /// under the turn it sent (`pv_ponder`), standing in for the live bot's wait for the next
     /// tick. 0 (the default): none. A live session ponders by time instead.
@@ -484,6 +498,7 @@ impl Default for Playbook {
             tree_pv_fog_ticks: 0,
             tree_pv_fog_maps: Vec::new(),
             tree_pv_fog_guesses: 3,
+            tree_pv_open: false,
             tree_pv_ponder: 0,
             tree_pv_weigh: 0.0,
             tree_pv_trust: 1.0,
@@ -667,6 +682,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_pv_fog_guesses").and_then(Value::as_u64) {
             p.tree_pv_fog_guesses = (x as u32).clamp(1, 8);
+        }
+        if let Some(x) = v.get("tree_pv_open").and_then(Value::as_bool) {
+            p.tree_pv_open = x;
         }
         if let Some(x) = v.get("tree_pv_ponder").and_then(Value::as_u64) {
             p.tree_pv_ponder = x as u32;
@@ -1653,6 +1671,10 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         && !pb.tree_pv_dir.is_empty()
         && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_pv_fog_ticks as i32).unwrap_or(false)
         && pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)).is_some();
+    // `tree_pv_open`: the same before the opponent has been seen at all; the guesses then
+    // start from its spawn.
+    let pv_open = !visible && pb.tree_pv_open && t.from_spawn && t.enemy_last_seen.is_none() && !pb.tree_pv_dir.is_empty() && pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)).is_some();
+    let pv_guess = pv_guess || pv_open;
     if pb.tree_ms > 0 && pb.search && (visible || guessed || pv_hidden || pv_guess) && t.think_cap_ms(pb.tree_ms) >= 20 {
         let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, lead_mask: if pb.tree_lead_them { 1u8 << (1 - me) } else { 0 }, expand_at: pb.tree_expand_at, max_nodes: pb.tree_max_nodes, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
         if pb.tree_value != 0.0 || pb.tree_net != 0.0 || pb.tree_net_hp != 0.0 || pb.tree_net_value != 0.0 {
