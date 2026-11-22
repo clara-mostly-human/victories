@@ -112,6 +112,9 @@ pub struct Tracker {
     spent_ms: std::cell::Cell<u64>,
     /// the server's own figure for the match budget left, in ms, when the session passes it on
     budget_left_ms: std::cell::Cell<Option<u64>>,
+    /// how long the frame being decided waited before its decision started, in ms; u64::MAX
+    /// when a newer observation already waits behind it (the ladder has moved on: answer at once)
+    frame_wait_ms: std::cell::Cell<u64>,
 }
 
 /// What a reply costs on top of thinking: network and server handling, as measured from
@@ -212,6 +215,7 @@ impl Tracker {
             enemy_dashes: 0,
             spent_ms: std::cell::Cell::new(0),
             budget_left_ms: std::cell::Cell::new(None),
+            frame_wait_ms: std::cell::Cell::new(0),
         })
     }
 
@@ -233,6 +237,7 @@ impl Tracker {
             enemy_dashes: 0,
             spent_ms: std::cell::Cell::new(0),
             budget_left_ms: std::cell::Cell::new(None),
+            frame_wait_ms: std::cell::Cell::new(0),
         }
     }
 
@@ -252,6 +257,11 @@ impl Tracker {
         self.budget_left_ms.set(Some(ms.max(0) as u64));
     }
 
+    /// How long the frame about to be decided has waited (see `frame_wait_ms`).
+    pub fn note_frame_wait(&self, ms: u64) {
+        self.frame_wait_ms.set(ms);
+    }
+
     /// The think cap for this tick: the playbook's, cut down when the match budget could
     /// not sustain it for the ticks that may remain.
     pub fn think_cap_ms(&self, wanted: u64) -> u64 {
@@ -266,7 +276,15 @@ impl Tracker {
         // Most games end long before the tick limit, so allow double the sustainable rate,
         // but never more than the tick deadline can carry.
         let per_tick_limit = (rules.limits.tick_ms.max(0) as u64).saturating_sub(400);
-        wanted.min(sustainable * 2).min(per_tick_limit)
+        let cap = wanted.min(sustainable * 2).min(per_tick_limit);
+        // A frame that waited behind another (a burst after a stall on the connection) gets
+        // what is left of the think time, at least 20 ms so the search still runs; one with a
+        // newer observation behind it gets none: the ladder has moved past it (2026-11-22).
+        match self.frame_wait_ms.get() {
+            0 => cap,
+            u64::MAX => 0,
+            w => cap.saturating_sub(w).max(cap.min(20)),
+        }
     }
 
     pub fn my_id(&self) -> i64 {
