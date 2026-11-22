@@ -134,7 +134,7 @@ fn main() {
         // one game's sums, by fighter index; turned to X and O at the end
         let mut g: [Tally; 2] = [Tally::default(), Tally::default()];
         // a shot in flight: its id -> (who fired it, distance band, the target could not step, the target stood slowed, led)
-        let mut flying: HashMap<u32, (usize, usize, bool, bool, bool)> = HashMap::new();
+        let mut flying: HashMap<u32, (usize, usize, bool, bool, bool, bool)> = HashMap::new();
         let mut first_power: Option<usize> = None;
         let mut marks = [[None::<i32>; 2]; 5];
         // the opening: power pads taken before tick 60 (the first pair appears together), and where each
@@ -188,12 +188,46 @@ fn main() {
                 if me.state == FState::Idle && me.cd_move <= 0 && tk.turns[x].mv == DirIn::None && tk.turns[x].dash == DirIn::None {
                     g[x].add(0, "ticks free to step and stood still", 1.0);
                 }
+                // holding the power-up while the other does not: what is made of it, and what the other does about it
+                if me.power_until >= before.tick && op.power_until < before.tick {
+                    g[x].add(0, "powered alone: ticks", 1.0);
+                    g[x].add(0, "  powered alone: distance to the other (sum)", d as f64);
+                    if see {
+                        g[x].add(0, "  powered alone: the other in sight", 1.0);
+                        if d <= 4 {
+                            g[x].add(0, "  powered alone: the other in sight within 4 tiles", 1.0);
+                        }
+                    }
+                    if me.state == FState::Idle && me.cd_move <= 0 && tk.turns[x].mv == DirIn::None && tk.turns[x].dash == DirIn::None {
+                        g[x].add(0, "  powered alone: stood still when free to step", 1.0);
+                    }
+                }
+                if op.power_until >= before.tick && me.power_until < before.tick {
+                    g[x].add(0, "the other powered alone: ticks", 1.0);
+                }
                 if me.state == FState::Idle && tk.turns[x].attack == AttackIn::None && tk.turns[x].mv == DirIn::None && tk.turns[x].dash == DirIn::None {
                     g[x].add(0, "ticks free and sent nothing", 1.0);
                 }
             }
             e.step_events(&mut s, &tk.turns, &mut events);
             let opening = (12..=21).contains(&before.tick);
+            // one powered alone: does each fighter end the tick nearer to where the other stood, or further
+            for x in 0..2 {
+                let (me, op) = (&before.fighters[x], &before.fighters[1 - x]);
+                if !(me.alive && op.alive) {
+                    continue;
+                }
+                let (mine, theirs) = (me.power_until >= before.tick, op.power_until >= before.tick);
+                if mine == theirs {
+                    continue;
+                }
+                let now = chebyshev(s.fighters[x].pos, op.pos);
+                if now < d {
+                    g[x].add(0, if mine { "  powered alone: ended the tick nearer the other" } else { "  the other powered alone: ended the tick nearer it" }, 1.0);
+                } else if now > d {
+                    g[x].add(0, if mine { "  powered alone: ended the tick further from the other" } else { "  the other powered alone: ended the tick further from it" }, 1.0);
+                }
+            }
             // every pad that appears this tick (the first pair and every return): who stands where
             for ev in &events {
                 if let Event::PickupSpawn { pad, kind, pos } = ev {
@@ -250,6 +284,10 @@ fn main() {
                             let a = Some(*attack as usize);
                             g[x].add(0, if a == shot { "ticks 12-21: shots fired" } else if a == frost { "ticks 12-21: frost cast" } else { "ticks 12-21: pushes used" }, 1.0);
                         }
+                        if before.fighters[x].power_until >= before.tick && op.power_until < before.tick {
+                            let a = Some(*attack as usize);
+                            g[x].add(0, if a == shot { "  powered alone: shots fired" } else if a == frost { "  powered alone: frost cast" } else { "  powered alone: pushes used" }, 1.0);
+                        }
                         if Some(*attack as usize) == shot {
                             g[x].add(0, "shots fired", 1.0);
                             let b = if see { band(d) } else { 3 };
@@ -292,12 +330,16 @@ fn main() {
                     Event::ProjectileSpawn { projectile, owner, target, .. } => {
                         let x = *owner as usize - 1;
                         let b = if see { band(d) } else { 3 };
-                        flying.insert(*projectile, (x, b, stuck(1 - x), slowed(1 - x), *target != before.fighters[1 - x].pos));
+                        let alone = before.fighters[x].power_until >= before.tick && before.fighters[1 - x].power_until < before.tick;
+                        flying.insert(*projectile, (x, b, stuck(1 - x), slowed(1 - x), *target != before.fighters[1 - x].pos, alone));
                     }
                     Event::ProjectileEnd { projectile, reason, .. } => {
-                        if let Some((x, b, st, sl, led)) = flying.remove(projectile) {
+                        if let Some((x, b, st, sl, led, alone)) = flying.remove(projectile) {
                             if *reason == "hit" {
                                 g[x].add(0, "shots landed", 1.0);
+                                if alone {
+                                    g[x].add(0, "  powered alone: shots landed", 1.0);
+                                }
                                 g[x].add(0, HIT_AT[b], 1.0);
                                 if st {
                                     g[x].add(0, "  shots landed on a target that could not step when fired", 1.0);
@@ -515,6 +557,19 @@ fn main() {
     rate("shot ready, of ticks in sight", "in sight: own shot ready", "ticks the other is in sight");
     rate("frost ready, of ticks in sight", "in sight: own frost ready", "ticks the other is in sight");
     rate("damage dealt while powered, of damage dealt", "  damage dealt while powered", "damage dealt");
+    rate("powered alone: the other in sight, of those ticks", "  powered alone: the other in sight", "powered alone: ticks");
+    rate("powered alone: in sight within 4 tiles, of those ticks", "  powered alone: the other in sight within 4 tiles", "powered alone: ticks");
+    rate("powered alone: ended the tick nearer the other, of those ticks", "  powered alone: ended the tick nearer the other", "powered alone: ticks");
+    rate("powered alone: ended the tick further away, of those ticks", "  powered alone: ended the tick further from the other", "powered alone: ticks");
+    rate("powered alone: stood still when free to step, of those ticks", "  powered alone: stood still when free to step", "powered alone: ticks");
+    rate("powered alone: shots fired a 100 ticks", "  powered alone: shots fired", "powered alone: ticks");
+    rate("powered alone: shots landed a 100 ticks", "  powered alone: shots landed", "powered alone: ticks");
+    rate("powered alone: shots landed of fired", "  powered alone: shots landed", "  powered alone: shots fired");
+    rate("powered alone: frost cast a 100 ticks", "  powered alone: frost cast", "powered alone: ticks");
+    rate("powered alone: pushes used a 100 ticks", "  powered alone: pushes used", "powered alone: ticks");
+    rate("powered alone: tiles to the other (x100)", "  powered alone: distance to the other (sum)", "powered alone: ticks");
+    rate("the other powered alone: ended the tick further from it", "  the other powered alone: ended the tick further from it", "the other powered alone: ticks");
+    rate("the other powered alone: ended the tick nearer it", "  the other powered alone: ended the tick nearer it", "the other powered alone: ticks");
     rate("power pad appears: nearer to it than the other", "  power pad appears: nearer to it than the other", "power pad appears");
     rate("power pad appears: on it or next to it", "  power pad appears: on it or next to it", "power pad appears");
     rate("health pad appears: nearer to it than the other", "  health pad appears: nearer to it than the other", "health pad appears");
