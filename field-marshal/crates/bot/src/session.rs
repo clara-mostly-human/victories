@@ -624,6 +624,9 @@ impl Session {
     }
 
     fn on_end(&mut self, msg: &Value) -> Vec<Out> {
+        // The learned search's trees for this match are no use any more: drop them now (they
+        // live on this thread, the one that decides), so a finished match holds no memory.
+        crate::policy::pv_forget();
         self.played += 1;
         let result = msg.get("result").and_then(Value::as_str).unwrap_or("?").to_string();
         match result.as_str() {
