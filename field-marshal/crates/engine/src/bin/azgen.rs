@@ -7,6 +7,7 @@
 //!
 //!   azgen --out FILE --games N [--net NET.json] [--iters 800] [--seed 1] [--threads 4]
 //!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25] [--earned 0] [--mix 0]
+//!         [--lead 0]
 //!
 //! Which turn is played: before tick --open one drawn in proportion to the search's visits;
 //! after it the most visited one, or with chance --wander a drawn one. That plays a turn the
@@ -21,6 +22,9 @@
 //! the network thinks little of. With --earned 1 what is saved for the trainer is the visits
 //! each turn earned (`Search::root_earned`), without the ones that width alone gave it; the
 //! turns played are still picked from the plain visits.
+//!
+//! With --lead N (the network-led search only) the search may lead its shots, and expects the
+//! other fighter to, from N lines through the root on (`Search::lead`).
 //!
 //! With --net the search is `pvsearch` led by that network. Without it the search is the
 //! flagship's (`mcts`, the live playbook's settings): the first generation learns from the
@@ -51,6 +55,7 @@ fn main() {
     let wide: f32 = arg(&args, "--wide", 0.25);
     let earned: u32 = arg(&args, "--earned", 0);
     let mix: u32 = arg(&args, "--mix", 0);
+    let lead: u32 = arg(&args, "--lead", 0);
     let net_path: String = arg(&args, "--net", String::new());
     let net = if net_path.is_empty() { None } else { Some(PvNet::load(std::path::Path::new(&net_path)).expect("cannot read the network")) };
     let e = Engine::shipped(&map);
@@ -74,7 +79,7 @@ fn main() {
                         let match_seed = (seed as i64).wrapping_mul(7919).wrapping_add(g as i64);
                         let mut log = GameLog { seed: match_seed, z: 0, ticks: Vec::new() };
                         let mut searched = 0u64;
-                        let mut pv = net.as_ref().map(|n| pvsearch::Search::new(&e, n, PvConfig { even_root: wide, ..Default::default() }));
+                        let mut pv = net.as_ref().map(|n| pvsearch::Search::new(&e, n, PvConfig { even_root: wide, lead_at: lead, ..Default::default() }));
                         while s.result.is_none() {
                             let free = |x: usize| s.fighters[x].alive && s.fighters[x].state == FState::Idle;
                             if !free(0) && !free(1) {

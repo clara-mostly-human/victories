@@ -276,6 +276,11 @@ pub struct Playbook {
     /// plain threads started each tick; they spin while they wait, so they need cores of
     /// their own.
     pub tree_pv_threads: u32,
+    /// Lead shots for the learned search (`pvsearch::Search::lead`): once this many lines ran
+    /// through the root, each fighter's most searched shots get copies aimed at the tiles the
+    /// other fighter could be on after its move, for us to fire and for the opponent to fire
+    /// at us. 0 (the default): every shot is aimed at the tile the other stands on.
+    pub tree_pv_lead: u32,
     /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
     /// past the time cap); 0: by time. For self-play: more games an hour, and the same game
     /// every time from the same seed.
@@ -471,6 +476,7 @@ impl Default for Playbook {
             tree_pv_weigh: 0.0,
             tree_pv_trust: 1.0,
             tree_pv_threads: 1,
+            tree_pv_lead: 0,
             tree_iters: 0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
@@ -657,6 +663,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_pv_threads").and_then(Value::as_u64) {
             p.tree_pv_threads = (x as u32).clamp(1, 16);
+        }
+        if let Some(x) = v.get("tree_pv_lead").and_then(Value::as_u64) {
+            p.tree_pv_lead = x as u32;
         }
         if let Some(x) = v.get("tree_turn_model").and_then(Value::as_str) {
             p.tree_turn_model = x.to_string();
@@ -1772,7 +1781,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             }
             let key = (t.seed, me);
             let kept = PV_KEPT.with(|k| k.borrow_mut().remove(&key));
-            let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig::default());
+            let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig { lead_at: pb.tree_pv_lead, ..Default::default() });
             let mut reused = 0u32;
             if let Some(k) = kept {
                 if k.tick + 1 == s.tick {
