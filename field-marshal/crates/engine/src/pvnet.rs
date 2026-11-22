@@ -66,8 +66,17 @@ pub const IN_OLD: usize = B_CTX + 3;
 /// weights are the first `IN_OLD` rows of a newer one's.
 const B_RING_T: usize = IN_OLD;
 const N_RING_T: usize = (8 * R_WALL) as usize;
+/// Number of inputs of one view in networks made before the pads' last-ticks inputs.
+pub const IN_RING: usize = B_RING_T + N_RING_T;
+/// How soon each pad that is not out appears, sharply: two ramps a pad, over its last 10 and its
+/// last 40 ticks (0 until then, 1 on the tick it appears). The older input counts the whole
+/// 200 ticks, so a pad that appears in 3 ticks and one that appears in 12 look nearly alike
+/// there, and who stands where in those ticks decides who gets it. They come after every older
+/// input, as the ring does.
+const B_SOON: usize = IN_RING;
+const N_SOON: usize = 2 * PADS;
 /// Number of inputs of one view.
-pub const IN: usize = B_RING_T + N_RING_T;
+pub const IN: usize = B_SOON + N_SOON;
 /// The most inputs that can be other than zero at once.
 pub const CAP: usize = 192;
 
@@ -77,13 +86,15 @@ pub struct Inputs {
     pub n: usize,
     /// how many of them, the first, are inputs an `IN_OLD` network has
     pub n0: usize,
+    /// how many of them, the first, are inputs an `IN_RING` network has
+    pub n1: usize,
     pub idx: [u16; CAP],
     pub val: [f32; CAP],
 }
 
 impl Default for Inputs {
     fn default() -> Inputs {
-        Inputs { n: 0, n0: 0, idx: [0; CAP], val: [0.0; CAP] }
+        Inputs { n: 0, n0: 0, n1: 0, idx: [0; CAP], val: [0.0; CAP] }
     }
 }
 
@@ -279,6 +290,15 @@ pub fn encode(e: &Engine, s: &State, x: usize, out: &mut Inputs) {
                 k += 1;
             }
         }
+    }
+    out.n1 = out.n;
+    for i in 0..PADS {
+        if e.map.pads.get(i).is_none() || s.pads[i].available {
+            continue;
+        }
+        let left = (s.pads[i].respawn_tick - s.tick).max(0);
+        out.put(B_SOON + 2 * i, (10 - left).max(0) as f32 / 10.0);
+        out.put(B_SOON + 2 * i + 1, (40 - left).max(0) as f32 / 40.0);
     }
 }
 
@@ -497,8 +517,8 @@ pub fn layout(n_in: usize, h1: usize, h2: usize) -> Layout {
 #[derive(Clone, Debug)]
 pub struct PvNet {
     pub map: String,
-    /// inputs of one view this network reads: `IN`, or `IN_OLD` for one made before the
-    /// opponent's third ring of walls
+    /// inputs of one view this network reads: `IN`, `IN_RING` for one made before the pads'
+    /// last-ticks inputs, or `IN_OLD` for one made before the opponent's third ring of walls
     pub n_in: usize,
     pub h1: usize,
     pub h2: usize,
@@ -543,7 +563,13 @@ impl PvNet {
     /// How many of a view's inputs this network reads: all, or the older ones only.
     #[inline]
     fn count(&self, x: &Inputs) -> usize {
-        if self.n_in == IN { x.n } else { x.n0 }
+        if self.n_in == IN {
+            x.n
+        } else if self.n_in == IN_RING {
+            x.n1
+        } else {
+            x.n0
+        }
     }
 
     /// This network reading every input there is now: one made with fewer gets the new ones
@@ -652,7 +678,7 @@ impl PvNet {
         let h1 = v.get("h1")?.as_u64()? as usize;
         let h2 = v.get("h2")?.as_u64()? as usize;
         let n_in = v.get("in")?.as_u64()? as usize;
-        if (n_in != IN && n_in != IN_OLD) || v.get("classes")?.as_u64()? as usize != CLASSES || h1 > MAX_H || h2 > MAX_H {
+        if (n_in != IN && n_in != IN_RING && n_in != IN_OLD) || v.get("classes")?.as_u64()? as usize != CLASSES || h1 > MAX_H || h2 > MAX_H {
             return None;
         }
         let w: Vec<f32> = v.get("w")?.as_array()?.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect();
