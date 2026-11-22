@@ -14,7 +14,7 @@
       "role": "canary",
       "managed": true,
       "experiments": false,
-      "playbooks": "playbooks/flagship.json",
+      "playbooks": "/Users/clara/Projects/victris/field-marshal/playbooks/flagship.json",
       "note": "The fleet's canary since 2026-11-18: the Rust bot under the fleet supervisor. Since 2026-11-21 21:40Z (asked by Mike) it is the learned-search canary: release r51-fbd80e5, a fresh label (v29), the flagship's 'learned' playbook from the release, no experiment arms, so the ladder rates the learned search from scratch while field-marshal v10 stays as it is. The TypeScript bot it replaced (foot-soldier/, v1 and v2) is retired.",
       "expect_online": true,
       "owner": "the fleet (infrastructure thread)"
