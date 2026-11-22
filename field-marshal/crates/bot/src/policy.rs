@@ -281,6 +281,12 @@ pub struct Playbook {
     /// other fighter could be on after its move, for us to fire and for the opponent to fire
     /// at us. 0 (the default): every shot is aimed at the tile the other stands on.
     pub tree_pv_lead: u32,
+    /// The most positions the learned search's tree holds (`pvsearch::PvConfig::max_nodes`);
+    /// 400,000 by default. The tree is kept from tick to tick and grown by pondering, so at
+    /// long thinking times it is this full for most of a match: a position takes about 3 kB
+    /// with its turn lists made and 0.5 kB without, on several threads all are made. When
+    /// it is full the half the fewest lines ran through is dropped.
+    pub tree_pv_nodes: u32,
     /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
     /// past the time cap); 0: by time. For self-play: more games an hour, and the same game
     /// every time from the same seed.
@@ -477,6 +483,7 @@ impl Default for Playbook {
             tree_pv_trust: 1.0,
             tree_pv_threads: 1,
             tree_pv_lead: 0,
+            tree_pv_nodes: 400_000,
             tree_iters: 0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
@@ -666,6 +673,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_pv_lead").and_then(Value::as_u64) {
             p.tree_pv_lead = x as u32;
+        }
+        if let Some(x) = v.get("tree_pv_nodes").and_then(Value::as_u64) {
+            p.tree_pv_nodes = (x as u32).clamp(1_000, 4_000_000);
         }
         if let Some(x) = v.get("tree_turn_model").and_then(Value::as_str) {
             p.tree_turn_model = x.to_string();
@@ -1781,7 +1791,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             }
             let key = (t.seed, me);
             let kept = PV_KEPT.with(|k| k.borrow_mut().remove(&key));
-            let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig { lead_at: pb.tree_pv_lead, ..Default::default() });
+            let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig { lead_at: pb.tree_pv_lead, max_nodes: pb.tree_pv_nodes as usize, ..Default::default() });
             let mut reused = 0u32;
             if let Some(k) = kept {
                 if k.tick + 1 == s.tick {
@@ -1828,9 +1838,10 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             let tree = search.into_tree();
             PV_KEPT.with(|k| {
                 let mut k = k.borrow_mut();
-                if k.len() > 16 {
-                    k.clear();
-                }
+                // a tree is only ever used at the next tick of its own match: those of other
+                // matches go now (they used to stay until 16 had piled up, each a finished
+                // match's last tree, hundreds of megabytes together)
+                k.retain(|other, _| other.0 == key.0);
                 k.insert(key, PvKept { tick: s.tick, root: s, ours: turn, tree });
             });
             return Decision { turn, sims: done + reused, score: q as f64, note: "pv" };
@@ -2712,9 +2723,7 @@ fn pv_guess_decide(t: &Tracker, pb: &Playbook, net: &'static victris_engine::pvn
     }
     PV_GUESSES.with(|g| {
         let mut g = g.borrow_mut();
-        if g.len() > 16 {
-            g.clear();
-        }
+        g.retain(|other, _| other.0 == key.0);
         g.insert(key, PvGuesses { tick: s.tick, ours: turn, guesses });
     });
     Some(Decision { turn, sims: done, score: q as f64, note: "pv-guess" })
@@ -2734,7 +2743,7 @@ pub fn pv_ponder(t: &Tracker, pb: &Playbook, lines: u32, until: Option<Instant>)
     let Some(net) = pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)) else { return 0 };
     let key = (t.seed, t.me);
     let Some(k) = PV_KEPT.with(|k| k.borrow_mut().remove(&key)) else { return 0 };
-    let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig::default());
+    let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig { max_nodes: pb.tree_pv_nodes as usize, ..Default::default() });
     search.start_from(k.tree);
     let mut done = 0u32;
     if pb.tree_pv_threads > 1 {
@@ -2751,6 +2760,20 @@ pub fn pv_ponder(t: &Tracker, pb: &Playbook, lines: u32, until: Option<Instant>)
     let tree = search.into_tree();
     PV_KEPT.with(|m| m.borrow_mut().insert(key, PvKept { tick: k.tick, root: k.root, ours: k.ours, tree }));
     done
+}
+
+/// Drops what the learned search keeps between ticks on this thread: its tree and its guesses
+/// at a hidden opponent, for every match. Call it when a match ends, on the thread that called
+/// `decide` (the kept things live there); a finished match's last tree is otherwise held until
+/// the next match's first decision by the learned search.
+pub fn pv_forget() {
+    PV_KEPT.with(|k| k.borrow_mut().clear());
+    PV_GUESSES.with(|g| g.borrow_mut().clear());
+}
+
+/// How many matches' trees and guesses the learned search holds on this thread (for tests).
+pub fn pv_kept() -> (usize, usize) {
+    (PV_KEPT.with(|k| k.borrow().len()), PV_GUESSES.with(|g| g.borrow().len()))
 }
 
 /// ARENA_ROOTS=file: for every tree decision, the position's hash and what the search made of it

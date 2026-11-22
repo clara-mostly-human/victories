@@ -30,6 +30,9 @@ pub struct PvConfig {
     pub fpu: f32,
     /// a line never runs longer than this many ticks
     pub depth: u32,
+    /// The most positions the tree holds. When it is full the half the fewest lines ran
+    /// through is dropped (`Search::room`); a position with its turn lists made takes about
+    /// 3 kB, one without about 0.5 kB.
     pub max_nodes: usize,
     /// Lead shots (`Search::lead`): once this many lines ran through the root, and again each
     /// time that number doubles, each fighter's most searched shots at the other get copies
@@ -549,6 +552,7 @@ impl<'a> Search<'a> {
         }
         self.ready(root);
         for _ in 0..count {
+            self.room(self.cfg.max_nodes);
             self.lead_when_due(root);
             self.line(root, None);
         }
@@ -582,6 +586,7 @@ impl<'a> Search<'a> {
             }
             given[best.1] += 1;
             let first = if me == 0 { (mine, best.1) } else { (best.1, mine) };
+            self.room(self.cfg.max_nodes);
             self.line(root, Some(first));
         }
         true
@@ -644,6 +649,7 @@ impl<'a> Search<'a> {
         if threads <= 1 {
             let mut done = 0u32;
             while done < count && !late(done) {
+                self.room(self.cfg.max_nodes);
                 if first.is_none() {
                     self.lead_when_due(root);
                 }
@@ -653,6 +659,9 @@ impl<'a> Search<'a> {
             }
             return done;
         }
+        // Room is made here, before any line is under way (a line under way names positions
+        // by their place in the tree): from three quarters full, so the run seldom fills it.
+        self.room(self.cfg.max_nodes / 4 * 3);
         // This thread owns the tree: it alone chooses turns, adds positions and reports
         // results, so the tree stays in one core's cache and needs no lock. What it hands
         // out is the part of a line that does not touch the tree: playing the last turns on
@@ -1418,6 +1427,20 @@ impl<'a> Search<'a> {
             return false;
         };
         self.led = 0;
+        self.keep_under(start, 0);
+        // the new root looks as wide as a root does (one whose turn lists are not made yet
+        // gets them, as wide, from `ready`)
+        if self.nodes[0].rest.is_none() {
+            widen(&mut self.nodes[0].acts, self.cfg.even, self.cfg.even_root);
+        }
+        true
+    }
+
+    /// The tree cut down to the position `start` and what is under it, leaving out every
+    /// position fewer than `least` lines ran through (and so everything under those). The
+    /// turns that led to a position left out keep their counts and results: a line that takes
+    /// them again finds no position there and makes it anew.
+    fn keep_under(&mut self, start: u32, least: u32) {
         let mut old = std::mem::take(&mut self.nodes);
         self.index.clear();
         // copy the kept part in the order found: each position's children follow it
@@ -1428,6 +1451,9 @@ impl<'a> Search<'a> {
             let kids = std::mem::take(&mut old[id].kids);
             let mut renamed = Vec::with_capacity(kids.len());
             for (pair, child) in kids {
+                if old[child as usize].n < least {
+                    continue;
+                }
                 let new_id = order.len() as u32;
                 order.push(child);
                 renamed.push((pair, new_id));
@@ -1438,12 +1464,30 @@ impl<'a> Search<'a> {
         }
         let mut slots: Vec<Option<Node>> = old.into_iter().map(Some).collect();
         self.nodes = order.iter().filter_map(|id| slots[*id as usize].take()).collect();
-        // the new root looks as wide as a root does (one whose turn lists are not made yet
-        // gets them, as wide, from `ready`)
-        if self.nodes[0].rest.is_none() {
-            widen(&mut self.nodes[0].acts, self.cfg.even, self.cfg.even_root);
+    }
+
+    /// Room for new positions when the tree holds `full` of them or more: it is cut down to
+    /// the half of `PvConfig::max_nodes` that the most lines ran through (a position is kept
+    /// with everything above it, since no position has more lines than the one it came
+    /// from). What goes is the part the search had all but stopped looking at; its results
+    /// stay in the counts of the turns that led there.
+    ///
+    /// Without this a full tree took no new positions: every further line ended where an
+    /// earlier one had, and the rest of the tick's thinking, and all of the pondering, added
+    /// nothing. At 300 ms a tick with pondering the tree fills within two ticks.
+    fn room(&mut self, full: usize) {
+        if self.nodes.len() < full.max(2) {
+            return;
         }
-        true
+        let target = (self.cfg.max_nodes / 2).max(1);
+        if self.nodes.len() <= target {
+            return;
+        }
+        let mut lines: Vec<u32> = self.nodes.iter().map(|nd| nd.n).collect();
+        // the fewest lines a kept position has: more than the first one that does not fit
+        let (_, first_out, _) = lines.select_nth_unstable_by(target, |a, b| b.cmp(a));
+        let least = *first_out + 1;
+        self.keep_under(0, least);
     }
 }
 

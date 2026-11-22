@@ -816,3 +816,72 @@ fn the_search_can_lead_its_shots_and_expects_the_other_fighter_to() {
     println!("{searched} positions searched; lead shots in {with_leads} turn lists ({stood} with the other fighter unable to move this tick), {leads_tried} of them tried, the tree moved on under one {moved_on} times");
     assert!(with_leads >= 20 && leads_tried >= 50 && moved_on >= 3 && stood >= 3);
 }
+
+#[test]
+fn a_full_tree_makes_room_and_goes_on_growing() {
+    // the tree holds at most `max_nodes` positions; full, it drops the half the fewest lines
+    // ran through and the search carries on (it used to take no new positions from then on)
+    let e = Engine::shipped("columns-21");
+    let net = random_net(41);
+    let mut s = e.new_match(5);
+    let mut rng = Rng::new(9);
+    let mut buf = Vec::new();
+    // a position in the middle of a random game
+    for _ in 0..60 {
+        let mut pair = [RawTurn::IDLE; 2];
+        for x in 0..2 {
+            turns(&e, &s, x, &mut buf);
+            pair[x] = buf[rng.below(buf.len())];
+        }
+        e.step(&mut s, &pair);
+    }
+    assert!(s.result.is_none());
+    let cap = 3000;
+    let cfg = PvConfig { max_nodes: cap, ..Default::default() };
+    let mut small = Search::new(&e, &net, cfg);
+    let mut most = 0;
+    let mut grew_after_full = false;
+    let mut was_full = false;
+    for _ in 0..40 {
+        let before = small.nodes();
+        small.iterate(&s, 500);
+        most = most.max(small.nodes());
+        was_full |= before + 500 > cap;
+        grew_after_full |= was_full && small.nodes() != before;
+        assert!(small.nodes() <= cap, "{} positions in a tree of at most {cap}", small.nodes());
+    }
+    assert!(was_full && grew_after_full, "the tree never filled, or stopped changing once full");
+    assert!(most > cap / 2);
+    // every line is still counted at the root, for both fighters
+    assert_eq!(small.visits(), 20_000);
+    for x in 0..2 {
+        assert_eq!(small.root()[x].iter().map(|a| a.1).sum::<u32>(), 20_000);
+    }
+    // what is left is the searched part: every position in it is reachable, and the tree
+    // moves on under the pair of turns both fighters like best
+    let left = small.positions(&s);
+    assert_eq!(left.len(), small.nodes(), "positions that cannot be reached from the root were kept");
+    let pair = [small.best(0), small.best(1)];
+    let mut next = s;
+    e.step(&mut next, &pair);
+    if next.result.is_none() {
+        assert!(small.advance(&pair[0], &pair[1]), "the most searched pair of turns has no position under it");
+        small.iterate(&next, 2000);
+        assert!(small.nodes() <= cap);
+    }
+    // against a tree with all the room it wants, the same number of lines: the same first choice
+    let mut big = Search::new(&e, &net, PvConfig::default());
+    big.iterate(&s, 20_000);
+    let mut again = Search::new(&e, &net, cfg);
+    again.iterate(&s, 20_000);
+    println!("{} positions with room for all, {} kept of at most {cap}; first choice {:?} / {:?}, value {:.3} / {:.3}", big.nodes(), again.nodes(), big.best(0), again.best(0), big.value(), again.value());
+    assert!((big.value() - again.value()).abs() < 0.15);
+    // on threads room is made before a run starts
+    let mut many = Search::new(&e, &net, cfg);
+    for _ in 0..12 {
+        assert_eq!(many.iterate_threads(&s, 1000, 3, None), 1000);
+        assert!(many.nodes() <= cap);
+    }
+    assert_eq!(many.root()[0].iter().map(|a| a.1).sum::<u32>(), 12_000);
+    assert!(many.nodes() > cap / 2);
+}
