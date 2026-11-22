@@ -1,10 +1,9 @@
 //! The learning network's arithmetic: the slopes the trainer follows are the true slopes of its
 //! loss, saved games replay to the positions they were played from, every turn the search may
 //! play has its own kind, the map's mirror images are the same game, and the search keeps its
-//! tree from one tick to the next. Positions beside a game's path are saved with the game and
-//! teach their value, and looking at them leaves the game as it was.
+//! tree from one tick to the next.
 
-use victris_engine::azdata::{shares, shares_earned, GameLog, SideLog, TickLog};
+use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
 use victris_engine::pvnet::{act, class_of, encode, layout, loss_grad, turns, Inputs, Pass, PvNet, Sample, Scratch, Sym, CLASSES, IN, IN_OLD};
 use victris_engine::pvsearch::{pick, PvConfig, Rng, Search};
 use victris_engine::{Engine, RawTurn};
@@ -32,12 +31,12 @@ fn random_game(e: &Engine, seed: u64, max_ticks: i32) -> GameLog {
             visits[x] = buf.iter().map(|t| (*t, 1 + rng.below(40) as u32)).collect();
             pair[x] = pick(&visits[x], 1.0, &mut rng);
         }
-        log.ticks.push(TickLog { turns: pair, q: Some(rng.unit() as f32 - 0.5), pol: Some([shares(&visits[0]), shares(&visits[1])]), side: Vec::new() });
+        log.ticks.push(TickLog { turns: pair, q: Some(rng.unit() as f32 - 0.5), pol: Some([shares(&visits[0]), shares(&visits[1])]) });
         e.step(&mut s, &pair);
     }
     // play on with idle turns to the end, as unsearched ticks
     while s.result.is_none() {
-        log.ticks.push(TickLog { turns: [RawTurn::IDLE; 2], q: None, pol: None, side: Vec::new() });
+        log.ticks.push(TickLog { turns: [RawTurn::IDLE; 2], q: None, pol: None });
         e.step(&mut s, &[RawTurn::IDLE; 2]);
     }
     log.z = victris_engine::pvsearch::outcome(&s).unwrap() as i8;
@@ -885,154 +884,4 @@ fn a_full_tree_makes_room_and_goes_on_growing() {
     }
     assert_eq!(many.root()[0].iter().map(|a| a.1).sum::<u32>(), 12_000);
     assert!(many.nodes() > cap / 2);
-}
-
-#[test]
-fn positions_beside_the_path_are_saved_with_the_game_and_teach_their_value_alone() {
-    let e = Engine::shipped("columns-21");
-    // a game as self-play saves it with --side: at searched ticks, a pair of turns that was
-    // not played and the search's value of the position after it
-    let plain = random_game(&e, 31, 120);
-    let mut game = plain.clone();
-    let mut rng = Rng::new(77);
-    let mut s = e.new_match(game.seed);
-    let mut buf = Vec::new();
-    let mut want: Vec<(victris_engine::State, f32)> = Vec::new();
-    for (k, t) in game.ticks.iter_mut().enumerate() {
-        if s.result.is_some() {
-            break;
-        }
-        if t.pol.is_some() && k % 3 != 2 {
-            for _ in 0..1 + k % 3 {
-                let mut pair = [RawTurn::IDLE; 2];
-                for x in 0..2 {
-                    turns(&e, &s, x, &mut buf);
-                    pair[x] = buf[rng.below(buf.len())];
-                }
-                let q = (rng.unit() as f32 - 0.5) * 1.6;
-                t.side.push(SideLog { turns: pair, q, lines: 64 + rng.below(100_000) as u32 });
-                let mut after = s;
-                e.step(&mut after, &pair);
-                if after.result.is_none() {
-                    want.push((after, q));
-                }
-            }
-        }
-        e.step(&mut s, &t.turns);
-    }
-    assert!(want.len() > 60, "{} positions beside the path", want.len());
-    // a file of games without such positions is the file older programs read; one with them
-    // says so in its first bytes, and both kinds can follow each other in one file
-    let mut bytes = Vec::new();
-    plain.write(&mut bytes);
-    assert_eq!(&bytes[..4], b"AZG2");
-    let first = bytes.len();
-    game.write(&mut bytes);
-    assert_eq!(&bytes[first..first + 4], b"AZG3");
-    plain.write(&mut bytes);
-    let back = GameLog::read_all(&bytes);
-    assert_eq!(back.len(), 3);
-    assert!(back[0].ticks.iter().all(|t| t.side.is_empty()) && back[2].ticks.iter().all(|t| t.side.is_empty()));
-    assert_eq!(back[2].ticks.len(), plain.ticks.len());
-    for (x, y) in game.ticks.iter().zip(&back[1].ticks) {
-        assert_eq!((x.turns, x.pol, x.side.len()), (y.turns, y.pol, y.side.len()));
-        for (a, b) in x.side.iter().zip(&y.side) {
-            assert_eq!(a.turns, b.turns);
-            assert!((a.q - b.q).abs() < 0.005, "{} read back as {}", a.q, b.q);
-            assert_eq!(b.lines, a.lines.min(65535));
-        }
-    }
-    // a file cut off inside the positions beside the path loses that game only
-    assert_eq!(GameLog::read_all(&bytes[..bytes.len() - plain_len(&plain) - 7]).len(), 1);
-    // replayed: the game's own positions as before, and after each the positions beside it
-    let mut own: Vec<Sample> = Vec::new();
-    assert!(back[0].samples(&e, &mut own));
-    let mut all: Vec<Sample> = Vec::new();
-    assert!(back[1].samples(&e, &mut all));
-    let on_path: Vec<&Sample> = all.iter().filter(|r| !r.side).collect();
-    assert_eq!(on_path.len(), own.len());
-    for (a, b) in on_path.iter().zip(&own) {
-        assert_eq!((a.s, a.pol, a.z, a.has_q), (b.s, b.pol, b.z, b.has_q));
-    }
-    let beside: Vec<&Sample> = all.iter().filter(|r| r.side).collect();
-    assert_eq!(beside.len(), want.len());
-    let net = random_net(5);
-    let n = net.layout().len;
-    let mut sc = Scratch::default();
-    for (r, (after, q)) in beside.iter().zip(&want) {
-        assert_eq!(r.s, *after, "the position is the one the pair of turns leads to");
-        assert!((r.q - q).abs() < 0.005);
-        // its lesson is the search's value of it and nothing else: not the game's result
-        // (the game did not go there), whatever the mix of the two is set to, and no turns
-        for lambda in [0.0, 0.5, 1.0] {
-            let t = victris_engine::pvnet::value_target(r, lambda);
-            assert!((t - 0.5 * (1.0 + r.q)).abs() < 1e-6, "target {t} for a value of {}", r.q);
-        }
-        let mut grad = vec![0.0f32; n];
-        let loss = loss_grad(&net, &e, r, 0.5, 1.0, &mut sc, Some(&mut grad));
-        assert!(loss.side && !loss.decided);
-        assert_eq!((loss.policy_n, loss.policy), (0, 0.0));
-        assert!(loss.value > 0.0 && grad.iter().any(|g| *g != 0.0));
-    }
-    // a mirror image of such a position is still one
-    let sym = Sym::of(&e);
-    for k in (1..4).filter(|k| sym.ok[*k]) {
-        let im = sym.image(k, beside[0]);
-        assert!(im.side && im.q == beside[0].q);
-    }
-}
-
-/// The bytes one game takes in a file.
-fn plain_len(g: &GameLog) -> usize {
-    let mut b = Vec::new();
-    g.write(&mut b);
-    b.len()
-}
-
-#[test]
-fn looking_beside_the_path_leaves_the_game_as_it_was() {
-    let e = Engine::shipped("columns-21");
-    let net = random_net(8);
-    let cfg = || PvConfig { even_root: 0.25, lead_at: 64, ..Default::default() };
-    // the same game twice, side by side: one search only plays, the other also looks at
-    // positions beside the path at every tick
-    let mut plain = Search::new(&e, &net, cfg());
-    let mut looks = Search::new(&e, &net, cfg());
-    let mut rng = Rng::new(4);
-    let mut rng_side = Rng::new(9);
-    let mut s = e.new_match(6);
-    let (mut seen, mut ticks) = (0, 0);
-    for _ in 0..30 {
-        if s.result.is_some() {
-            break;
-        }
-        plain.iterate(&s, 160);
-        looks.iterate(&s, 160);
-        let (a, b) = (plain.root(), looks.root());
-        assert_eq!(a, b, "tick {}: the searches differ", s.tick);
-        assert_eq!(plain.value(), looks.value());
-        let visits = |x: usize| a[x].iter().map(|t| (t.0, t.1)).collect::<Vec<_>>();
-        let pair = [pick(&visits(0), 0.5, &mut rng), pick(&visits(1), 0.5, &mut rng)];
-        let tried = looks.root_cells(0).cells.iter().filter(|c| c.1 > 0).count();
-        let got = looks.beside(&s, &pair, 3, 40, &mut rng_side);
-        assert!(got.len() <= 3);
-        assert!(got.len() == 3 || tried < 4, "tick {}: {} of {tried} tried pairs", s.tick, got.len());
-        for (k, (turns, q, lines)) in got.iter().enumerate() {
-            assert!(*turns != pair, "the pair played is on the path, not beside it");
-            assert!(got[..k].iter().all(|g| g.0 != *turns), "the same pair twice");
-            assert!(*lines >= 40, "{lines} lines behind a position beside the path");
-            assert!(q.abs() <= 1.0);
-            // the pair is one both fighters could play, and the game is not over after it
-            assert!(a[0].iter().any(|t| t.0 == turns[0]) && a[1].iter().any(|t| t.0 == turns[1]));
-            let mut after = s;
-            e.step(&mut after, turns);
-            assert!(after.result.is_none());
-            seen += 1;
-        }
-        e.step(&mut s, &pair);
-        assert_eq!(plain.advance(&pair[0], &pair[1]), looks.advance(&pair[0], &pair[1]));
-        assert_eq!(plain.nodes(), looks.nodes(), "tick {}: what was kept differs", s.tick);
-        ticks += 1;
-    }
-    assert!(ticks >= 20 && seen >= 40, "{seen} positions beside the path in {ticks} ticks");
 }

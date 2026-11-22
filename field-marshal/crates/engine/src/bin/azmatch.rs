@@ -206,7 +206,7 @@ fn main() {
                                 let fit: Vec<usize> = (0..seen.len())
                                     .filter(|i| {
                                         let t = &seen[*i].s;
-                                        !seen[*i].side && t.tick >= 20 && t.tick <= 220 && t.fighters[0].alive && t.fighters[1].alive && (t.fighters[0].hp - t.fighters[1].hp).abs() <= 20
+                                        t.tick >= 20 && t.tick <= 220 && t.fighters[0].alive && t.fighters[1].alive && (t.fighters[0].hp - t.fighters[1].hp).abs() <= 20
                                     })
                                     .collect();
                                 if !fit.is_empty() {

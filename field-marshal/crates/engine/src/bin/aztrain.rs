@@ -6,10 +6,6 @@
 //!   aztrain --out NET.json --data FILE [FILE ...] [--init NET.json] [--h1 64] [--h2 32]
 //!           [--epochs 8] [--lr 0.002] [--batch 512] [--lambda 0.5] [--pw 1.0] [--threads 4]
 //!           [--holdout 0.05] [--seed 1] [--map columns-21] [--mirror 1] [--widen]
-//!           [--beside 1]
-//!
-//! Games saved with positions beside their path (`azgen --side`) teach the value of those
-//! positions too: the search's value of each, and no turns. --beside 0 leaves them out.
 //!
 //! With --widen an --init network made before the walls three tiles from the opponent were
 //! inputs (`pvnet::IN_OLD`) is given them (`PvNet::widened`); a new network always has them.
@@ -35,18 +31,10 @@ struct Sum {
     floor: f64,
     pn: f64,
     top: f64,
-    /// positions beside the games' paths, and their value loss (kept out of `n` and `value`)
-    side_n: f64,
-    side_value: f64,
 }
 
 impl Sum {
     fn add(&mut self, l: &Loss) {
-        if l.side {
-            self.side_n += 1.0;
-            self.side_value += l.value as f64;
-            return;
-        }
         self.n += 1.0;
         self.value += l.value as f64;
         self.decided += l.decided as u8 as f64;
@@ -65,13 +53,10 @@ impl Sum {
         self.floor += o.floor;
         self.pn += o.pn;
         self.top += o.top;
-        self.side_n += o.side_n;
-        self.side_value += o.side_value;
     }
     fn line(&self) -> String {
-        let beside = if self.side_n > 0.0 { format!("; beside the games ({:.0} positions) value loss {:.4}", self.side_n, self.side_value / self.side_n) } else { String::new() };
         format!(
-            "value loss {:.4}, picks the winner {:.1}%; moves loss {:.4} (the search's own spread {:.4}), same first choice as the search {:.1}%{beside}",
+            "value loss {:.4}, picks the winner {:.1}%; moves loss {:.4} (the search's own spread {:.4}), same first choice as the search {:.1}%",
             self.value / self.n.max(1.0),
             100.0 * self.hit / self.decided.max(1.0),
             self.policy / self.pn.max(1.0),
@@ -86,7 +71,6 @@ fn main() {
     let out: String = arg(&args, "--out", String::from("net.json"));
     let init: String = arg(&args, "--init", String::new());
     let widen = args.iter().any(|a| a == "--widen");
-    let beside = arg::<u32>(&args, "--beside", 1) != 0;
     let (h1, h2): (usize, usize) = (arg(&args, "--h1", 64), arg(&args, "--h2", 32));
     let epochs: usize = arg(&args, "--epochs", 8);
     let lr0: f32 = arg(&args, "--lr", 0.002);
@@ -115,17 +99,6 @@ fn main() {
         for g in GameLog::read_all(&b) {
             let at = data.len();
             if g.samples(&e, &mut data) {
-                if !beside {
-                    // the game's own positions only (they are first in line, so `at` stands)
-                    let mut k = at;
-                    for i in at..data.len() {
-                        if !data[i].side {
-                            data.swap(k, i);
-                            k += 1;
-                        }
-                    }
-                    data.truncate(k);
-                }
                 game_start.push(at);
             } else {
                 bad += 1;

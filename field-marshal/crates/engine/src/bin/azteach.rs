@@ -73,7 +73,7 @@ fn main() {
                                 break;
                             }
                             trace.push((s.fighters[0].pos, s.fighters[0].hp, s.fighters[1].pos, s.fighters[1].hp));
-                            log.ticks.push(TickLog { turns: t.turns, q: None, pol: None, side: Vec::new() });
+                            log.ticks.push(TickLog { turns: t.turns, q: None, pol: None });
                             e.step(&mut s, &t.turns);
                         }
                         let Some(z) = outcome(&s) else {
