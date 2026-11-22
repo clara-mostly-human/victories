@@ -592,6 +592,82 @@ impl<'a> Search<'a> {
         true
     }
 
+    /// The turn fighter `1 - me` does best with when it has been told that fighter `me` plays
+    /// `ours` this tick: `lines` more lines that all begin with `ours`, the other fighter's
+    /// first turn chosen by what it has brought against that one turn (the lines that began
+    /// with the pair) and no longer by what it brought against everything `me` might do.
+    /// Every turn of the other fighter is first tried once against `ours` (the network's
+    /// value of the position the pair leads to), highest share first, then the search's
+    /// usual rule picks among them. Returns the turn with the most lines against `ours`.
+    ///
+    /// No bot can do this in a game: both move at once. It is for self-play and for judging.
+    /// A search that plays one fixed turn where the right play is a mix (stand or step off
+    /// the edge while a dash with repulsor is on; which way to step out of a slow area) loses
+    /// nothing to an opponent that mixes too, and a great deal to one that guesses it. Told
+    /// the turn, the other side always guesses right, so what a habit costs when it is read
+    /// shows in the result. None when `ours` is not one of the root's turns or nothing was
+    /// searched from `root` yet.
+    pub fn answer(&mut self, root: &State, me: usize, ours: &RawTurn, lines: u32) -> Option<RawTurn> {
+        if root.result.is_some() || self.nodes.is_empty() {
+            return None;
+        }
+        let mine = self.nodes[0].acts[me].iter().position(|a| a.turn == *ours)?;
+        let other = 1 - me;
+        let count = self.nodes[0].acts[other].len();
+        if count == 0 {
+            return None;
+        }
+        if count == 1 {
+            return Some(self.nodes[0].acts[other][0].turn);
+        }
+        let mut order: Vec<usize> = (0..count).collect();
+        order.sort_by(|a, b| self.nodes[0].acts[other][*b].prior.total_cmp(&self.nodes[0].acts[other][*a].prior));
+        let prior: Vec<f32> = self.nodes[0].acts[other].iter().map(|a| a.prior).collect();
+        let turns: Vec<RawTurn> = self.nodes[0].acts[other].iter().map(|a| a.turn).collect();
+        let side = if other == 0 { 1.0 } else { -1.0 };
+        // what each turn has brought against `ours` so far: (lines, summed results for the other fighter).
+        // Kept here and not read back from the tree, where a pair that ends the game has no position.
+        let mut got: Vec<(u32, f32)> = (0..count)
+            .map(|j| {
+                let c = self.cell(other, j, mine);
+                (c.1, c.0 * c.1 as f32)
+            })
+            .collect();
+        let mut total: u32 = got.iter().map(|g| g.0).sum();
+        let mut next = 0usize;
+        for _ in 0..lines {
+            while next < count && got[order[next]].0 > 0 {
+                next += 1;
+            }
+            let j = if next < count {
+                order[next]
+            } else {
+                let root_n = (total.max(1) as f32).sqrt();
+                let mut best = (f32::MIN, 0usize);
+                for j in 0..count {
+                    let u = got[j].1 / got[j].0 as f32 + self.cfg.c * prior[j] * root_n / (1.0 + got[j].0 as f32);
+                    if u > best.0 {
+                        best = (u, j);
+                    }
+                }
+                best.1
+            };
+            self.room(self.cfg.max_nodes);
+            let value = self.line(root, Some(if me == 0 { (mine, j) } else { (j, mine) }));
+            got[j].0 += 1;
+            got[j].1 += side * value;
+            total += 1;
+        }
+        let mut best = (0u32, f32::MIN, 0usize);
+        for j in 0..count {
+            let mean = if got[j].0 > 0 { got[j].1 / got[j].0 as f32 } else { f32::MIN };
+            if got[j].0 > best.0 || (got[j].0 == best.0 && mean > best.1) {
+                best = (got[j].0, mean, j);
+            }
+        }
+        Some(turns[best.2])
+    }
+
     /// `iterate` on `threads` threads: lines until `count` are done or the time `until` has
     /// come, whichever is first; returns the lines done. One thread (or none to spare) is
     /// `iterate` itself, line for line. With more, the calling thread owns the tree: it alone

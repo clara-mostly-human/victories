@@ -8,7 +8,7 @@
 //!   azgen --out FILE --games N [--net NET.json] [--iters 800] [--seed 1] [--threads 4]
 //!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25] [--earned 0] [--mix 0]
 //!         [--lead 0] [--from GAMES.az] [--from-share 0.5] [--from-tick 0]
-//!         [--from-level 1000]
+//!         [--from-level 1000] [--read 0] [--read-lines N]
 //!
 //! With --from a share of the games (--from-share) do not start at tick 0 but from a position
 //! out of a saved game (ladder games as `azreal` saves them): a game drawn from the file is
@@ -28,6 +28,16 @@
 //! (the network-led search only) both fighters' turns are drawn at every tick in proportion
 //! to the visits each turn earned (`Search::root_earned`: the search's own mix, without the
 //! visits the wider root alone gave), so every turn is played as often as the search rates it.
+//!
+//! With --read P (the network-led search only), at each tick with chance P one of the two
+//! fighters, drawn evenly, is told the turn the other has just chosen and plays its best
+//! answer to it (`Search::answer`, --read-lines more lines, half of --iters unless given).
+//! An opponent on the ladder that guesses our turn right gets the same: it slams the
+//! fighter that stands on the edge, shoots the tile the slowed fighter steps to. Our own
+//! search carries such a threat out only as often as a mix asks, so the network learns the
+//! position is cheap. Here a habit that can be read is punished as soon as it is shown,
+//! and the game's result teaches what the position costs. What is saved for the trainer
+//! at that tick is still the plain search's visits for both fighters: no bot is told.
 //!
 //! --wide makes the search look wider at the root than anywhere else, so self-play tries turns
 //! the network thinks little of. With --earned 1 what is saved for the trainer is the visits
@@ -72,19 +82,21 @@ fn main() {
     let from_share: f64 = arg(&args, "--from-share", 0.5);
     let from_tick: usize = arg(&args, "--from-tick", 0);
     let from_level: i32 = arg(&args, "--from-level", 1000);
+    let read: f64 = arg(&args, "--read", 0.0);
+    let read_lines: u32 = arg(&args, "--read-lines", iters / 2);
     let from: Vec<GameLog> = if from_path.is_empty() { Vec::new() } else { GameLog::read_all(&std::fs::read(&from_path).expect("cannot read the --from games")) };
     let net = if net_path.is_empty() { None } else { Some(PvNet::load(std::path::Path::new(&net_path)).expect("cannot read the network")) };
     let e = Engine::shipped(&map);
     let flag = mcts::Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, slam_prior: 0.228, ..Default::default() };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let started = std::time::Instant::now();
-    let parts: Vec<(Vec<u8>, [u64; 7])> = std::thread::scope(|sc| {
+    let parts: Vec<(Vec<u8>, [u64; 9])> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 sc.spawn(|| {
                     let mut bytes: Vec<u8> = Vec::new();
                     // games, positions, ticks, fighter 0 wins, fighter 1 wins, search lines, games from a saved position
-                    let mut st = [0u64; 7];
+                    let mut st = [0u64; 9];
                     loop {
                         let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if g >= games {
@@ -159,10 +171,19 @@ fn main() {
                             st[5] += iters as u64;
                             searched += 1;
                             let w = if s.tick < open { 1.0 } else { wander };
-                            let pair = match &drawn {
+                            let mut pair = match &drawn {
                                 Some(d) => [pick(&d[0], 1.0, &mut rng), pick(&d[1], 1.0, &mut rng)],
                                 None => [pick(&visits[0], w, &mut rng), pick(&visits[1], w, &mut rng)],
                             };
+                            if read > 0.0 && visits[0].len() > 1 && visits[1].len() > 1 && rng.unit() < read {
+                                // one fighter is told the other's turn and answers it
+                                let reader = rng.below(2);
+                                if let Some(t) = pv.as_mut().and_then(|p| p.answer(&s, 1 - reader, &pair[1 - reader], read_lines)) {
+                                    st[7] += 1;
+                                    st[8] += (t != pair[reader]) as u64;
+                                    pair[reader] = t;
+                                }
+                            }
                             log.ticks.push(TickLog { turns: pair, q, pol: Some(pol.unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])])) });
                             e.step(&mut s, &pair);
                             if let Some(p) = pv.as_mut() {
@@ -185,20 +206,22 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut file = std::io::BufWriter::new(std::fs::File::create(&out).expect("cannot write the output"));
-    let mut st = [0u64; 7];
+    let mut st = [0u64; 9];
     for (bytes, s) in &parts {
         file.write_all(bytes).unwrap();
-        for i in 0..7 {
+        for i in 0..9 {
             st[i] += s[i];
         }
     }
     file.flush().unwrap();
     let secs = started.elapsed().as_secs_f64();
     println!(
-        "azgen {}: {} games ({} from a saved position), {} positions, {:.0} ticks a game, fighter 0 won {} / fighter 1 won {} / drawn {}, {:.1} s ({:.1} games a minute, {:.0} lines a second a thread)",
+        "azgen {}: {} games ({} from a saved position; a fighter was told the other's turn at {} ticks and changed its own at {}), {} positions, {:.0} ticks a game, fighter 0 won {} / fighter 1 won {} / drawn {}, {:.1} s ({:.1} games a minute, {:.0} lines a second a thread)",
         if net.is_some() { "network" } else { "flagship" },
         st[0],
         st[6],
+        st[7],
+        st[8],
         st[1],
         st[2] as f64 / st[0].max(1) as f64,
         st[3],

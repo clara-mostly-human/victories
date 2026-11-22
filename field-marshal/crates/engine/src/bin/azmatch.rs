@@ -2,6 +2,7 @@
 //!
 //!   azmatch --a SPEC --b SPEC [--games 100] [--seed 1] [--threads 4] [--map columns-21] [--open 10]
 //!           [--book GAMES.az] [--book-from 20] [--book-to 220] [--soft 0]
+//!           [--read-a 0] [--read-b 0] [--read-lines N]
 //!
 //! SPEC is `flag:N` (the flagship's search, the live playbook's settings, N lines a tick),
 //! `pv:NET.json:N` (the network-led search), `pvw:NET.json:N[:SHARE[:TRUST]]` (the same, its
@@ -25,6 +26,11 @@
 //! --soft K tests play from the spawn instead: before tick K each player draws its turn in
 //! proportion to its own search's visits, so every game is different and each player still
 //! plays its own opening (use with --open 0).
+//! --read-b P: at each tick with chance P player b (a network-led one) is told the turn a has
+//! just chosen and plays its best answer to it (`Search::answer`, --read-lines more lines,
+//! half of b's own unless given); --read-a the other way round. No bot gets that in a game.
+//! It measures what a's play gives away to an opponent that guesses its turn: run the same
+//! b against two a's and compare.
 
 use victris_engine::azdata::GameLog;
 use victris_engine::mcts;
@@ -104,7 +110,7 @@ fn parse(spec: &str) -> Player {
 }
 
 /// The player's turn for fighter `x` at `s`, the lines it searched and how deep the average line went.
-fn think(e: &Engine, p: &Player, flag: mcts::Config, s: &State, x: usize) -> (RawTurn, u64, f64, Vec<(RawTurn, u32)>) {
+fn think(e: &Engine, p: &Player, flag: mcts::Config, s: &State, x: usize, told: Option<(&RawTurn, u32)>) -> (RawTurn, u64, f64, Vec<(RawTurn, u32)>) {
     let started = std::time::Instant::now();
     let mut lines = 0u64;
     match &p.net {
@@ -137,7 +143,14 @@ fn think(e: &Engine, p: &Player, flag: mcts::Config, s: &State, x: usize) -> (Ra
                 }
             }
             let visits: Vec<(RawTurn, u32)> = search.root()[x].iter().map(|v| (v.0, v.1)).collect();
-            let turn = if p.weigh > 0.0 { search.weigh(s, x, held.max(1), p.trust)[0].turn } else { search.best(x) };
+            let mut turn = if p.weigh > 0.0 { search.weigh(s, x, held.max(1), p.trust)[0].turn } else { search.best(x) };
+            if let Some((theirs, more)) = told {
+                // told the other fighter's turn: the best answer to it
+                let more = if more > 0 { more } else { (lines / 2).max(1) as u32 };
+                if let Some(t) = search.answer(s, 1 - x, theirs, more) {
+                    turn = t;
+                }
+            }
             let depth: u64 = search.depth_hist.iter().enumerate().map(|(d, n)| d as u64 * n).sum();
             (turn, lines, depth as f64 / lines.max(1) as f64, visits)
         }
@@ -178,6 +191,8 @@ fn main() {
     // the ticks a book position may come from
     let book_from: i32 = arg(&args, "--book-from", 20);
     let book_to: i32 = arg(&args, "--book-to", 220);
+    let read: [f64; 2] = [arg(&args, "--read-a", 0.0), arg(&args, "--read-b", 0.0)];
+    let read_lines: u32 = arg(&args, "--read-lines", 0);
     let book: Vec<GameLog> = if book_path.is_empty() { Vec::new() } else { GameLog::read_all(&std::fs::read(&book_path).expect("cannot read the book")) };
     let players = [parse(&sa), parse(&sb)];
     let e = Engine::shipped(&map);
@@ -224,14 +239,33 @@ fn main() {
                         let mut own = Rng::new((seed as u64).wrapping_mul(15_485_863).wrapping_add(g as u64));
                         while s.result.is_none() {
                             let mut pair = [RawTurn::IDLE, RawTurn::IDLE];
-                            for x in 0..2 {
+                            // the player that is told the other's turn this tick (0: a, 1: b), if any; it thinks second
+                            let can = |x: usize| s.fighters[x].alive && s.fighters[x].state == FState::Idle;
+                            let reader: Option<usize> = if (read[0] > 0.0 || read[1] > 0.0) && s.tick >= open && can(0) && can(1) {
+                                let (ra, rb) = (own.unit() < read[0], own.unit() < read[1]);
+                                match (ra, rb) {
+                                    (true, false) => Some(0),
+                                    (false, true) => Some(1),
+                                    (true, true) => Some(own.below(2)),
+                                    _ => None,
+                                }
+                            } else {
+                                None
+                            };
+                            let order = match reader {
+                                Some(who) if (if who == 0 { side } else { 1 - side }) == 0 => [1, 0],
+                                _ => [0, 1],
+                            };
+                            for x in order {
                                 if s.tick < open {
                                     victris_engine::pvnet::turns(&e, &s, x, &mut buf);
                                     buf.retain(|t| t.attack == victris_engine::turn::AttackIn::None && t.dash == victris_engine::turn::DirIn::None);
                                     pair[x] = buf[rng.below(buf.len())];
                                 } else if s.fighters[x].alive && s.fighters[x].state == FState::Idle {
                                     let who = if x == side { 0 } else { 1 };
-                                    let (t, lines, depth, visits) = think(&e, &players[who], flag, &s, x);
+                                    let told = if reader == Some(who) { Some((&pair[1 - x], read_lines)) } else { None };
+                                    let told = told.map(|(t, n)| (*t, n));
+                                    let (t, lines, depth, visits) = think(&e, &players[who], flag, &s, x, told.as_ref().map(|(t, n)| (t, *n)));
                                     pair[x] = if s.tick < soft { pick(&visits, 1.0, &mut own) } else { t };
                                     st[6 + who * 3] += lines as f64;
                                     st[7 + who * 3] += 1.0;

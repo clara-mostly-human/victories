@@ -949,3 +949,55 @@ fn a_full_tree_makes_room_and_goes_on_growing() {
     assert_eq!(many.root()[0].iter().map(|a| a.1).sum::<u32>(), 12_000);
     assert!(many.nodes() > cap / 2);
 }
+
+#[test]
+fn told_the_other_fighters_turn_a_fighter_answers_that_turn() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(23);
+    let mut s = e.new_match(9);
+    let mut answered = 0u32;
+    for tick in 0..24 {
+        if s.result.is_some() {
+            break;
+        }
+        let told = tick % 2; // the fighter whose turn is given away
+        let mut search = Search::new(&e, &net, PvConfig::default());
+        assert!(search.answer(&s, told, &RawTurn::IDLE, 10).is_none(), "nothing searched yet");
+        search.iterate(&s, 400);
+        let ours = search.best(told);
+        let before = search.root();
+        let answer = search.answer(&s, told, &ours, 300).expect("the turn is at the root");
+        let after = search.root();
+        let other = 1 - told;
+        // every one of the 300 lines began with the turn that was told (with one turn to
+        // answer with there is nothing to search)
+        let more = if before[other].len() > 1 { 300 } else { 0 };
+        for (b, a) in before[told].iter().zip(after[told].iter()) {
+            assert_eq!(a.1, b.1 + if a.0 == ours { more } else { 0 });
+        }
+        assert_eq!(after[other].iter().map(|a| a.1).sum::<u32>(), 400 + more);
+        // the answer is one of the other fighter's turns: the one with the most lines against the
+        // told turn, and every turn it has was tried against it
+        let mine = after[told].iter().position(|a| a.0 == ours).unwrap();
+        let cells = search.root_cells(other);
+        let lines = |j: usize| cells.cells[j * cells.cols + mine].1;
+        let j = after[other].iter().position(|a| a.0 == answer).expect("the answer is not one of its turns");
+        if cells.rows > 1 && cells.rows <= 300 {
+            for k in 0..cells.rows {
+                assert!(lines(k) > 0, "turn {k} of {} was never tried against the told turn", cells.rows);
+                assert!(lines(k) <= lines(j), "turn {k} has {} lines against the told turn, the answer {}", lines(k), lines(j));
+            }
+            answered += 1;
+        }
+        // a turn that is not at the root is refused
+        let mut odd = RawTurn::step(0);
+        odd.dash = RawTurn::dash(0).dash;
+        if !after[told].iter().any(|a| a.0 == odd) {
+            assert!(search.answer(&s, told, &odd, 10).is_none());
+        }
+        let mut pair = [ours; 2];
+        pair[other] = answer;
+        e.step(&mut s, &pair);
+    }
+    assert!(answered > 10, "only {answered} ticks had a choice to answer with");
+}
