@@ -4,7 +4,7 @@
 //! tree from one tick to the next.
 
 use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
-use victris_engine::pvnet::{act, class_of, encode, layout, loss_grad, turns, Inputs, Pass, PvNet, Sample, Scratch, Sym, CLASSES, IN};
+use victris_engine::pvnet::{act, class_of, encode, layout, loss_grad, turns, Inputs, Pass, PvNet, Sample, Scratch, Sym, CLASSES, IN, IN_OLD};
 use victris_engine::pvsearch::{pick, PvConfig, Rng, Search};
 use victris_engine::{Engine, RawTurn};
 
@@ -140,7 +140,7 @@ fn the_trainers_slopes_are_the_true_slopes() {
     let recs: Vec<Sample> = all.into_iter().step_by(9).take(16).collect();
     assert!(recs.len() >= 8);
     let (lambda, pw) = (0.5f32, 1.0f32);
-    let len = layout(net.h1, net.h2).len;
+    let len = net.layout().len;
     let mut grad = vec![0.0f32; len];
     let mut sc = Scratch::default();
     let total = |net: &PvNet, sc: &mut Scratch| -> f64 { recs.iter().map(|r| { let l = loss_grad(net, &e, r, lambda, pw, sc, None); (l.value + pw * l.policy) as f64 }).sum() };
@@ -385,7 +385,7 @@ fn a_lesson_without_shares_teaches_the_value_and_leaves_the_moves_alone() {
     assert!(back[0].samples(&e, &mut samples));
     assert!(samples.len() >= 30, "{} positions", samples.len());
     let net = random_net(3);
-    let n = layout(net.h1, net.h2).len;
+    let n = net.layout().len;
     let mut sc = Scratch::default();
     let mut moved_value = false;
     for r in &samples {
@@ -550,7 +550,7 @@ fn a_pass_in_blocks_is_the_plain_pass_to_the_last_bit() {
         for w in net.w.iter_mut() {
             *w += (rng.unit() as f32 - 0.5) * 0.7;
         }
-        let l = layout(h1, h2);
+        let l = net.layout();
         let w = &net.w;
         let game = random_game(&e, 40 + h1 as u64, 60);
         let mut s = e.new_match(game.seed);
@@ -615,9 +615,10 @@ fn a_position_no_line_was_played_on_from_is_searched_like_a_fresh_one() {
         // a position one tick down that was reached once and never played on from
         let leaf = kept.positions(&s).into_iter().find(|p| p.0 == 1 && p.1 == 0);
         if let Some((_, _, c)) = leaf {
-            if kept.advance_to(&s, &c) {
+            // (two pairs of turns can lead to the same position: the tree then moves to the more
+            // searched one, which is not the case tested here)
+            if kept.advance_to(&s, &c) && kept.visits() == 0 {
                 tried += 1;
-                assert_eq!(kept.visits(), 0);
                 kept.iterate(&c, 300);
                 let mut fresh = Search::new(&e, &net, PvConfig::default());
                 fresh.iterate(&c, 300);
@@ -645,4 +646,173 @@ fn a_position_no_line_was_played_on_from_is_searched_like_a_fresh_one() {
         e.step(&mut s, &pair);
     }
     assert!(tried >= 5, "only {tried} positions never played on from were found");
+}
+
+/// A network with the inputs networks had before the opponent's third ring of walls.
+fn older_net(seed: u64, h1: usize, h2: usize) -> PvNet {
+    let mut rng = Rng::new(seed);
+    let w = (0..layout(IN_OLD, h1, h2).len).map(|_| (rng.unit() as f32 - 0.5) * 0.6).collect();
+    PvNet { map: "columns-21".to_string(), n_in: IN_OLD, h1, h2, w }
+}
+
+#[test]
+fn the_walls_three_tiles_from_the_opponent_are_inputs_and_older_networks_read_as_before() {
+    let e = Engine::shipped("columns-21");
+    let wall = |p: [i32; 2]| p[0] < 0 || p[1] < 0 || p[0] >= e.map.w || p[1] >= e.map.h || e.map.is_wall(p);
+    let old = older_net(9, 24, 12);
+    let wide = old.widened();
+    assert_eq!((old.n_in, wide.n_in, wide.w.len()), (IN_OLD, IN, layout(IN, 24, 12).len));
+    // saved and read back, each keeps its own number of inputs
+    let dir = std::env::temp_dir();
+    for (net, name) in [(&old, "pvnet-older.json"), (&wide, "pvnet-wider.json")] {
+        let path = dir.join(format!("{}-{name}", std::process::id()));
+        net.save(&path, &serde_json::json!({})).unwrap();
+        let back = PvNet::load(&path).expect("the saved network does not load");
+        std::fs::remove_file(&path).ok();
+        assert_eq!((back.n_in, &back.w), (net.n_in, &net.w));
+    }
+    let (mut x, mut p) = (Inputs::default(), Pass::default());
+    let (mut positions, mut ring_seen, mut far_only) = (0, 0, 0);
+    for seed in 0..6 {
+        let game = random_game(&e, 80 + seed, 300);
+        let mut s = e.new_match(game.seed);
+        for t in &game.ticks {
+            for f in 0..2 {
+                encode(&e, &s, f, &mut x);
+                // the older inputs first and unchanged in number, the ring after them
+                assert!((0..x.n0).all(|k| (x.idx[k] as usize) < IN_OLD) && (x.n0..x.n).all(|k| (x.idx[k] as usize) >= IN_OLD));
+                // the ring is exactly the walls at three tiles from the opponent
+                let o = s.fighters[1 - f].pos;
+                let mut ring = 0;
+                for wy in -3i32..=3 {
+                    for wx in -3i32..=3 {
+                        if wx.abs().max(wy.abs()) == 3 && wall([o[0] + wx, o[1] + wy]) {
+                            ring += 1;
+                        }
+                    }
+                }
+                assert_eq!(x.n - x.n0, ring, "tick {}: {} ring inputs for {ring} walls three tiles from the opponent", s.tick, x.n - x.n0);
+                if ring > 0 {
+                    ring_seen += 1;
+                    // a wall the push can reach that the older inputs did not show at all
+                    let near = (-2i32..=2).any(|wy| (-2i32..=2).any(|wx| wall([o[0] + wx, o[1] + wy])));
+                    far_only += !near as u32;
+                }
+                // the older network reads the position from the older inputs alone, in plain arithmetic
+                let l = old.layout();
+                old.forward(&x, &mut p);
+                for j in 0..old.h1 {
+                    let mut z = old.w[l.b1 + j];
+                    for k in 0..x.n0 {
+                        z += x.val[k] * old.w[l.t1 + x.idx[k] as usize * old.h1 + j];
+                    }
+                    assert_eq!(z.to_bits(), p.z1[j].to_bits(), "unit {j} of the older network");
+                }
+            }
+            // made wider it still reads every position the same, to the last bit
+            let (a, b) = (old.eval(&e, &s), wide.eval(&e, &s));
+            assert_eq!(a.v0.to_bits(), b.v0.to_bits());
+            assert!(a.logits.iter().flatten().zip(b.logits.iter().flatten()).all(|(u, v)| u == v));
+            positions += 1;
+            e.step(&mut s, &t.turns);
+        }
+    }
+    println!("{positions} positions; walls three tiles from the opponent in {ring_seen} views, in {far_only} of them none nearer");
+    assert!(ring_seen > 100 && far_only > 10);
+    // and the wider one learns from the ring: its slope for those weights is not zero
+    let mut all = Vec::new();
+    assert!(random_game(&e, 81, 300).samples(&e, &mut all));
+    let mut grad = vec![0.0f32; wide.layout().len];
+    let mut sc = Scratch::default();
+    for r in &all {
+        loss_grad(&wide, &e, r, 0.5, 1.0, &mut sc, Some(&mut grad));
+    }
+    let l = wide.layout();
+    let ring = &grad[l.t1 + IN_OLD * wide.h1..l.b1];
+    assert!(ring.iter().filter(|g| **g != 0.0).count() > ring.len() / 4, "the ring's weights have no slope");
+}
+
+#[test]
+fn the_search_can_lead_its_shots_and_expects_the_other_fighter_to() {
+    use victris_engine::geom::chebyshev;
+    use victris_engine::rules::AttackKind;
+    use victris_engine::turn::{AttackIn, TargetIn};
+    let e = Engine::shipped("columns-21");
+    let net = random_net(31);
+    let shot = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Projectile { .. })).unwrap() as u8;
+    let aim = |t: &RawTurn| match t.attack {
+        AttackIn::Named { attack, target: TargetIn::Tile(p) } if attack == shot => Some(p),
+        _ => None,
+    };
+    let (mut searched, mut with_leads, mut leads_tried, mut moved_on, mut stood) = (0, 0, 0, 0, 0);
+    for seed in 0..10 {
+        let game = random_game(&e, 200 + seed, 300);
+        let mut s = e.new_match(game.seed);
+        for (k, t) in game.ticks.iter().enumerate() {
+            if k % 5 == 3 && s.result.is_none() {
+                searched += 1;
+                // without the switch every shot is aimed at the tile the other fighter stands on
+                let mut plain = Search::new(&e, &net, PvConfig::default());
+                plain.iterate(&s, 500);
+                for x in 0..2 {
+                    assert!(plain.root()[x].iter().all(|a| aim(&a.0).map(|p| p == s.fighters[1 - x].pos).unwrap_or(true)));
+                }
+                let cfg = PvConfig { lead_at: 100, ..Default::default() };
+                let mut search = Search::new(&e, &net, cfg);
+                search.iterate(&s, 500);
+                let root = search.root();
+                for x in 0..2 {
+                    assert_eq!(root[x].iter().map(|a| a.1).sum::<u32>(), 500);
+                    let at = s.fighters[1 - x].pos;
+                    let leads: Vec<(RawTurn, u32)> = root[x].iter().filter(|a| aim(&a.0).map(|p| p != at).unwrap_or(false)).map(|a| (a.0, a.1)).collect();
+                    if leads.is_empty() {
+                        continue;
+                    }
+                    with_leads += 1;
+                    for (i, a) in root[x].iter().enumerate() {
+                        assert!(root[x][..i].iter().all(|b| b.0 != a.0), "a turn is in the list twice");
+                    }
+                    // the other fighter's turns here: can it move this tick?
+                    let can_move = root[1 - x].iter().any(|a| a.0.mv != RawTurn::IDLE.mv || a.0.dash != RawTurn::IDLE.dash);
+                    stood += !can_move as u32;
+                    for (turn, n) in &leads {
+                        let p = aim(turn).unwrap();
+                        // aimed at a tile the other fighter can get to: a step off, or as far as a dash goes
+                        assert!(chebyshev(p, at) <= if can_move { e.rules.dash_distance } else { 1 } && !e.map.is_wall(p), "aim {p:?} with the other fighter at {at:?}");
+                        // a copy of a shot at the other fighter that is in the list
+                        let direct = RawTurn { attack: AttackIn::Named { attack: shot, target: TargetIn::Tile(at) }, ..*turn };
+                        assert!(root[x].iter().any(|b| b.0 == direct));
+                        // and the engine fires it: the shot's cooldown starts
+                        let mut pair = [RawTurn::IDLE; 2];
+                        pair[x] = *turn;
+                        let mut after = s;
+                        e.step(&mut after, &pair);
+                        assert!(after.fighters[x].cd_attack[shot as usize] > 0 || after.result.is_some(), "the engine did not fire {turn:?}");
+                        leads_tried += (*n > 0) as u32;
+                    }
+                    // the tree moves on under a lead shot as under any turn
+                    if let Some((lead, _)) = leads.iter().filter(|l| l.1 > 0).max_by_key(|l| l.1) {
+                        let other = root[1 - x].iter().max_by_key(|a| a.1).unwrap().0;
+                        let mut again = Search::new(&e, &net, cfg);
+                        again.iterate(&s, 500);
+                        let pair = if x == 0 { [*lead, other] } else { [other, *lead] };
+                        let mut next = s;
+                        e.step(&mut next, &pair);
+                        if next.result.is_none() && again.advance(&pair[0], &pair[1]) {
+                            moved_on += 1;
+                            again.iterate(&next, 300);
+                            assert_eq!(again.root()[0].iter().map(|a| a.1).sum::<u32>(), again.visits());
+                        }
+                    }
+                }
+                // on threads too
+                let mut many = Search::new(&e, &net, cfg);
+                assert_eq!(many.iterate_threads(&s, 500, 3, None), 500);
+                assert_eq!(many.root()[0].iter().map(|a| a.1).sum::<u32>(), 500);
+            }
+            e.step(&mut s, &t.turns);
+        }
+    }
+    println!("{searched} positions searched; lead shots in {with_leads} turn lists ({stood} with the other fighter unable to move this tick), {leads_tried} of them tried, the tree moved on under one {moved_on} times");
+    assert!(with_leads >= 20 && leads_tried >= 50 && moved_on >= 3 && stood >= 3);
 }

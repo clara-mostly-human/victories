@@ -5,13 +5,16 @@
 //!
 //!   aztrain --out NET.json --data FILE [FILE ...] [--init NET.json] [--h1 64] [--h2 32]
 //!           [--epochs 8] [--lr 0.002] [--batch 512] [--lambda 0.5] [--pw 1.0] [--threads 4]
-//!           [--holdout 0.05] [--seed 1] [--map columns-21] [--mirror 1]
+//!           [--holdout 0.05] [--seed 1] [--map columns-21] [--mirror 1] [--widen]
+//!
+//! With --widen an --init network made before the walls three tiles from the opponent were
+//! inputs (`pvnet::IN_OLD`) is given them (`PvNet::widened`); a new network always has them.
 //!
 //! With --mirror (on by default) every position is shown in a mirror image of the map drawn
 //! afresh each time (`pvnet::Sym`), where the map mirrors onto itself.
 
 use victris_engine::azdata::GameLog;
-use victris_engine::pvnet::{layout, loss_grad, Loss, PvNet, Sample, Scratch, Sym};
+use victris_engine::pvnet::{loss_grad, Loss, PvNet, Sample, Scratch, Sym};
 use victris_engine::pvsearch::Rng;
 
 fn arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
@@ -67,6 +70,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let out: String = arg(&args, "--out", String::from("net.json"));
     let init: String = arg(&args, "--init", String::new());
+    let widen = args.iter().any(|a| a == "--widen");
     let (h1, h2): (usize, usize) = (arg(&args, "--h1", 64), arg(&args, "--h2", 32));
     let epochs: usize = arg(&args, "--epochs", 8);
     let lr0: f32 = arg(&args, "--lr", 0.002);
@@ -113,7 +117,13 @@ fn main() {
         to.extend((at..end).map(|i| i as u32));
     }
     let mut net = if init.is_empty() { PvNet::blank(&map, h1, h2, seed) } else { PvNet::load(std::path::Path::new(&init)).expect("cannot read --init") };
-    let len = layout(net.h1, net.h2).len;
+    // `--widen`: a network made before the newest inputs gets them here, with weights of zero,
+    // so it starts from what it knows and learns them on top. Without it the network keeps
+    // the inputs it has, and stays readable by the programs that were built before them.
+    if widen {
+        net = net.widened();
+    }
+    let len = net.layout().len;
     if init.is_empty() {
         // Start every kind of turn at its overall share of the search's visits. Left at zero,
         // the rare kinds need thousands of steps to sink, and all that time every weight is
@@ -131,7 +141,7 @@ fn main() {
             }
         }
         let all: f64 = share.iter().sum();
-        let pb = layout(net.h1, net.h2).pb;
+        let pb = net.layout().pb;
         for c in 0..share.len() {
             net.w[pb + c] = (share[c] / all).ln() as f32;
         }
@@ -201,7 +211,7 @@ fn main() {
             }
         }
         if std::env::var("AZ_DEBUG").is_ok() {
-            let l = layout(net.h1, net.h2);
+            let l = net.layout();
             let norm = |a: usize, b: usize| (net.w[a..b].iter().map(|x| (*x as f64).powi(2)).sum::<f64>() / (b - a).max(1) as f64).sqrt();
             let (mut sat1, mut sat2, mut n1, mut n2) = (0u64, 0u64, 0u64, 0u64);
             let mut pass = victris_engine::pvnet::Pass::default();
