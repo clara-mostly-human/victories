@@ -11,8 +11,9 @@
 //! of picks leads to the next position.
 
 use crate::pvnet::{class_of, encode, turns, Inputs, Pass, PvNet};
-use crate::state::State;
-use crate::turn::RawTurn;
+use crate::rules::AttackKind;
+use crate::state::{FState, State};
+use crate::turn::{AttackIn, RawTurn, TargetIn};
 use crate::Engine;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -29,12 +30,22 @@ pub struct PvConfig {
     pub fpu: f32,
     /// a line never runs longer than this many ticks
     pub depth: u32,
+    /// The most positions the tree holds. When it is full the half the fewest lines ran
+    /// through is dropped (`Search::room`); a position with its turn lists made takes about
+    /// 3 kB, one without about 0.5 kB.
     pub max_nodes: usize,
+    /// Lead shots (`Search::lead`): once this many lines ran through the root, and again each
+    /// time that number doubles, each fighter's most searched shots at the other get copies
+    /// aimed at the tiles the other could be standing on after its move. 0: the shot is only
+    /// ever aimed at the tile the other stands on now.
+    pub lead_at: u32,
+    /// how many of a fighter's shots get the copies
+    pub lead_turns: usize,
 }
 
 impl Default for PvConfig {
     fn default() -> PvConfig {
-        PvConfig { c: 1.5, even: 0.05, even_root: 0.05, fpu: 0.2, depth: 80, max_nodes: 400_000 }
+        PvConfig { c: 1.5, even: 0.05, even_root: 0.05, fpu: 0.2, depth: 80, max_nodes: 400_000, lead_at: 0, lead_turns: 3 }
     }
 }
 
@@ -100,6 +111,8 @@ pub struct Search<'a> {
     buf: Vec<RawTurn>,
     /// length of every line searched, by ticks (the last slot holds that and longer)
     pub depth_hist: [u64; 64],
+    /// lines through the root when its lead shots were last added (0: not yet for this root)
+    led: u32,
 }
 
 /// `Search::root_cells`: the root as a table, `rows` turns of one fighter by `cols` of the
@@ -342,7 +355,7 @@ const ON_ITS_WAY: f32 = 1.0;
 
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, net: &'a PvNet, cfg: PvConfig) -> Search<'a> {
-        Search { e, net, cfg, nodes: Vec::new(), index: Index::default(), path: Vec::new(), pass: Pass::default(), x: Inputs::default(), buf: Vec::new(), depth_hist: [0; 64] }
+        Search { e, net, cfg, nodes: Vec::new(), index: Index::default(), path: Vec::new(), pass: Pass::default(), x: Inputs::default(), buf: Vec::new(), depth_hist: [0; 64], led: 0 }
     }
 
     /// Takes the tree out, to keep while the search itself (which borrows the engine and the
@@ -356,6 +369,7 @@ impl<'a> Search<'a> {
     pub fn start_from(&mut self, tree: Tree) {
         self.nodes = tree.nodes;
         self.index = tree.index;
+        self.led = 0;
     }
 
     /// Lines that ran through the root so far.
@@ -366,6 +380,7 @@ impl<'a> Search<'a> {
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.index.clear();
+        self.led = 0;
     }
 
     pub fn nodes(&self) -> usize {
@@ -400,6 +415,136 @@ impl<'a> Search<'a> {
         select_in(&self.nodes[node], x, &self.cfg)
     }
 
+    /// Lead shots, when they are due (`PvConfig::lead_at`).
+    #[inline]
+    fn lead_when_due(&mut self, root: &State) {
+        if self.cfg.lead_at > 0 {
+            let n = self.nodes[0].n;
+            if n >= self.cfg.lead_at && (self.led == 0 || n >= 2 * self.led) {
+                self.lead(root);
+            }
+        }
+    }
+
+    /// Lead shots. A shot is aimed when it is fired, after both fighters moved, and flies on
+    /// along that aim: aimed at the tile the other fighter stood on, it misses one that
+    /// stepped aside this tick or does before it arrives. The turn lists (`pvnet::turns`) aim
+    /// every shot at the other's tile, so the search could neither fire ahead of a moving
+    /// target nor expect that of the opponent. Here each fighter's most searched shots at the
+    /// root (`PvConfig::lead_turns` of them) get copies aimed at every tile the other fighter's
+    /// own turns can take it to this tick, or, when it cannot move this tick, every tile one
+    /// step from it. A copy starts with its shot's share times the share of the search's lines
+    /// in which the other fighter went to that tile (`even_root` of that spread evenly), so
+    /// the lines go first to the aims the search itself expects; from there the copies are
+    /// turns like any other and earn their lines by their results. Nothing says when to lead
+    /// or which way.
+    ///
+    /// Only the root gets them: deeper in a line the shot is aimed as before. The network's
+    /// kinds of turn do not tell aims apart (`pvnet::class_of`), so a lead shot is saved and
+    /// learned as the shot it is a copy of.
+    pub fn lead(&mut self, root: &State) {
+        if self.nodes.is_empty() || self.nodes[0].rest.is_some() {
+            return;
+        }
+        self.led = self.nodes[0].n.max(1);
+        let e = self.e;
+        let Some(shot) = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Projectile { .. })) else { return };
+        // where fighter `x` stands after the movement of `turn`, the other standing still
+        let after = |x: usize, turn: &RawTurn| -> [i32; 2] {
+            let mut pair = [RawTurn::IDLE; 2];
+            pair[x] = RawTurn { attack: AttackIn::None, ..*turn };
+            let mut s = *root;
+            e.step(&mut s, &pair);
+            s.fighters[x].pos
+        };
+        let moves = |t: &RawTurn| t.mv != RawTurn::IDLE.mv || t.dash != RawTurn::IDLE.dash;
+        for x in 0..2 {
+            let o = 1 - x;
+            let at = root.fighters[o].pos;
+            // the shots at the other fighter's tile, most searched first
+            let mut shots: Vec<usize> = (0..self.nodes[0].acts[x].len())
+                .filter(|&i| {
+                    let a = &self.nodes[0].acts[x][i];
+                    a.n > 0 && matches!(a.turn.attack, AttackIn::Named { attack, target: TargetIn::Tile(t) } if attack as usize == shot && t == at)
+                })
+                .collect();
+            if shots.is_empty() {
+                continue;
+            }
+            shots.sort_by_key(|&i| std::cmp::Reverse(self.nodes[0].acts[x][i].n));
+            shots.truncate(self.cfg.lead_turns);
+            // the tiles the other fighter can be on after its move, each with the share of its lines that went there
+            let mut aims: Vec<([i32; 2], f32)> = vec![(at, 0.0)];
+            let theirs = &self.nodes[0].acts[o];
+            let lines: u32 = theirs.iter().map(|a| a.n).sum();
+            let mut done: Vec<(RawTurn, [i32; 2])> = Vec::new();
+            for a in theirs.iter() {
+                let to = if moves(&a.turn) {
+                    let mv = RawTurn { attack: AttackIn::None, ..a.turn };
+                    match done.iter().find(|d| d.0 == mv) {
+                        Some(d) => d.1,
+                        None => {
+                            let to = after(o, &mv);
+                            done.push((mv, to));
+                            to
+                        }
+                    }
+                } else {
+                    at
+                };
+                let share = a.n as f32 / lines.max(1) as f32;
+                match aims.iter_mut().find(|t| t.0 == to) {
+                    Some(t) => t.1 += share,
+                    None => aims.push((to, share)),
+                }
+            }
+            let f = &root.fighters[o];
+            if aims.len() == 1 && f.alive && f.state == FState::Idle {
+                // it cannot move this tick but can before a shot from farther off arrives
+                for dir in 0..8u8 {
+                    if !e.map.step_blocked(at, dir) {
+                        aims.push((crate::geom::add(at, crate::geom::DIR_VEC[dir as usize]), 0.0));
+                    }
+                }
+                aims[0].1 = 0.0;
+                let even = 1.0 / aims.len() as f32;
+                for t in aims.iter_mut() {
+                    t.1 = even;
+                }
+            } else {
+                let (wide, flat) = (self.cfg.even_root, 1.0 / aims.len() as f32);
+                for t in aims.iter_mut() {
+                    t.1 = (1.0 - wide) * t.1 + wide * flat;
+                }
+            }
+            if aims.len() == 1 {
+                continue;
+            }
+            let mut added = false;
+            for i in shots {
+                let a = self.nodes[0].acts[x][i];
+                let from = if moves(&a.turn) { after(x, &a.turn) } else { root.fighters[x].pos };
+                for &(to, share) in &aims[1..] {
+                    if to == from {
+                        continue;
+                    }
+                    let turn = RawTurn { attack: AttackIn::Named { attack: shot as u8, target: TargetIn::Tile(to) }, ..a.turn };
+                    if self.nodes[0].acts[x].iter().any(|b| b.turn == turn) {
+                        continue;
+                    }
+                    self.nodes[0].acts[x].push(Act { turn, prior: a.prior * share, n: 0, w: 0.0 });
+                    added = true;
+                }
+            }
+            if added {
+                let total: f32 = self.nodes[0].acts[x].iter().map(|a| a.prior).sum();
+                for a in self.nodes[0].acts[x].iter_mut() {
+                    a.prior /= total.max(1e-9);
+                }
+            }
+        }
+    }
+
     /// Runs `count` lines from `root`.
     pub fn iterate(&mut self, root: &State, count: u32) {
         if root.result.is_some() {
@@ -407,6 +552,8 @@ impl<'a> Search<'a> {
         }
         self.ready(root);
         for _ in 0..count {
+            self.room(self.cfg.max_nodes);
+            self.lead_when_due(root);
             self.line(root, None);
         }
     }
@@ -439,6 +586,7 @@ impl<'a> Search<'a> {
             }
             given[best.1] += 1;
             let first = if me == 0 { (mine, best.1) } else { (best.1, mine) };
+            self.room(self.cfg.max_nodes);
             self.line(root, Some(first));
         }
         true
@@ -501,12 +649,19 @@ impl<'a> Search<'a> {
         if threads <= 1 {
             let mut done = 0u32;
             while done < count && !late(done) {
+                self.room(self.cfg.max_nodes);
+                if first.is_none() {
+                    self.lead_when_due(root);
+                }
                 let pair = first.as_mut().map(|f| f.next());
                 self.line(root, pair);
                 done += 1;
             }
             return done;
         }
+        // Room is made here, before any line is under way (a line under way names positions
+        // by their place in the tree): from three quarters full, so the run seldom fills it.
+        self.room(self.cfg.max_nodes / 4 * 3);
         // This thread owns the tree: it alone chooses turns, adds positions and reports
         // results, so the tree stays in one core's cache and needs no lock. What it hands
         // out is the part of a line that does not touch the tree: playing the last turns on
@@ -565,6 +720,9 @@ impl<'a> Search<'a> {
                     if started >= count || late(started) {
                         closing = true;
                         break;
+                    }
+                    if first.is_none() {
+                        self.lead_when_due(root);
                     }
                     let pair = first.as_mut().map(|f| f.next());
                     started += 1;
@@ -1268,6 +1426,21 @@ impl<'a> Search<'a> {
             self.clear();
             return false;
         };
+        self.led = 0;
+        self.keep_under(start, 0);
+        // the new root looks as wide as a root does (one whose turn lists are not made yet
+        // gets them, as wide, from `ready`)
+        if self.nodes[0].rest.is_none() {
+            widen(&mut self.nodes[0].acts, self.cfg.even, self.cfg.even_root);
+        }
+        true
+    }
+
+    /// The tree cut down to the position `start` and what is under it, leaving out every
+    /// position fewer than `least` lines ran through (and so everything under those). The
+    /// turns that led to a position left out keep their counts and results: a line that takes
+    /// them again finds no position there and makes it anew.
+    fn keep_under(&mut self, start: u32, least: u32) {
         let mut old = std::mem::take(&mut self.nodes);
         self.index.clear();
         // copy the kept part in the order found: each position's children follow it
@@ -1278,6 +1451,9 @@ impl<'a> Search<'a> {
             let kids = std::mem::take(&mut old[id].kids);
             let mut renamed = Vec::with_capacity(kids.len());
             for (pair, child) in kids {
+                if old[child as usize].n < least {
+                    continue;
+                }
                 let new_id = order.len() as u32;
                 order.push(child);
                 renamed.push((pair, new_id));
@@ -1288,12 +1464,30 @@ impl<'a> Search<'a> {
         }
         let mut slots: Vec<Option<Node>> = old.into_iter().map(Some).collect();
         self.nodes = order.iter().filter_map(|id| slots[*id as usize].take()).collect();
-        // the new root looks as wide as a root does (one whose turn lists are not made yet
-        // gets them, as wide, from `ready`)
-        if self.nodes[0].rest.is_none() {
-            widen(&mut self.nodes[0].acts, self.cfg.even, self.cfg.even_root);
+    }
+
+    /// Room for new positions when the tree holds `full` of them or more: it is cut down to
+    /// the half of `PvConfig::max_nodes` that the most lines ran through (a position is kept
+    /// with everything above it, since no position has more lines than the one it came
+    /// from). What goes is the part the search had all but stopped looking at; its results
+    /// stay in the counts of the turns that led there.
+    ///
+    /// Without this a full tree took no new positions: every further line ended where an
+    /// earlier one had, and the rest of the tick's thinking, and all of the pondering, added
+    /// nothing. At 300 ms a tick with pondering the tree fills within two ticks.
+    fn room(&mut self, full: usize) {
+        if self.nodes.len() < full.max(2) {
+            return;
         }
-        true
+        let target = (self.cfg.max_nodes / 2).max(1);
+        if self.nodes.len() <= target {
+            return;
+        }
+        let mut lines: Vec<u32> = self.nodes.iter().map(|nd| nd.n).collect();
+        // the fewest lines a kept position has: more than the first one that does not fit
+        let (_, first_out, _) = lines.select_nth_unstable_by(target, |a, b| b.cmp(a));
+        let least = *first_out + 1;
+        self.keep_under(0, least);
     }
 }
 

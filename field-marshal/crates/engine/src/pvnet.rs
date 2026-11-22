@@ -15,7 +15,13 @@
 //!
 //! The inputs are facts of the board, mostly yes/no, laid out so that "the opponent is two tiles
 //! north-east of me" is one input of its own: no input is a judgment of whether something is
-//! good. Only the inputs that are not zero are passed on (`Inputs`), about 60 of 611.
+//! good. Only the inputs that are not zero are passed on (`Inputs`), about 60 of 635.
+//!
+//! The walls are given three tiles out around both fighters: a push throws a fighter three
+//! tiles, so a wall three tiles behind either is a slam. Networks made before the opponent's
+//! third ring was added (611 inputs, walls two tiles out around the opponent) still load and
+//! play exactly as they did; `PvNet::widened` gives such a network the new inputs with
+//! weights of zero, so it starts from everything it knows and learns the ring on top.
 
 use crate::geom::{add, chebyshev, DIR_VEC, SUB};
 use crate::map::PadKind;
@@ -53,8 +59,15 @@ const B_WALL_T: usize = B_WALL + N_WALL;
 const B_THREAT: usize = B_WALL_T + N_WALL_T;
 const B_PADS: usize = B_THREAT + 2 * TH;
 const B_CTX: usize = B_PADS + 8 * PADS;
+/// Number of inputs of one view in networks made before the opponent's third ring of walls.
+pub const IN_OLD: usize = B_CTX + 3;
+/// The walls exactly three tiles from the opponent (the outer ring of the 7 x 7 around it; the
+/// inner 5 x 5 is at `B_WALL_T`). They come after every older input, so an older network's
+/// weights are the first `IN_OLD` rows of a newer one's.
+const B_RING_T: usize = IN_OLD;
+const N_RING_T: usize = (8 * R_WALL) as usize;
 /// Number of inputs of one view.
-pub const IN: usize = B_CTX + 3;
+pub const IN: usize = B_RING_T + N_RING_T;
 /// The most inputs that can be other than zero at once.
 pub const CAP: usize = 192;
 
@@ -62,13 +75,15 @@ pub const CAP: usize = 192;
 #[derive(Clone)]
 pub struct Inputs {
     pub n: usize,
+    /// how many of them, the first, are inputs an `IN_OLD` network has
+    pub n0: usize,
     pub idx: [u16; CAP],
     pub val: [f32; CAP],
 }
 
 impl Default for Inputs {
     fn default() -> Inputs {
-        Inputs { n: 0, idx: [0; CAP], val: [0.0; CAP] }
+        Inputs { n: 0, n0: 0, idx: [0; CAP], val: [0.0; CAP] }
     }
 }
 
@@ -252,6 +267,19 @@ pub fn encode(e: &Engine, s: &State, x: usize, out: &mut Inputs) {
     out.put(B_CTX, s.tick as f32 / 600.0);
     out.put(B_CTX + 1, s.zone_radius.clamp(0, 15) as f32 / 15.0);
     out.on(B_CTX + 2);
+    out.n0 = out.n;
+    // the ring three tiles from the opponent, row by row
+    let mut k = 0;
+    for wy in -R_WALL..=R_WALL {
+        for wx in -R_WALL..=R_WALL {
+            if wx.abs().max(wy.abs()) == R_WALL {
+                if wall([o.pos[0] + wx, o.pos[1] + wy]) {
+                    out.on(B_RING_T + k);
+                }
+                k += 1;
+            }
+        }
+    }
 }
 
 pub const MOVES: usize = 17;
@@ -454,9 +482,9 @@ pub struct Layout {
     pub len: usize,
 }
 
-pub fn layout(h1: usize, h2: usize) -> Layout {
+pub fn layout(n_in: usize, h1: usize, h2: usize) -> Layout {
     let t1 = 0;
-    let b1 = t1 + IN * h1;
+    let b1 = t1 + n_in * h1;
     let t2 = b1 + h1;
     let b2 = t2 + h1 * h2;
     let vw = b2 + h2;
@@ -469,6 +497,9 @@ pub fn layout(h1: usize, h2: usize) -> Layout {
 #[derive(Clone, Debug)]
 pub struct PvNet {
     pub map: String,
+    /// inputs of one view this network reads: `IN`, or `IN_OLD` for one made before the
+    /// opponent's third ring of walls
+    pub n_in: usize,
     pub h1: usize,
     pub h2: usize,
     pub w: Vec<f32>,
@@ -485,7 +516,7 @@ pub struct Eval {
 impl PvNet {
     /// A network that knows nothing: every position even, every turn as likely as any other.
     pub fn blank(map: &str, h1: usize, h2: usize, seed: u64) -> PvNet {
-        let l = layout(h1, h2);
+        let l = layout(IN, h1, h2);
         let mut w = vec![0.0f32; l.len];
         let mut rng = seed | 1;
         let mut r = |scale: f32| {
@@ -501,7 +532,32 @@ impl PvNet {
             *v = r(0.15);
         }
         // the two outputs start at zero
-        PvNet { map: map.to_string(), h1, h2, w }
+        PvNet { map: map.to_string(), n_in: IN, h1, h2, w }
+    }
+
+    /// Where each part of this network's weights starts.
+    pub fn layout(&self) -> Layout {
+        layout(self.n_in, self.h1, self.h2)
+    }
+
+    /// How many of a view's inputs this network reads: all, or the older ones only.
+    #[inline]
+    fn count(&self, x: &Inputs) -> usize {
+        if self.n_in == IN { x.n } else { x.n0 }
+    }
+
+    /// This network reading every input there is now: one made with fewer gets the new ones
+    /// with weights of zero, so it reads every position exactly as before until it is trained on.
+    pub fn widened(&self) -> PvNet {
+        if self.n_in == IN {
+            return self.clone();
+        }
+        let old = self.layout();
+        let mut w = Vec::with_capacity(layout(IN, self.h1, self.h2).len);
+        w.extend_from_slice(&self.w[..old.b1]);
+        w.resize(IN * self.h1, 0.0);
+        w.extend_from_slice(&self.w[old.b1..]);
+        PvNet { map: self.map.clone(), n_in: IN, h1: self.h1, h2: self.h2, w }
     }
 
     /// One pass over one view's inputs.
@@ -514,9 +570,9 @@ impl PvNet {
     /// only this much of each view.
     pub fn hidden(&self, x: &Inputs, p: &mut Pass) {
         let (h1, h2) = (self.h1, self.h2);
-        let l = layout(h1, h2);
+        let l = self.layout();
         let w = &self.w;
-        layer(&mut p.z1[..h1], &w[l.b1..l.b1 + h1], x.n, |k| {
+        layer(&mut p.z1[..h1], &w[l.b1..l.b1 + h1], self.count(x), |k| {
             let i = x.idx[k] as usize;
             (x.val[k], &w[l.t1 + i * h1..l.t1 + (i + 1) * h1])
         });
@@ -535,7 +591,7 @@ impl PvNet {
     /// `hidden` left in `p`.
     pub fn numbers(&self, p: &mut Pass) {
         let h2 = self.h2;
-        let l = layout(self.h1, h2);
+        let l = self.layout();
         let w = &self.w;
         let a2 = &p.a2;
         layer(&mut p.logits, &w[l.pb..l.pb + CLASSES], h2, |j| (a2[j], &w[l.tp + j * CLASSES..l.tp + (j + 1) * CLASSES]));
@@ -545,7 +601,7 @@ impl PvNet {
     /// with respect to this view's score (`dg`) and to its number for each kind of turn.
     pub fn backward(&self, x: &Inputs, p: &Pass, dg: f32, dlogits: &[f32; CLASSES], grad: &mut [f32]) {
         let (h1, h2) = (self.h1, self.h2);
-        let l = layout(h1, h2);
+        let l = self.layout();
         let w = &self.w;
         grad[l.vb] += dg;
         axpy(&mut grad[l.pb..l.pb + CLASSES], 1.0, dlogits);
@@ -567,7 +623,7 @@ impl PvNet {
             dz1[i] = dot(&w[l.t2 + i * h2..l.t2 + (i + 1) * h2], &dz2[..h2]) * act_d(p.z1[i]);
         }
         axpy(&mut grad[l.b1..l.b1 + h1], 1.0, &dz1[..h1]);
-        for k in 0..x.n {
+        for k in 0..self.count(x) {
             let i = x.idx[k] as usize;
             axpy(&mut grad[l.t1 + i * h1..l.t1 + (i + 1) * h1], x.val[k], &dz1[..h1]);
         }
@@ -586,7 +642,7 @@ impl PvNet {
     }
 
     pub fn save(&self, path: &std::path::Path, note: &serde_json::Value) -> std::io::Result<()> {
-        let json = serde_json::json!({ "kind": "pvnet", "map": self.map, "h1": self.h1, "h2": self.h2, "in": IN, "classes": CLASSES, "note": note, "w": self.w });
+        let json = serde_json::json!({ "kind": "pvnet", "map": self.map, "h1": self.h1, "h2": self.h2, "in": self.n_in, "classes": CLASSES, "note": note, "w": self.w });
         std::fs::write(path, serde_json::to_string(&json).unwrap_or_default())
     }
 
@@ -595,14 +651,15 @@ impl PvNet {
         let v: serde_json::Value = serde_json::from_str(&text).ok()?;
         let h1 = v.get("h1")?.as_u64()? as usize;
         let h2 = v.get("h2")?.as_u64()? as usize;
-        if v.get("in")?.as_u64()? as usize != IN || v.get("classes")?.as_u64()? as usize != CLASSES || h1 > MAX_H || h2 > MAX_H {
+        let n_in = v.get("in")?.as_u64()? as usize;
+        if (n_in != IN && n_in != IN_OLD) || v.get("classes")?.as_u64()? as usize != CLASSES || h1 > MAX_H || h2 > MAX_H {
             return None;
         }
         let w: Vec<f32> = v.get("w")?.as_array()?.iter().filter_map(|x| x.as_f64().map(|f| f as f32)).collect();
-        if w.len() != layout(h1, h2).len {
+        if w.len() != layout(n_in, h1, h2).len {
             return None;
         }
-        Some(PvNet { map: v.get("map").and_then(|m| m.as_str()).unwrap_or("").to_string(), h1, h2, w })
+        Some(PvNet { map: v.get("map").and_then(|m| m.as_str()).unwrap_or("").to_string(), n_in, h1, h2, w })
     }
 }
 

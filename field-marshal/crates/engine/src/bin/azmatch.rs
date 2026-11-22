@@ -10,7 +10,10 @@
 //! `pvd:NET.json:N:K` (the network-led search with K times the lines at a standoff: what a
 //! memory of that one situation, searched deep beforehand, could be worth),
 //! `pvt:NET.json:N:K` (the network-led search on K threads, `Search::iterate_threads`;
-//! against `pv` at the same N it shows what a line from several threads is worth), or
+//! against `pv` at the same N it shows what a line from several threads is worth),
+//! `pvl:NET.json:N[:AT]` (the network-led search with lead shots, `Search::lead`, from AT
+//! lines on, 256 unless given), `pvn:NET.json:N:NODES` (the network-led search with a tree
+//! of at most NODES positions, `PvConfig::max_nodes`), or
 //! `flag`/`pv` with `Nms` in place of N for a time limit a tick. Each fighter runs its own search every tick it can act, fresh, and plays its
 //! most visited turn. Both searches are repeatable, so without help every game would be one of
 //! two: each pair of games starts with --open ticks of random steps (no attacks, no dashes),
@@ -48,6 +51,10 @@ struct Player {
     deep: u32,
     /// threads of one search (`Search::iterate_threads`); 1: the plain search
     search_threads: usize,
+    /// lead shots from this many lines through the root on (`PvConfig::lead_at`); 0: none
+    lead: u32,
+    /// the most positions in the tree (`PvConfig::max_nodes`); 0: the default
+    nodes: usize,
 }
 
 /// The commonest situation of real arena-21 games: the fighters four tiles apart, both free
@@ -66,10 +73,10 @@ fn parse(spec: &str) -> Player {
         None => Limit::Lines(s.parse().expect("bad line count")),
     };
     match parts.as_slice() {
-        ["flag", l] => Player { net: None, limit: limit(l), weigh: 0.0, trust: 1.0, deep: 1, search_threads: 1 },
-        ["pv", path, l] => Player { net: Some(PvNet::load(std::path::Path::new(path)).expect("cannot read the network")), limit: limit(l), weigh: 0.0, trust: 1.0, deep: 1, search_threads: 1 },
-        ["pvd", path, l, k] => Player { net: Some(PvNet::load(std::path::Path::new(path)).expect("cannot read the network")), limit: limit(l), weigh: 0.0, trust: 1.0, deep: k.parse().expect("bad multiple"), search_threads: 1 },
-        ["pvt", path, l, k] => Player { net: Some(PvNet::load(std::path::Path::new(path)).expect("cannot read the network")), limit: limit(l), weigh: 0.0, trust: 1.0, deep: 1, search_threads: k.parse().expect("bad thread count") },
+        ["flag", l] => Player { net: None, limit: limit(l), weigh: 0.0, trust: 1.0, deep: 1, search_threads: 1, lead: 0, nodes: 0 },
+        ["pv", path, l] => Player { net: Some(PvNet::load(std::path::Path::new(path)).expect("cannot read the network")), limit: limit(l), weigh: 0.0, trust: 1.0, deep: 1, search_threads: 1, lead: 0, nodes: 0 },
+        ["pvd", path, l, k] => Player { net: Some(PvNet::load(std::path::Path::new(path)).expect("cannot read the network")), limit: limit(l), weigh: 0.0, trust: 1.0, deep: k.parse().expect("bad multiple"), search_threads: 1, lead: 0, nodes: 0 },
+        ["pvt", path, l, k] => Player { net: Some(PvNet::load(std::path::Path::new(path)).expect("cannot read the network")), limit: limit(l), weigh: 0.0, trust: 1.0, deep: 1, search_threads: k.parse().expect("bad thread count"), lead: 0, nodes: 0 },
         ["pvw", path, l, rest @ ..] if rest.len() <= 2 => Player {
             net: Some(PvNet::load(std::path::Path::new(path)).expect("cannot read the network")),
             limit: limit(l),
@@ -77,7 +84,20 @@ fn parse(spec: &str) -> Player {
             trust: rest.get(1).map(|w| w.parse().expect("bad trust")).unwrap_or(1.0),
             deep: 1,
             search_threads: 1,
+            lead: 0,
+            nodes: 0,
         },
+        ["pvl", path, l, rest @ ..] if rest.len() <= 1 => Player {
+            net: Some(PvNet::load(std::path::Path::new(path)).expect("cannot read the network")),
+            limit: limit(l),
+            weigh: 0.0,
+            trust: 1.0,
+            deep: 1,
+            search_threads: 1,
+            lead: rest.first().map(|w| w.parse().expect("bad line count")).unwrap_or(256),
+            nodes: 0,
+        },
+        ["pvn", path, l, n] => Player { net: Some(PvNet::load(std::path::Path::new(path)).expect("cannot read the network")), limit: limit(l), weigh: 0.0, trust: 1.0, deep: 1, search_threads: 1, lead: 0, nodes: n.parse().expect("bad position count") },
         _ => panic!("bad player: {spec}"),
     }
 }
@@ -88,7 +108,11 @@ fn think(e: &Engine, p: &Player, flag: mcts::Config, s: &State, x: usize) -> (Ra
     let mut lines = 0u64;
     match &p.net {
         Some(net) => {
-            let mut search = pvsearch::Search::new(e, net, PvConfig::default());
+            let mut cfg = PvConfig { lead_at: p.lead, ..Default::default() };
+            if p.nodes > 0 {
+                cfg.max_nodes = p.nodes;
+            }
+            let mut search = pvsearch::Search::new(e, net, cfg);
             let mut held = 0u32;
             match p.limit {
                 Limit::Lines(n) => {
