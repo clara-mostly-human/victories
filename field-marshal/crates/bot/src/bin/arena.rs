@@ -52,4 +52,12 @@ fn main() {
             v(0), v(1), v(2), v(3), v(4), v(5), v(6), v(7), v(8)
         );
     }
+    // with `tree_pv_fog_ticks`: how good the guesses at the hidden opponent were
+    let gs: Vec<f64> = marshal::policy::PV_GUESS_STATS.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed) as f64).collect();
+    if gs[0] > 0.0 {
+        println!(
+            "guesses at the hidden opponent: {:.0} ticks a game decided over them, {:.1} guesses a tick; weight on the tile it really stood on {:.0}%; likeliest guess right {:.0}%, within one tile {:.0}%; the standing ghost right {:.0}%, within one tile {:.0}%",
+            gs[0] / g, gs[6] / gs[0], gs[1] / gs[0] / 1e4, 100.0 * gs[2] / gs[0], 100.0 * gs[3] / gs[0], 100.0 * gs[4] / gs[0], 100.0 * gs[5] / gs[0]
+        );
+    }
 }

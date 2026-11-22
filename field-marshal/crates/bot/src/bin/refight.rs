@@ -14,6 +14,10 @@
 //! a search of N lines, and the table solved as a game (regret matching): what share each turn
 //! gets when neither side can be exploited, beside the share the search gave it.
 //!
+//! --weigh SHARE turns on `tree_pv_weigh` (the turn chosen by `Search::weigh`, SHARE of the
+//! lines held back for it) and prints what each of our turns came to; --trust T sets
+//! `tree_pv_trust` (1 unless given).
+//!
 //! --iters fixes the lines searched (a cloud core is slower than the Mac, so the live
 //! thinking time would search fewer). --pv points `tree_pv_dir` at another folder of networks.
 //! A tick is searched fresh unless the tick before it was asked for too: ask for a run of
@@ -46,6 +50,12 @@ fn main() {
     }
     if let Some(dir) = opt("--pv") {
         pbv["tree_pv_dir"] = Value::from(dir);
+    }
+    if let Some(w) = opt("--weigh").and_then(|s| s.parse::<f64>().ok()) {
+        pbv["tree_pv_weigh"] = Value::from(w);
+    }
+    if let Some(w) = opt("--trust").and_then(|s| s.parse::<f64>().ok()) {
+        pbv["tree_pv_trust"] = Value::from(w);
     }
     let pb = Playbook::from_json(pbv.get("name").and_then(Value::as_str).unwrap_or("refight"), &pbv);
     let ticks: Vec<i64> = opt("--ticks").unwrap_or_default().split(',').filter_map(|s| s.trim().parse().ok()).collect();
@@ -118,6 +128,14 @@ fn main() {
                     if f[1 - me].power_until > root.root.tick { f[1 - me].power_until - root.root.tick } else { 0 },
                     if me == 0 { root.value } else { -root.value }
                 );
+                if !root.weighed.is_empty() {
+                    println!("  our turns weighed, the turn to play first (worth | against the turns expected of them | against their best answer to our usual play | lines):");
+                    for w in root.weighed.iter() {
+                        // at trust 1 no answer of theirs is looked for
+                        let answer = if w.worst_to == RawTurn::IDLE && w.worst == w.expected { String::from("(not looked for)") } else { format!("{:+.3} to {}", w.worst, show(&w.worst_to)) };
+                        println!("    {:+.3} | {:+.3} | {} | {:>6} lines  <- {}", w.worth, w.expected, answer, w.lines, show(&w.turn));
+                    }
+                }
                 let is_slam = |turn: &RawTurn| turn.dash != DirIn::None && matches!(turn.attack, AttackIn::Named { attack, .. } if matches!(t.engine.rules.attacks[attack as usize].kind, AttackKind::Burst { .. }));
                 if net.is_none() && !pb.tree_pv_dir.is_empty() {
                     net = victris_engine::pvnet::PvNet::load(&std::path::Path::new(&pb.tree_pv_dir).join(format!("{}.json", t.engine.map.name)));

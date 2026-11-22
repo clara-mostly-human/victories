@@ -6,7 +6,16 @@
 //! files.
 //!
 //!   azgen --out FILE --games N [--net NET.json] [--iters 800] [--seed 1] [--threads 4]
-//!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25] [--earned 0]
+//!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25] [--earned 0] [--mix 0]
+//!
+//! Which turn is played: before tick --open one drawn in proportion to the search's visits;
+//! after it the most visited one, or with chance --wander a drawn one. That plays a turn the
+//! search gave a third of its visits about one time in twelve: where the right play is a
+//! mix (both move at once), self-play then carries a threat out far less often than its own
+//! search thinks right, and the network never learns what the threat costs. With --mix 1
+//! (the network-led search only) both fighters' turns are drawn at every tick in proportion
+//! to the visits each turn earned (`Search::root_earned`: the search's own mix, without the
+//! visits the wider root alone gave), so every turn is played as often as the search rates it.
 //!
 //! --wide makes the search look wider at the root than anywhere else, so self-play tries turns
 //! the network thinks little of. With --earned 1 what is saved for the trainer is the visits
@@ -41,6 +50,7 @@ fn main() {
     let open: i32 = arg(&args, "--open", 12);
     let wide: f32 = arg(&args, "--wide", 0.25);
     let earned: u32 = arg(&args, "--earned", 0);
+    let mix: u32 = arg(&args, "--mix", 0);
     let net_path: String = arg(&args, "--net", String::new());
     let net = if net_path.is_empty() { None } else { Some(PvNet::load(std::path::Path::new(&net_path)).expect("cannot read the network")) };
     let e = Engine::shipped(&map);
@@ -76,13 +86,21 @@ fn main() {
                                 continue;
                             }
                             let mut pol: Option<[[u8; CLASSES]; 2]> = None;
+                            // with --mix: what each turn earned, to draw the turns played from
+                            let mut drawn: Option<[Vec<(RawTurn, u32)>; 2]> = None;
                             let (visits, q): ([Vec<(RawTurn, u32)>; 2], Option<f32>) = match pv.as_mut() {
                                 Some(p) => {
                                     p.iterate(&s, iters);
                                     let r = p.root();
-                                    if earned > 0 {
+                                    if earned > 0 || mix > 0 {
                                         let k = p.root_earned();
-                                        pol = Some([shares_earned(&k[0]), shares_earned(&k[1])]);
+                                        if earned > 0 {
+                                            pol = Some([shares_earned(&k[0]), shares_earned(&k[1])]);
+                                        }
+                                        if mix > 0 {
+                                            let whole = |x: usize| k[x].iter().map(|a| (a.0, a.1.round() as u32)).collect::<Vec<_>>();
+                                            drawn = Some([whole(0), whole(1)]);
+                                        }
                                     }
                                     ([r[0].iter().map(|a| (a.0, a.1)).collect(), r[1].iter().map(|a| (a.0, a.1)).collect()], Some(p.value()))
                                 }
@@ -97,7 +115,10 @@ fn main() {
                             st[5] += iters as u64;
                             searched += 1;
                             let w = if s.tick < open { 1.0 } else { wander };
-                            let pair = [pick(&visits[0], w, &mut rng), pick(&visits[1], w, &mut rng)];
+                            let pair = match &drawn {
+                                Some(d) => [pick(&d[0], 1.0, &mut rng), pick(&d[1], 1.0, &mut rng)],
+                                None => [pick(&visits[0], w, &mut rng), pick(&visits[1], w, &mut rng)],
+                            };
                             log.ticks.push(TickLog { turns: pair, q, pol: Some(pol.unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])])) });
                             e.step(&mut s, &pair);
                             if let Some(p) = pv.as_mut() {

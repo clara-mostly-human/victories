@@ -4,7 +4,7 @@
 //! tree from one tick to the next.
 
 use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
-use victris_engine::pvnet::{class_of, encode, layout, loss_grad, turns, Inputs, PvNet, Sample, Scratch, Sym, CLASSES, IN};
+use victris_engine::pvnet::{act, class_of, encode, layout, loss_grad, turns, Inputs, Pass, PvNet, Sample, Scratch, Sym, CLASSES, IN};
 use victris_engine::pvsearch::{pick, PvConfig, Rng, Search};
 use victris_engine::{Engine, RawTurn};
 
@@ -410,4 +410,239 @@ fn a_lesson_without_shares_teaches_the_value_and_leaves_the_moves_alone() {
         }
     }
     assert!(moved_value, "the value was not taught");
+}
+
+#[test]
+fn weighing_compares_our_turns_against_what_is_expected_and_their_best_answer() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(17);
+    let mut s = e.new_match(5);
+    let mut weighed_ticks = 0;
+    for _ in 0..40 {
+        if s.result.is_some() {
+            break;
+        }
+        let mut search = Search::new(&e, &net, PvConfig::default());
+        search.iterate(&s, 600);
+        let before = search.root();
+        let total: u32 = before[0].iter().map(|a| a.1).sum();
+        let w = search.weigh(&s, 0, 400, 0.5);
+        assert!(!w.is_empty() && w.len() <= 8);
+        if w.len() > 1 {
+            weighed_ticks += 1;
+            // only turns the search took seriously are weighed, and no turn twice
+            for (k, a) in w.iter().enumerate() {
+                let seen = before[0].iter().find(|b| b.0 == a.turn).expect("a weighed turn is one of the root's");
+                assert!(seen.1 as u64 * 50 >= total as u64, "a turn with {} of {} visits was weighed", seen.1, total);
+                assert!(w[..k].iter().all(|b| b.turn != a.turn));
+                // what it is worth lies between its expected result and its result against their answer
+                let (lo, hi) = (a.expected.min(a.worst), a.expected.max(a.worst));
+                assert!(a.worth >= lo - 1e-4 && a.worth <= hi + 1e-4, "worth {} outside {} to {}", a.worth, lo, hi);
+                assert!((-1.0..=1.0).contains(&a.expected) && (-1.0..=1.0).contains(&a.worst));
+                // their answer is one turn, the same against every turn of ours
+                assert_eq!(a.worst_to, w[0].worst_to);
+            }
+            // the most visited turn is always among them
+            let top = before[0].iter().max_by_key(|a| a.1).unwrap().0;
+            assert!(w.iter().any(|a| a.turn == top));
+            // the turn to play is the search's own choice, unless another did better against the mix
+            assert!(w[0].turn == top || w[0].worth > w.iter().find(|a| a.turn == top).unwrap().worth);
+            // it spent lines, and no more than it was given
+            let after: u32 = search.root()[0].iter().map(|a| a.1).sum();
+            assert!(after > total && after <= total + 400, "{} lines spent of 400", after - total);
+            // the same search weighed again the same way gives the same turn
+            let mut again = Search::new(&e, &net, PvConfig::default());
+            again.iterate(&s, 600);
+            assert_eq!(again.weigh(&s, 0, 400, 0.5)[0].turn, w[0].turn);
+            // all trust: worth is the expected result, and no answer is looked for
+            let mut all = Search::new(&e, &net, PvConfig::default());
+            all.iterate(&s, 600);
+            assert!(all.weigh(&s, 0, 400, 1.0).iter().all(|a| (a.worth - a.expected).abs() < 1e-6 && a.worst_to == RawTurn::IDLE));
+            // none: the result against their best answer alone
+            let mut none = Search::new(&e, &net, PvConfig::default());
+            none.iterate(&s, 600);
+            let n = none.weigh(&s, 0, 400, 0.0);
+            assert!(n.iter().all(|a| (a.worth - a.worst).abs() < 1e-6));
+        }
+        let pair = [w[0].turn, search.best(1)];
+        e.step(&mut s, &pair);
+    }
+    assert!(weighed_ticks > 10, "most ticks give a choice to weigh");
+    // nothing searched: the plain answer, no lines
+    let mut empty = Search::new(&e, &net, PvConfig::default());
+    assert_eq!(empty.weigh(&e.new_match(5), 0, 100, 0.5).len(), 1);
+}
+
+#[test]
+fn threads_share_one_tree_and_leave_its_counts_whole() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(17);
+    let mut s = e.new_match(5);
+    for tick in 0..24 {
+        if s.result.is_some() {
+            break;
+        }
+        // one thread through the new entry is the plain search, line for line
+        let mut plain = Search::new(&e, &net, PvConfig::default());
+        plain.iterate(&s, 600);
+        let mut one = Search::new(&e, &net, PvConfig::default());
+        assert_eq!(one.iterate_threads(&s, 600, 1, None), 600);
+        assert_eq!(format!("{:?}", one.root()), format!("{:?}", plain.root()));
+        // three threads: every line counted once at the root and below, nothing left "on its way"
+        let mut many = Search::new(&e, &net, PvConfig::default());
+        assert_eq!(many.iterate_threads(&s, 600, 3, None), 600);
+        let root = many.root();
+        assert_eq!(many.visits(), 600);
+        for x in 0..2 {
+            assert_eq!(root[x].iter().map(|a| a.1).sum::<u32>(), 600);
+            for a in root[x].iter() {
+                assert!(a.2.abs() <= 1.0 + 1e-4, "a turn's mean result {} is outside -1..1: a line was left on its way", a.2);
+            }
+        }
+        // what one fighter won on the lines the other lost
+        let sum = |x: usize| root[x].iter().map(|a| a.1 as f64 * a.2 as f64).sum::<f64>();
+        assert!((sum(0) + sum(1)).abs() < 0.05, "the two fighters' results do not cancel: {} and {}", sum(0), sum(1));
+        // the positions below hold the root's lines between them (but for lines that ended the game)
+        let below: u32 = many.positions(&s).iter().filter(|p| p.0 == 1).map(|p| p.1 + 1).sum();
+        assert!(below <= 600, "{below} lines counted one tick down, 600 run");
+        // pondering on threads: every line begins with our turn
+        let ours = many.best(0);
+        let before = root[0].iter().find(|a| a.0 == ours).unwrap().1;
+        assert_eq!(many.ponder_threads(&s, 0, &ours, 300, 3, None), Some(300));
+        let after = many.root();
+        assert_eq!(after[0].iter().find(|a| a.0 == ours).unwrap().1, before + 300);
+        assert_eq!(after[1].iter().map(|a| a.1).sum::<u32>(), 900);
+        // lines kept short: many of them end on a position already there, or wait for a pair
+        // another line is having played, and every one is still counted once
+        let mut short = Search::new(&e, &net, PvConfig { depth: 2, ..PvConfig::default() });
+        assert_eq!(short.iterate_threads(&s, 500, 4, None), 500);
+        let r = short.root();
+        assert_eq!(short.visits(), 500);
+        for x in 0..2 {
+            assert_eq!(r[x].iter().map(|a| a.1).sum::<u32>(), 500);
+            assert!(r[x].iter().all(|a| a.2.abs() <= 1.0 + 1e-4), "a short line was left on its way");
+        }
+        // a time already past stops the threads at once
+        let mut none = Search::new(&e, &net, PvConfig::default());
+        assert!(none.iterate_threads(&s, 100_000, 3, Some(std::time::Instant::now())) < 400);
+        // the tree is kept and moved on as ever
+        let pair = [many.best(0), many.best(1)];
+        let old = s;
+        e.step(&mut s, &pair);
+        if s.result.is_none() && tick % 3 == 0 {
+            assert!(many.advance_to(&old, &s));
+            assert!(many.visits() > 0);
+            many.iterate_threads(&s, 200, 3, None);
+            let r = many.root();
+            assert_eq!(r[0].iter().map(|a| a.1).sum::<u32>(), many.visits());
+        }
+    }
+}
+
+#[test]
+fn a_pass_in_blocks_is_the_plain_pass_to_the_last_bit() {
+    // `PvNet::forward` works a layer through in blocks of units; a unit's sum must still be its
+    // bias and then each input times its weight, added in the order the inputs come
+    let e = Engine::shipped("columns-21");
+    let mut rng = Rng::new(3);
+    for (h1, h2) in [(64usize, 32usize), (24, 12), (37, 13), (128, 128)] {
+        let mut net = PvNet::blank("columns-21", h1, h2, 5 + h1 as u64);
+        for w in net.w.iter_mut() {
+            *w += (rng.unit() as f32 - 0.5) * 0.7;
+        }
+        let l = layout(h1, h2);
+        let w = &net.w;
+        let game = random_game(&e, 40 + h1 as u64, 60);
+        let mut s = e.new_match(game.seed);
+        let (mut x, mut p) = (Inputs::default(), Pass::default());
+        for t in game.ticks.iter().take(60) {
+            for f in 0..2 {
+                encode(&e, &s, f, &mut x);
+                net.forward(&x, &mut p);
+                let mut z1: Vec<f32> = w[l.b1..l.b1 + h1].to_vec();
+                for k in 0..x.n {
+                    for j in 0..h1 {
+                        z1[j] += x.val[k] * w[l.t1 + x.idx[k] as usize * h1 + j];
+                    }
+                }
+                let mut z2: Vec<f32> = w[l.b2..l.b2 + h2].to_vec();
+                for i in 0..h1 {
+                    for j in 0..h2 {
+                        z2[j] += act(z1[i]) * w[l.t2 + i * h2 + j];
+                    }
+                }
+                let mut numbers: Vec<f32> = w[l.pb..l.pb + CLASSES].to_vec();
+                for j in 0..h2 {
+                    for c in 0..CLASSES {
+                        numbers[c] += act(z2[j]) * w[l.tp + j * CLASSES + c];
+                    }
+                }
+                let bits = |v: &[f32]| v.iter().map(|a| a.to_bits()).collect::<Vec<u32>>();
+                assert_eq!(bits(&p.z1[..h1]), bits(&z1), "first layer, {h1} and {h2} units");
+                assert_eq!(bits(&p.z2[..h2]), bits(&z2), "second layer, {h1} and {h2} units");
+                assert_eq!(bits(&p.logits), bits(&numbers), "turn numbers, {h1} and {h2} units");
+                // the two halves of a pass, as the search takes them, are the whole pass
+                let mut q = Pass::default();
+                net.hidden(&x, &mut q);
+                assert_eq!(q.g.to_bits(), p.g.to_bits());
+                net.numbers(&mut q);
+                assert_eq!(bits(&q.logits), bits(&p.logits));
+            }
+            e.step(&mut s, &t.turns);
+            if s.result.is_some() {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn a_position_no_line_was_played_on_from_is_searched_like_a_fresh_one() {
+    // a new position gets only its value; its turn lists are made when a line is first played
+    // on from it. Moving the tree onto such a position and searching must be the search a new
+    // tree makes from there, line for line.
+    let e = Engine::shipped("columns-21");
+    let net = random_net(23);
+    let mut s = e.new_match(11);
+    let mut tried = 0;
+    for _ in 0..30 {
+        if s.result.is_some() {
+            break;
+        }
+        let mut kept = Search::new(&e, &net, PvConfig::default());
+        kept.iterate(&s, 400);
+        let pair = [kept.best(0), kept.best(1)];
+        // a position one tick down that was reached once and never played on from
+        let leaf = kept.positions(&s).into_iter().find(|p| p.0 == 1 && p.1 == 0);
+        if let Some((_, _, c)) = leaf {
+            if kept.advance_to(&s, &c) {
+                tried += 1;
+                assert_eq!(kept.visits(), 0);
+                kept.iterate(&c, 300);
+                let mut fresh = Search::new(&e, &net, PvConfig::default());
+                fresh.iterate(&c, 300);
+                assert_eq!(format!("{:?}", kept.root()), format!("{:?}", fresh.root()));
+                assert_eq!(kept.nodes(), fresh.nodes());
+                // and the same on threads: its lists are made before the threads start
+                let mut many = Search::new(&e, &net, PvConfig::default());
+                many.iterate(&s, 400);
+                assert!(many.advance_to(&s, &c));
+                assert_eq!(many.iterate_threads(&c, 300, 3, None), 300);
+                assert_eq!(many.root()[0].iter().map(|a| a.1).sum::<u32>(), 300);
+                // weighing right after the move reads the root's lists too
+                let mut moved = Search::new(&e, &net, PvConfig::default());
+                moved.iterate(&s, 400);
+                assert!(moved.advance_to(&s, &c));
+                assert!(!moved.weigh(&c, 0, 100, 0.5).is_empty());
+            }
+        }
+        // threads going on from a tree one thread made: the positions it left without lists get them
+        let mut both = Search::new(&e, &net, PvConfig::default());
+        both.iterate(&s, 300);
+        assert_eq!(both.iterate_threads(&s, 300, 3, None), 300);
+        assert_eq!(both.visits(), 600);
+        assert_eq!(both.root()[1].iter().map(|a| a.1).sum::<u32>(), 600);
+        e.step(&mut s, &pair);
+    }
+    assert!(tried >= 5, "only {tried} positions never played on from were found");
 }
