@@ -25,7 +25,7 @@ use victris_engine::rules::AttackKind;
 use victris_engine::state::{FState, Fighter, State};
 use victris_engine::{Engine, RawTurn};
 
-const KINDS: [&str; 19] = [
+const KINDS: [&str; 21] = [
     "all positions",
     "in sight within 4 tiles",
     "X: dash and repulsor ready, other within 4",
@@ -45,6 +45,8 @@ const KINDS: [&str; 19] = [
     "X on a power pad that appears within 5 ticks",
     "the same and the other within 2 tiles of that pad",
     "X within 2 of a power pad appearing within 5 ticks, other not",
+    "other ready, X within 4 and by a wall or the map edge",
+    "the same and X can step this tick",
 ];
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -73,7 +75,7 @@ fn main() {
             games.push((r.seed, r.ticks.iter().map(|t| t.turns).collect()));
         }
     }
-    let (mut n, mut value, mut real) = ([0u64; 19], [0.0f64; 19], [0.0f64; 19]);
+    let (mut n, mut value, mut real) = ([0u64; 21], [0.0f64; 21], [0.0f64; 21]);
     // over every position: summed value loss and positions; right about the winner and positions of won games
     let (mut loss, mut positions, mut hit, mut decided) = (0.0f64, 0u64, 0u64, 0u64);
     // the same four by part of the game: ticks 0-199, 200-379, 380 and later
@@ -81,7 +83,7 @@ fn main() {
     // and again for the positions with the two fighters' hp within 10
     let mut level = [[0.0f64; 4]; 3];
     // per game and kind: summed (real - value) and positions
-    let mut per: Vec<([f64; 19], [f64; 19])> = Vec::new();
+    let mut per: Vec<([f64; 21], [f64; 21])> = Vec::new();
     for (seed, turns) in &games {
         let mut s = e.new_match(*seed);
         let mut seen: Vec<State> = Vec::new();
@@ -93,7 +95,7 @@ fn main() {
             e.step(&mut s, t);
         }
         let Some(z0) = outcome(&s) else { continue };
-        per.push(([0.0; 19], [0.0; 19]));
+        per.push(([0.0; 21], [0.0; 21]));
         let slot = per.len() - 1;
         for p in &seen {
             let v0 = net.eval(&e, p).v0 as f64;
@@ -129,6 +131,11 @@ fn main() {
                 let powered = |f: &Fighter| f.power_until > p.tick;
                 let by_wall = (-1..=1).any(|dx| (-1..=1).any(|dy| (dx != 0 || dy != 0) && e.map.is_wall([me.pos[0] + dx, me.pos[1] + dy])));
                 let threat = near && ready(op);
+                // a wall or the edge of the map next to X: what a push can slam it into
+                let by_edge = (-1..=1).any(|dx| (-1..=1).any(|dy| {
+                    let q = [me.pos[0] + dx, me.pos[1] + dy];
+                    (dx != 0 || dy != 0) && (q[0] < 0 || q[1] < 0 || q[0] >= e.map.w || q[1] >= e.map.h || e.map.is_wall(q))
+                }));
                 // a power pad that is not out yet and appears within 5 ticks: how far each fighter is from the nearest to X
                 let soon = e.map.pads.iter().enumerate().filter(|(i, pd)| pd.kind == victris_engine::map::PadKind::Power && !p.pads[*i].available && p.pads[*i].respawn_tick - p.tick <= 5).map(|(_, pd)| (chebyshev(pd.pos, me.pos), chebyshev(pd.pos, op.pos))).min();
                 let kinds = [
@@ -151,8 +158,10 @@ fn main() {
                     matches!(soon, Some((0, _))),
                     matches!(soon, Some((0, d)) if d <= 2),
                     matches!(soon, Some((a, b)) if a <= 2 && b > 2),
+                    threat && by_edge,
+                    threat && by_edge && me.cd_move == 0 && me.state == FState::Idle,
                 ];
-                for k in 0..19 {
+                for k in 0..21 {
                     if kinds[k] {
                         n[k] += 1;
                         value[k] += v;
@@ -185,7 +194,7 @@ fn main() {
         );
     }
     println!("For fighter X: the network's value, the real result, and the gap (real less value; negative: the network thinks too well of it for X)");
-    for k in 0..19 {
+    for k in 0..21 {
         let c = n[k].max(1) as f64;
         let gap = (real[k] - value[k]) / c;
         let err = per.iter().map(|(a, m)| (a[k] - gap * m[k]) * (a[k] - gap * m[k])).sum::<f64>().sqrt() / c;
