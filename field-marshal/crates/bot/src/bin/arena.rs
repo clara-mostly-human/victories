@@ -60,14 +60,4 @@ fn main() {
             gs[0] / g, gs[6] / gs[0], gs[1] / gs[0] / 1e4, 100.0 * gs[2] / gs[0], 100.0 * gs[3] / gs[0], 100.0 * gs[4] / gs[0], 100.0 * gs[5] / gs[0]
         );
     }
-    // with `tree_pv_fog_belief`: how the belief did, and how many hidden ticks it left alone
-    if gs[8] > 0.0 {
-        println!(
-            "belief about the hidden opponent: moved on {:.0} ticks a game, {:.1} places; the guesses to search held {:.0}% of it and the opponent really stood on one of their tiles {:.0}%; {:.0} ticks a game left to the play without the switch; moving it on took {:.2} ms a tick; {:.1}% of the whole belief was on the tile the opponent really stood on",
-            gs[8] / g, gs[12] / gs[8], gs[9] / gs[8] / 1e4, 100.0 * gs[10] / gs[8], gs[11] / g, gs[13] / gs[8] / 1e3, gs[14] / gs[8] / 1e4
-        );
-        let held: Vec<u64> = marshal::policy::PV_BELIEF_HELD.iter().map(|a| a.load(std::sync::atomic::Ordering::Relaxed)).collect();
-        let steps: Vec<String> = (0..10).filter(|i| held[2 * i] > 0).map(|i| format!("{}-{}%: {} ticks, really {:.0}%", 10 * i, 10 * i + 10, held[2 * i], 100.0 * held[2 * i + 1] as f64 / held[2 * i] as f64)).collect();
-        println!("by the share the guesses held, how often the opponent really stood on one of their tiles: {}", steps.join("; "));
-    }
 }

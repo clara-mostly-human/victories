@@ -252,25 +252,6 @@ pub struct Playbook {
     pub tree_pv_fog_ticks: u32,
     /// With `tree_pv_fog_ticks`: how many guesses at the hidden opponent are searched (1 to 8).
     pub tree_pv_fog_guesses: u32,
-    /// The learned search decides a hidden tick over its guesses only while the guesses it
-    /// searches hold at least this share of the belief (0: off, `tree_pv_fog_ticks` decides).
-    ///
-    /// `tree_pv_fog_ticks` is a count somebody picked: ten ticks suit a map where a hidden
-    /// opponent is behind a column and can only be in a few places, and are too many where
-    /// nothing limits where it went. Here the bot keeps the whole belief instead of only the
-    /// guesses it searched: every place the opponent could now stand (up to 64), each with
-    /// its weight, moved on each hidden tick by what the search of that place expected of the
-    /// opponent, or by the network's own shares for its turns where the place was not
-    /// searched; places we would be seeing, and places the tracker has ruled out, drop out
-    /// and the rest share the weight. The `tree_pv_fog_guesses` heaviest places are the
-    /// guesses. The share of the belief standing on their tiles is how likely the search is
-    /// to be looking at the right position: while it is at least this number the learned
-    /// search decides over them as with `tree_pv_fog_ticks`; below it the tick is played as
-    /// a hidden tick is without the switch. The belief moves on every hidden tick either
-    /// way (also while we cannot act), so the search takes over again when the places left
-    /// narrow down, and there is no count of ticks at all. 0.5 is the natural setting: act on
-    /// the guesses while they are more likely right than wrong.
-    pub tree_pv_fog_belief: f64,
     /// For the arena only: after each decision of the learned search, this many more lines
     /// under the turn it sent (`pv_ponder`), standing in for the live bot's wait for the next
     /// tick. 0 (the default): none. A live session ponders by time instead.
@@ -497,7 +478,6 @@ impl Default for Playbook {
             tree_pv_fog: false,
             tree_pv_fog_ticks: 0,
             tree_pv_fog_guesses: 3,
-            tree_pv_fog_belief: 0.0,
             tree_pv_ponder: 0,
             tree_pv_weigh: 0.0,
             tree_pv_trust: 1.0,
@@ -678,9 +658,6 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_pv_fog_guesses").and_then(Value::as_u64) {
             p.tree_pv_fog_guesses = (x as u32).clamp(1, 8);
-        }
-        if let Some(x) = v.get("tree_pv_fog_belief").and_then(Value::as_f64) {
-            p.tree_pv_fog_belief = x.clamp(0.0, 1.0);
         }
         if let Some(x) = v.get("tree_pv_ponder").and_then(Value::as_u64) {
             p.tree_pv_ponder = x as u32;
@@ -1575,8 +1552,7 @@ struct PvKept {
 
 /// One guess at the hidden opponent (`tree_pv_fog_ticks`): the position as it would be with the
 /// opponent there, how likely the guess is, and what the search of it expected the opponent to
-/// do next (its turns with their visits). With `tree_pv_fog_belief` every place of the belief
-/// is kept as one of these; a place that was not searched has no expectation yet.
+/// do next (its turns with their visits).
 struct PvGuess {
     state: State,
     weight: f32,
@@ -1603,21 +1579,8 @@ thread_local! {
 /// decided over guesses; the weight (in millionths) the guesses gave the tile the opponent
 /// really stood on; ticks the likeliest guess was that tile; ticks it was within one tile of
 /// it; the same two for the tracker's ghost; guesses searched; and guesses that stood on a
-/// tile we could see (there should be none). With `tree_pv_fog_belief`, from place 8 on: hidden
-/// ticks the belief was moved on; the share of it (in millionths) on the tiles of the guesses
-/// that were or would have been searched; ticks the opponent really stood on one of those
-/// tiles; ticks we could act on and left to the play without the switch because that share was
-/// too small; the places the belief held; the microseconds moving it on took; and the share
-/// of the whole belief (in millionths) on the tile the opponent really stood on.
-pub static PV_GUESS_STATS: [std::sync::atomic::AtomicU64; 15] = [const { std::sync::atomic::AtomicU64::new(0) }; 15];
-
-/// For the arena, with `tree_pv_fog_belief`: is the belief honest? Hidden ticks by the share of
-/// the belief its guesses held, in ten steps of 10%: for each step the ticks, and the ticks
-/// the opponent really stood on one of the guesses' tiles.
-pub static PV_BELIEF_HELD: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
-
-/// The most places for a hidden opponent the belief holds (`tree_pv_fog_belief`).
-const PV_BELIEF_MAX: usize = 64;
+/// tile we could see (there should be none).
+pub static PV_GUESS_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
 /// What the tree search found at the root of its latest decision on this thread: the position
 /// it searched (the tracker's belief), each side's turns with their visits and average result
@@ -1641,19 +1604,6 @@ thread_local! {
 pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
     let started = Instant::now();
     let d = decide_inner(t, view, pb, started);
-    // a belief about a hidden opponent that was moved on this tick is played on next tick
-    // with the turn we really sent, whichever part of the bot chose it
-    if pb.tree_pv_fog_belief > 0.0 {
-        if let Some(tick) = t.belief.as_ref().map(|s| s.tick) {
-            PV_GUESSES.with(|g| {
-                if let Some(b) = g.borrow_mut().get_mut(&(t.seed, t.me)) {
-                    if b.tick == tick {
-                        b.ours = d.turn;
-                    }
-                }
-            });
-        }
-    }
     t.charge_think(started.elapsed());
     d
 }
@@ -1667,24 +1617,13 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     let en = s.fighters[1 - me];
     // standing in the opponent's frostburst before it goes off
     let frosted = s.areas().iter().any(|b| b.owner as usize != me && t.engine.map.in_blast(b.pos, b.radius, my.pos));
-    // `tree_pv_fog_belief`: a belief about a hidden opponent moves on while we cannot act, or
-    // while the opening book places us
-    let move_belief = || {
-        if view.enemy.is_none() && pb.tree_pv_fog_belief > 0.0 && pb.search && !pb.tree_pv_dir.is_empty() {
-            if let Some(net) = pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)) {
-                pv_guess_decide(t, pb, net, &s, started, 0, false);
-            }
-        }
-    };
     if my.state != FState::Idle {
-        move_belief();
         return idle;
     }
     // The opening book, while we are on its line and the opponent is out of sight (it only
     // places us; once the opponent is seen, the search decides).
     if let (Some(line), None) = (pb.book.get(&format!("{}/{}", e.map.name, me + 1)), view.enemy.as_ref()) {
         if let Some((_, _, turn)) = line.iter().find(|(tick, pos, _)| *tick == s.tick && *pos == my.pos) {
-            move_belief();
             return Decision { turn: RawTurn::from_json(Some(turn), &e.rules), sims: 0, score: 0.0, note: "book" };
         }
     }
@@ -1699,28 +1638,11 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
     let pv_hidden = !visible && pb.tree_pv_fog && !pb.tree_pv_dir.is_empty() && pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)).is_some();
     // `tree_pv_fog_ticks`: for that many ticks after the opponent was last seen, the learned
     // search decides over its own guesses of where the opponent stands.
-    // `tree_pv_fog_belief`: the same on every hidden tick since the opponent was first seen,
-    // for as long as the guesses hold enough of the belief.
-    let by_belief = pb.tree_pv_fog_belief > 0.0;
-    let mut pv_guess = !visible
-        && (by_belief || pb.tree_pv_fog_ticks > 0)
+    let pv_guess = !visible
+        && pb.tree_pv_fog_ticks > 0
         && !pb.tree_pv_dir.is_empty()
-        && t.enemy_last_seen.map(|(tick, _)| by_belief || s.tick - tick <= pb.tree_pv_fog_ticks as i32).unwrap_or(false)
+        && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_pv_fog_ticks as i32).unwrap_or(false)
         && pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)).is_some();
-    if pv_guess && by_belief {
-        // Decided here, ahead of the tree search: a tick on which the guesses hold too little
-        // of the belief is played below as a hidden tick is without the switch.
-        // (With no time to search the belief is moved on all the same.)
-        if pb.search {
-            if let Some(net) = pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)) {
-                let cap = if pb.tree_ms > 0 { t.think_cap_ms(pb.tree_ms) } else { 0 };
-                if let Some(d) = pv_guess_decide(t, pb, net, &s, started, cap, cap >= 20) {
-                    return d;
-                }
-            }
-        }
-        pv_guess = false;
-    }
     if pb.tree_ms > 0 && pb.search && (visible || guessed || pv_hidden || pv_guess) && t.think_cap_ms(pb.tree_ms) >= 20 {
         let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, lead_mask: if pb.tree_lead_them { 1u8 << (1 - me) } else { 0 }, expand_at: pb.tree_expand_at, max_nodes: pb.tree_max_nodes, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
         if pb.tree_value != 0.0 || pb.tree_net != 0.0 || pb.tree_net_hp != 0.0 || pb.tree_net_value != 0.0 {
@@ -1811,7 +1733,7 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         let pv = if (visible || pv_hidden || pv_guess) && !pb.tree_pv_dir.is_empty() { pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)) } else { None };
         if let Some(net) = pv {
             if pv_guess {
-                return pv_guess_decide(t, pb, net, &s, started, deadline, true).unwrap_or(idle);
+                return pv_guess_decide(t, pb, net, &s, started, deadline).unwrap_or(idle);
             }
             if !visible {
                 // One search for each guess at where the opponent stands, an equal share of the
@@ -2673,20 +2595,12 @@ fn pv_net(path: &str) -> Option<&'static victris_engine::pvnet::PvNet> {
 /// tracker has ruled out. The likeliest few are searched, each for its share of the time, and
 /// our turns are pooled by those shares. No tree is carried over here: the guesses of the
 /// next tick are other positions.
-///
-/// With `tree_pv_fog_belief` every place is kept, not only the guesses searched, and the
-/// search runs only while the guesses hold that share of the belief (see the playbook's
-/// field). None then means the tick is not this function's to decide; the belief has been
-/// moved on all the same. `act` is false on a tick we cannot act on: the belief is moved on
-/// and nothing is searched.
-fn pv_guess_decide(t: &Tracker, pb: &Playbook, net: &'static victris_engine::pvnet::PvNet, s: &State, started: Instant, deadline: u64, act: bool) -> Option<Decision> {
+fn pv_guess_decide(t: &Tracker, pb: &Playbook, net: &'static victris_engine::pvnet::PvNet, s: &State, started: Instant, deadline: u64) -> Option<Decision> {
     use victris_engine::pvsearch::{PvConfig, Search};
-    let entered = Instant::now();
     let e = &t.engine;
     let me = t.me;
     let key = (t.seed, me);
     let mine = s.fighters[me];
-    let by_belief = pb.tree_pv_fog_belief > 0.0;
     // what the opponent was expected to do, from each position it was believed to be in
     let mut sources: Vec<(State, f32, Vec<(RawTurn, u32)>, RawTurn)> = Vec::new();
     match PV_GUESSES.with(|g| g.borrow_mut().remove(&key)) {
@@ -2705,25 +2619,6 @@ fn pv_guess_decide(t: &Tracker, pb: &Playbook, net: &'static victris_engine::pvn
                     sources.push((k.root, 1.0, theirs, k.ours));
                 }
             }
-            // The belief can also start without a search of the last tick in sight (we could
-            // not act on it): from where the tracker holds the opponent, seen one tick ago.
-            // (The tracker's position is already this tick's, so the step below puts the
-            // opponent on the right tiles with its cooldowns a tick early.)
-            if by_belief && sources.is_empty() && t.enemy_last_seen.map(|(tick, _)| s.tick - tick == 1).unwrap_or(false) {
-                sources.push((*s, 1.0, Vec::new(), RawTurn::IDLE));
-            }
-        }
-    }
-    if by_belief {
-        // a place nobody searched has no expectation: the network's own shares for the
-        // opponent's turns there stand in
-        // (Measured on pillars-21: with the searches' own expectations where there are any,
-        // 34% of the belief stands on the opponent's real tile; with the network's shares
-        // for every place, 22%.)
-        let mut look: Option<Search> = None;
-        for src in sources.iter_mut().filter(|src| src.2.is_empty()) {
-            let search = look.get_or_insert_with(|| Search::new(e, net, PvConfig::default()));
-            src.2 = search.priors(&src.0)[1 - me].iter().map(|a| (a.0, (a.1 * 1e6) as u32)).collect();
         }
     }
     // where that leaves the opponent now: (its fighter, weight)
@@ -2759,87 +2654,37 @@ fn pv_guess_decide(t: &Tracker, pb: &Playbook, net: &'static victris_engine::pvn
         places = vec![(truth.fighters[1 - me], 1.0)];
     }
     if places.is_empty() {
-        if by_belief {
-            // nothing believed fits what we see: there is no belief until it is seen again
-            return None;
-        }
         // nothing the search expected fits what we see: the tracker's own guess
         places.push((s.fighters[1 - me], 1.0));
     }
     places.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    let wanted = pb.tree_pv_fog_guesses.clamp(1, 8) as usize;
-    // the share of the belief on the tiles of the guesses to search
-    let mut held = 1.0f32;
-    if by_belief {
-        places.truncate(PV_BELIEF_MAX);
-        let all: f32 = places.iter().map(|p| p.1).sum::<f32>().max(1e-9);
-        for p in places.iter_mut() {
-            p.1 /= all;
-        }
-        let top = &places[..wanted.min(places.len())];
-        held = places.iter().filter(|p| top.iter().any(|q| q.0.pos == p.0.pos)).map(|p| p.1).sum();
-    } else {
-        places.truncate(wanted);
-    }
-    let searched = wanted.min(places.len());
-    let search_now = act && (!by_belief || held >= pb.tree_pv_fog_belief as f32);
-    let sum: f32 = places[..searched].iter().map(|p| p.1).sum::<f32>().max(1e-9);
+    places.truncate(pb.tree_pv_fog_guesses.clamp(1, 8) as usize);
+    let sum: f32 = places.iter().map(|p| p.1).sum::<f32>().max(1e-9);
     if let Some(truth) = PV_TRUTH.with(|o| *o.borrow()) {
         use std::sync::atomic::Ordering::Relaxed;
         let real = truth.fighters[1 - me].pos;
-        if by_belief {
-            PV_GUESS_STATS[8].fetch_add(1, Relaxed);
-            PV_GUESS_STATS[9].fetch_add((held * 1e6) as u64, Relaxed);
-            PV_GUESS_STATS[10].fetch_add(places[..searched].iter().any(|p| p.0.pos == real) as u64, Relaxed);
-            PV_GUESS_STATS[11].fetch_add((act && !search_now) as u64, Relaxed);
-            PV_GUESS_STATS[12].fetch_add(places.len() as u64, Relaxed);
-            PV_GUESS_STATS[13].fetch_add(entered.elapsed().as_micros() as u64, Relaxed);
-            PV_GUESS_STATS[14].fetch_add((places.iter().filter(|p| p.0.pos == real).map(|p| p.1).sum::<f32>() * 1e6) as u64, Relaxed);
-            let step = ((held * 10.0) as usize).min(9);
-            PV_BELIEF_HELD[2 * step].fetch_add(1, Relaxed);
-            PV_BELIEF_HELD[2 * step + 1].fetch_add(places[..searched].iter().any(|p| p.0.pos == real) as u64, Relaxed);
-        }
-        if search_now {
-            let on: f32 = places[..searched].iter().filter(|p| p.0.pos == real).map(|p| p.1).sum::<f32>() / sum;
-            let ghost = s.fighters[1 - me].pos;
-            PV_GUESS_STATS[0].fetch_add(1, Relaxed);
-            PV_GUESS_STATS[1].fetch_add((on * 1e6) as u64, Relaxed);
-            PV_GUESS_STATS[2].fetch_add((places[0].0.pos == real) as u64, Relaxed);
-            PV_GUESS_STATS[3].fetch_add((chebyshev(places[0].0.pos, real) <= 1) as u64, Relaxed);
-            PV_GUESS_STATS[4].fetch_add((ghost == real) as u64, Relaxed);
-            PV_GUESS_STATS[5].fetch_add((chebyshev(ghost, real) <= 1) as u64, Relaxed);
-            PV_GUESS_STATS[6].fetch_add(searched as u64, Relaxed);
-            PV_GUESS_STATS[7].fetch_add(places[..searched].iter().filter(|p| can_see(&e.rules, &e.map, mine.pos, p.0.pos)).count() as u64, Relaxed);
-        }
-    }
-    // the position with the opponent set down at a place: what is known of the opponent
-    // wherever it stands (its hp, from the hits we saw land) stays
-    let known = s.fighters[1 - me];
-    let set_down = |o: &victris_engine::state::Fighter| {
-        let mut root = *s;
-        root.fighters[1 - me] = victris_engine::state::Fighter { hp: known.hp, ..*o };
-        root
-    };
-    let keep = |guesses: Vec<PvGuess>, ours: RawTurn| {
-        PV_GUESSES.with(|g| {
-            let mut g = g.borrow_mut();
-            g.retain(|other, _| other.0 == key.0);
-            g.insert(key, PvGuesses { tick: s.tick, ours, guesses });
-        });
-    };
-    if !search_now {
-        // the belief moves on without a search (the turn we send is filled in by `decide`)
-        keep(places.iter().map(|(o, w)| PvGuess { state: set_down(o), weight: *w, theirs: Vec::new() }).collect(), RawTurn::IDLE);
-        return None;
+        let on: f32 = places.iter().filter(|p| p.0.pos == real).map(|p| p.1).sum::<f32>() / sum;
+        let ghost = s.fighters[1 - me].pos;
+        PV_GUESS_STATS[0].fetch_add(1, Relaxed);
+        PV_GUESS_STATS[1].fetch_add((on * 1e6) as u64, Relaxed);
+        PV_GUESS_STATS[2].fetch_add((places[0].0.pos == real) as u64, Relaxed);
+        PV_GUESS_STATS[3].fetch_add((chebyshev(places[0].0.pos, real) <= 1) as u64, Relaxed);
+        PV_GUESS_STATS[4].fetch_add((ghost == real) as u64, Relaxed);
+        PV_GUESS_STATS[5].fetch_add((chebyshev(ghost, real) <= 1) as u64, Relaxed);
+        PV_GUESS_STATS[6].fetch_add(places.len() as u64, Relaxed);
+        PV_GUESS_STATS[7].fetch_add(places.iter().filter(|p| can_see(&e.rules, &e.map, mine.pos, p.0.pos)).count() as u64, Relaxed);
     }
     let begun = started.elapsed().as_millis() as u64;
     let mut pooled: Vec<(RawTurn, f32, f32)> = Vec::new();
     let mut guesses: Vec<PvGuess> = Vec::new();
     let mut first: Option<(State, [Vec<(RawTurn, u32, f64)>; 2], f64)> = None;
     let (mut done, mut spent) = (0u32, 0.0f32);
-    for (o, w) in places[..searched].iter() {
+    for (o, w) in places.iter() {
         let weight = w / sum;
-        let root = set_down(o);
+        let mut root = *s;
+        // what is known of the opponent wherever it stands (its hp, from the hits we saw land) stays
+        let known = root.fighters[1 - me];
+        root.fighters[1 - me] = victris_engine::state::Fighter { hp: known.hp, ..*o };
         spent += weight;
         let until = begun + (deadline.saturating_sub(begun) as f32 * spent) as u64;
         let share = if pb.tree_iters > 0 { ((pb.tree_iters as f32 * weight) as u32).max(1) } else { 0 };
@@ -2870,18 +2715,17 @@ fn pv_guess_decide(t: &Tracker, pb: &Playbook, net: &'static victris_engine::pvn
             let wide = |x: usize| r[x].iter().map(|a| (a.0, a.1, a.2 as f64)).collect::<Vec<_>>();
             first = Some((root, [wide(0), wide(1)], search.value() as f64));
         }
-        // among the guesses searched their weights add up to one; in a belief every place
-        // keeps its share of the whole
-        guesses.push(PvGuess { state: root, weight: if by_belief { *w } else { weight }, theirs: r[1 - me].iter().map(|a| (a.0, a.1)).collect() });
+        guesses.push(PvGuess { state: root, weight, theirs: r[1 - me].iter().map(|a| (a.0, a.1)).collect() });
     }
     let (turn, _, q) = pooled.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)).copied()?;
     if let Some((root, acts, value)) = first {
         LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root, acts, value, sims: done, reused: 0, weighed: Vec::new() }));
     }
-    for (o, w) in places[searched..].iter() {
-        guesses.push(PvGuess { state: set_down(o), weight: *w, theirs: Vec::new() });
-    }
-    keep(guesses, turn);
+    PV_GUESSES.with(|g| {
+        let mut g = g.borrow_mut();
+        g.retain(|other, _| other.0 == key.0);
+        g.insert(key, PvGuesses { tick: s.tick, ours: turn, guesses });
+    });
     Some(Decision { turn, sims: done, score: q as f64, note: "pv-guess" })
 }
 
