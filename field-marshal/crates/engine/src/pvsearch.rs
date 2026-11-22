@@ -140,6 +140,20 @@ pub struct WeighedTurn {
     pub lines: u32,
 }
 
+/// One of our turns in the table `Search::mixed` solved.
+#[derive(Clone, Copy, Debug)]
+pub struct MixTurn {
+    pub turn: RawTurn,
+    /// its visits and mean result in the search so far
+    pub visits: u32,
+    pub mean: f32,
+    /// how often the solved table plays it
+    pub share: f32,
+    /// the answer in the table that leaves it least, and what that is
+    pub worst_to: RawTurn,
+    pub worst: f32,
+}
+
 /// A search's tree on its own, to keep between ticks (`Search::into_tree`, `Search::start_from`).
 pub struct Tree {
     nodes: Vec<Node>,
@@ -598,7 +612,8 @@ impl<'a> Search<'a> {
     /// with the pair) and no longer by what it brought against everything `me` might do.
     /// Every turn of the other fighter is first tried once against `ours` (the network's
     /// value of the position the pair leads to), highest share first, then the search's
-    /// usual rule picks among them. Returns the turn with the most lines against `ours`.
+    /// usual rule picks among them. Returns the turn that got the most of those lines
+    /// (`best_answer`).
     ///
     /// No bot can do this in a game: both move at once. It is for self-play and for judging.
     /// A search that plays one fixed turn where the right play is a mix (stand or step off
@@ -608,20 +623,36 @@ impl<'a> Search<'a> {
     /// shows in the result. None when `ours` is not one of the root's turns or nothing was
     /// searched from `root` yet.
     pub fn answer(&mut self, root: &State, me: usize, ours: &RawTurn, lines: u32) -> Option<RawTurn> {
-        let got = self.answer_lines(root, me, ours, lines)?;
+        let got = self.answers(root, me, ours, lines)?;
+        Some(Self::best_answer(&got).0)
+    }
+
+    /// The answer the lines of `answers` settled on: the turn that got the most of the new
+    /// lines (equal: the higher mean), with its mean result for the answering fighter. Not
+    /// the turn with the most lines in all: the lines a pair had before are mostly a count
+    /// of how usual the two turns are, and after a long search no answer could overtake the
+    /// usual turn's.
+    pub fn best_answer(got: &[(RawTurn, u32, f32, u32)]) -> (RawTurn, f32) {
         let mut best = (0u32, f32::MIN, RawTurn::IDLE);
         for (i, g) in got.iter().enumerate() {
-            if i == 0 || g.1 > best.0 || (g.1 == best.0 && g.2 > best.1) {
-                best = (g.1, g.2, g.0);
+            if i == 0 || g.3 > best.0 || (g.3 == best.0 && g.2 > best.1) {
+                best = (g.3, g.2, g.0);
             }
         }
-        Some(best.2)
+        (best.2, best.1)
+    }
+
+    /// `answers` without the count of new lines: each turn of fighter `1 - me` with all the
+    /// lines that began with it against `ours` and their mean result for that fighter.
+    pub fn answer_lines(&mut self, root: &State, me: usize, ours: &RawTurn, lines: u32) -> Option<Vec<(RawTurn, u32, f32)>> {
+        Some(self.answers(root, me, ours, lines)?.into_iter().map(|g| (g.0, g.1, g.2)).collect())
     }
 
     /// The work of `answer`, and what it found: each turn of fighter `1 - me` (in the order
-    /// of `root()`) with the lines that began with it against `ours` and their mean result
-    /// for that fighter. With a single turn to answer with nothing is searched.
-    pub fn answer_lines(&mut self, root: &State, me: usize, ours: &RawTurn, lines: u32) -> Option<Vec<(RawTurn, u32, f32)>> {
+    /// of `root()`) with the lines that began with it against `ours` (those of the search
+    /// before and the new ones), their mean result for that fighter, and how many of them
+    /// are new. With a single turn to answer with nothing is searched.
+    pub fn answers(&mut self, root: &State, me: usize, ours: &RawTurn, lines: u32) -> Option<Vec<(RawTurn, u32, f32, u32)>> {
         if root.result.is_some() || self.nodes.is_empty() {
             return None;
         }
@@ -632,7 +663,7 @@ impl<'a> Search<'a> {
             return None;
         }
         if count == 1 {
-            return Some(vec![(self.nodes[0].acts[other][0].turn, 0, 0.0)]);
+            return Some(vec![(self.nodes[0].acts[other][0].turn, 0, 0.0, 0)]);
         }
         let mut order: Vec<usize> = (0..count).collect();
         order.sort_by(|a, b| self.nodes[0].acts[other][*b].prior.total_cmp(&self.nodes[0].acts[other][*a].prior));
@@ -647,6 +678,7 @@ impl<'a> Search<'a> {
                 (c.1, c.0 * c.1 as f32)
             })
             .collect();
+        let before: Vec<u32> = got.iter().map(|g| g.0).collect();
         let mut total: u32 = got.iter().map(|g| g.0).sum();
         let mut next = 0usize;
         for _ in 0..lines {
@@ -672,7 +704,139 @@ impl<'a> Search<'a> {
             got[j].1 += side * value;
             total += 1;
         }
-        Some((0..count).map(|j| (turns[j], got[j].0, if got[j].0 > 0 { got[j].1 / got[j].0 as f32 } else { f32::MIN })).collect())
+        Some((0..count).map(|j| (turns[j], got[j].0, if got[j].0 > 0 { got[j].1 / got[j].0 as f32 } else { f32::MIN }, got[j].0 - before[j])).collect())
+    }
+
+    /// The turns of fighter `x` that the search rates the same as its most visited one, that
+    /// turn first: at least a tenth of its visits and a mean result no more than `margin`
+    /// below its own; at most four, by visits. What `safest` compares: with fewer than two
+    /// it has nothing to do. Empty before anything was searched.
+    pub fn rated_same(&self, x: usize, margin: f32) -> Vec<(RawTurn, u32, f32)> {
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
+        let acts = &self.root()[x];
+        let Some(top) = acts.iter().max_by_key(|a| a.1).copied() else {
+            return Vec::new();
+        };
+        let mut same: Vec<(RawTurn, u32, f32)> = acts.iter().filter(|a| a.0 != top.0 && a.1 > 0 && a.1 as u64 * 10 >= top.1 as u64 && a.2 >= top.2 - margin).copied().collect();
+        same.sort_by(|a, b| b.1.cmp(&a.1));
+        same.truncate(3);
+        same.insert(0, top);
+        same
+    }
+
+    /// Where the search rates several turns of fighter `x` the same, how often to play each:
+    /// the turns of `rated_same` set against the other fighter's answers in a small table,
+    /// and the table solved as the game it is (both choose at once, one side's gain the
+    /// other's loss). The other fighter's columns: its two most visited turns and, for each
+    /// of our turns, the answer that does best against that one turn (`answers`, half of
+    /// `lines` shared among our turns). The other half of `lines` goes to the cells evenly,
+    /// each line beginning with the cell's pair. Solved by regret matching, the average
+    /// taken. Returns our turns with their shares (the most visited first; alone with share
+    /// 1 when nothing else rates the same, and then no line is run) and the table's worth.
+    ///
+    /// Why: the search's counts settle where every turn worth playing has the same mean
+    /// result (stand on the edge or step off it while a dash with repulsor is on: both
+    /// -0.26), which is the worth of the position to a fighter that plays those turns as a
+    /// mix. Sending the most visited one every time is not that fighter: an opponent that
+    /// answers the habit (slams whenever we are on the edge) gets the habit's worst cell
+    /// (-0.60), every time. The solved shares are the mix that leaves no answer better than
+    /// the table's worth. The caller draws the turn; nothing here is random.
+    pub fn mixed(&mut self, root: &State, x: usize, lines: u32, margin: f32) -> (Vec<MixTurn>, f32) {
+        let same = self.rated_same(x, margin);
+        let Some(top) = same.first().copied() else {
+            return (Vec::new(), 0.0);
+        };
+        let plain = |t: (RawTurn, u32, f32), share: f32| MixTurn { turn: t.0, visits: t.1, mean: t.2, share, worst_to: RawTurn::IDLE, worst: t.2 };
+        let other = 1 - x;
+        if same.len() < 2 || root.result.is_some() || self.nodes[0].acts[other].len() < 2 {
+            return (vec![plain(top, 1.0)], top.2);
+        }
+        let rows = same.len();
+        // their answers to each of our turns: (turn, lines, mean for them, new lines), in the order of the root
+        let each = (lines / 2 / rows as u32).max(1);
+        let mut got: Vec<Vec<(RawTurn, u32, f32, u32)>> = Vec::with_capacity(rows);
+        for cand in &same {
+            match self.answers(root, x, &cand.0, each) {
+                Some(g) => got.push(g),
+                None => return (vec![plain(top, 1.0)], top.2),
+            }
+        }
+        // the columns: their two most visited turns, and the best answer to each of our turns
+        let theirs = &self.root()[other];
+        let mut by_visits: Vec<usize> = (0..theirs.len()).collect();
+        by_visits.sort_by(|a, b| theirs[*b].1.cmp(&theirs[*a].1));
+        let mut cols: Vec<usize> = by_visits.into_iter().take(2).collect();
+        for g in &got {
+            let best = Self::best_answer(g).0;
+            if let Some(j) = g.iter().position(|a| a.0 == best) {
+                if !cols.contains(&j) {
+                    cols.push(j);
+                }
+            }
+        }
+        let n = cols.len();
+        // each cell: (lines, summed result for us), from the answers; then the other half of the lines, evenly
+        let mut cell: Vec<(u32, f32)> = Vec::with_capacity(rows * n);
+        for g in &got {
+            for &j in &cols {
+                cell.push(if g[j].1 > 0 { (g[j].1, -g[j].2 * g[j].1 as f32) } else { (0, 0.0) });
+            }
+        }
+        let mine: Vec<usize> = same.iter().map(|c| self.nodes[0].acts[x].iter().position(|a| a.turn == c.0).unwrap_or(0)).collect();
+        let side = if x == 0 { 1.0 } else { -1.0 };
+        let more = (lines - (lines / 2).min(lines)) / (rows * n) as u32;
+        for i in 0..rows {
+            for (k, &j) in cols.iter().enumerate() {
+                // a cell never tried gets at least one line
+                let count = if cell[i * n + k].0 == 0 { more.max(1) } else { more };
+                for _ in 0..count {
+                    self.room(self.cfg.max_nodes);
+                    let value = self.line(root, Some(if x == 0 { (mine[i], j) } else { (j, mine[i]) }));
+                    cell[i * n + k].0 += 1;
+                    cell[i * n + k].1 += side * value;
+                }
+            }
+        }
+        let m: Vec<f32> = cell.iter().map(|c| c.1 / c.0.max(1) as f32).collect();
+        // regret matching by both sides, the average strategies: the table's solution
+        let (mut ra, mut rb) = (vec![0.0f32; rows], vec![0.0f32; n]);
+        let (mut sa, mut sb) = (vec![0.0f32; rows], vec![0.0f32; n]);
+        let strat = |r: &[f32]| -> Vec<f32> {
+            let tot: f32 = r.iter().map(|v| v.max(0.0)).sum();
+            r.iter().map(|v| if tot > 0.0 { v.max(0.0) / tot } else { 1.0 / r.len() as f32 }).collect()
+        };
+        for it in 0..20_000u32 {
+            let (pa, pb) = (strat(&ra), strat(&rb));
+            let ua: Vec<f32> = (0..rows).map(|i| (0..n).map(|k| pb[k] * m[i * n + k]).sum()).collect();
+            let ub: Vec<f32> = (0..n).map(|k| (0..rows).map(|i| -pa[i] * m[i * n + k]).sum()).collect();
+            let va: f32 = (0..rows).map(|i| pa[i] * ua[i]).sum();
+            for i in 0..rows {
+                ra[i] = (ra[i] + ua[i] - va).max(0.0);
+                sa[i] += pa[i] * it as f32;
+            }
+            for k in 0..n {
+                rb[k] = (rb[k] + ub[k] + va).max(0.0);
+                sb[k] += pb[k] * it as f32;
+            }
+        }
+        let (ta, tb): (f32, f32) = (sa.iter().sum(), sb.iter().sum());
+        let (pa, pb): (Vec<f32>, Vec<f32>) = (sa.iter().map(|v| v / ta).collect(), sb.iter().map(|v| v / tb).collect());
+        let worth: f32 = (0..rows).map(|i| pa[i] * (0..n).map(|k| pb[k] * m[i * n + k]).sum::<f32>()).sum();
+        let turns: Vec<RawTurn> = cols.iter().map(|&j| got[0][j].0).collect();
+        let out = (0..rows)
+            .map(|i| {
+                let (mut worst, mut to) = (f32::MAX, RawTurn::IDLE);
+                for k in 0..n {
+                    if m[i * n + k] < worst {
+                        (worst, to) = (m[i * n + k], turns[k]);
+                    }
+                }
+                MixTurn { turn: same[i].0, visits: same[i].1, mean: same[i].2, share: pa[i], worst_to: to, worst }
+            })
+            .collect();
+        (out, worth)
     }
 
     /// `iterate` on `threads` threads: lines until `count` are done or the time `until` has
