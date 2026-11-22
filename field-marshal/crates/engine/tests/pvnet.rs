@@ -885,3 +885,44 @@ fn a_full_tree_makes_room_and_goes_on_growing() {
     assert_eq!(many.root()[0].iter().map(|a| a.1).sum::<u32>(), 12_000);
     assert!(many.nodes() > cap / 2);
 }
+
+#[test]
+fn the_networks_own_shares_for_the_turns_can_be_asked_for_without_a_search() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(11);
+    let mut s = e.new_match(3);
+    // a few ticks in, so both fighters have a choice of turns
+    for _ in 0..6 {
+        e.step(&mut s, &[RawTurn::IDLE, RawTurn::IDLE]);
+    }
+    let mut search = Search::new(&e, &net, PvConfig::default());
+    let first = search.priors(&s);
+    let mut buf = Vec::new();
+    for x in 0..2 {
+        // a share for every turn the fighter has, each above nothing, the whole adding up to one
+        turns(&e, &s, x, &mut buf);
+        assert_eq!(first[x].len(), buf.len());
+        assert!(buf.iter().all(|t| first[x].iter().any(|a| a.0 == *t)));
+        assert!(first[x].iter().all(|a| a.1 > 0.0));
+        let all: f32 = first[x].iter().map(|a| a.1).sum();
+        assert!((all - 1.0).abs() < 1e-3, "fighter {x}: the shares add up to {all}");
+        // and not all alike: they are the network's, not an even spread
+        let (low, high) = first[x].iter().fold((1.0f32, 0.0f32), |m, a| (m.0.min(a.1), m.1.max(a.1)));
+        assert!(high > 1.5 * low, "fighter {x}: shares from {low} to {high}");
+    }
+    // they are what a search of the position starts from: the same turns in the same order
+    search.iterate(&s, 300);
+    let searched = search.root();
+    for x in 0..2 {
+        assert_eq!(searched[x].iter().map(|a| a.0).collect::<Vec<_>>(), first[x].iter().map(|a| a.0).collect::<Vec<_>>());
+    }
+    // asked again after that search the answer is the same, and the search's lines are gone
+    assert_eq!(search.priors(&s), first);
+    assert!(search.root().iter().all(|l| l.iter().all(|a| a.1 == 0)));
+    // a game that is over has no turns
+    let mut over = s;
+    while over.result.is_none() {
+        e.step(&mut over, &[RawTurn::IDLE, RawTurn::IDLE]);
+    }
+    assert!(search.priors(&over).iter().all(|l| l.is_empty()));
+}

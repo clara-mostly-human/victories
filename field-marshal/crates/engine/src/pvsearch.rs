@@ -1067,6 +1067,18 @@ impl<'a> Search<'a> {
         }
     }
 
+    /// The network's own shares for each fighter's turns at `root`, before any search: what a
+    /// root's turn lists start from. Whatever this search held is dropped.
+    pub fn priors(&mut self, root: &State) -> [Vec<(RawTurn, f32)>; 2] {
+        self.clear();
+        if root.result.is_some() {
+            return [Vec::new(), Vec::new()];
+        }
+        self.ready(root);
+        let list = |x: usize| self.nodes[0].acts[x].iter().map(|a| (a.turn, a.prior)).collect();
+        [list(0), list(1)]
+    }
+
     /// The network's own value of the root for fighter 0, before any search.
     pub fn net_value(&self) -> f32 {
         self.nodes.first().map(|n| n.v).unwrap_or(0.0)
