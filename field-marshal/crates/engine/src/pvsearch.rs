@@ -115,6 +115,112 @@ pub fn outcome(s: &State) -> Option<f32> {
     })
 }
 
+/// A new position for the tree: each fighter's turns with the network's shares (`even` of
+/// them spread evenly) and the network's value of the position.
+fn expand_at(e: &Engine, net: &PvNet, s: &State, even: f32, x: &mut Inputs, pass: &mut Pass, buf: &mut Vec<RawTurn>) -> Node {
+    let mut g = [0.0f32; 2];
+    let mut acts: [Vec<Act>; 2] = [Vec::new(), Vec::new()];
+    for f in 0..2 {
+        encode(e, s, f, x);
+        net.forward(x, pass);
+        g[f] = pass.g;
+        turns(e, s, f, buf);
+        let logits = &pass.logits;
+        let top = buf.iter().map(|t| logits[class_of(t)]).fold(f32::MIN, f32::max);
+        let mut total = 0.0f32;
+        let mut list: Vec<Act> = buf.iter().map(|t| {
+            let p = (logits[class_of(t)] - top).exp();
+            total += p;
+            Act { turn: *t, prior: p, n: 0, w: 0.0 }
+        }).collect();
+        let flat = 1.0 / list.len() as f32;
+        for a in list.iter_mut() {
+            a.prior = (1.0 - even) * a.prior / total.max(1e-9) + even * flat;
+        }
+        acts[f] = list;
+    }
+    Node { acts, n: 0, v: ((g[0] - g[1]) * 0.5).tanh(), kids: Vec::new() }
+}
+
+/// The turn of fighter `x` the next line through `nd` takes.
+fn select_in(nd: &Node, x: usize, cfg: &PvConfig) -> usize {
+    let list = &nd.acts[x];
+    if list.len() == 1 {
+        return 0;
+    }
+    let root_n = (nd.n.max(1) as f32).sqrt();
+    let unseen = if x == 0 { nd.v } else { -nd.v } - cfg.fpu;
+    let mut best = (f32::MIN, 0);
+    for (i, a) in list.iter().enumerate() {
+        let q = if a.n > 0 { a.w / a.n as f32 } else { unseen };
+        let u = q + cfg.c * a.prior * root_n / (1.0 + a.n as f32);
+        if u > best.0 {
+            best = (u, i);
+        }
+    }
+    best.1
+}
+
+/// The tree while several threads search it (`Search::iterate_threads`), and for pondering
+/// the opponent's first turns handed out so far.
+struct Shared {
+    nodes: Vec<Node>,
+    index: HashMap<u64, u32>,
+    first: Option<FirstTurns>,
+}
+
+/// Pondering's first pair of turns (`Search::ponder`): ours fixed, theirs spread over their
+/// turns in proportion to `theirs`.
+struct FirstTurns {
+    me: usize,
+    mine: usize,
+    theirs: Vec<f64>,
+    total: f64,
+    given: Vec<u32>,
+    lines: u32,
+}
+
+impl FirstTurns {
+    /// The next line's first pair: the opponent turn furthest behind its share.
+    fn next(&mut self) -> (usize, usize) {
+        let mut best = (f64::MIN, 0usize);
+        for (i, n) in self.theirs.iter().enumerate() {
+            let behind = n / self.total * (self.lines + 1) as f64 - self.given[i] as f64;
+            if *n > 0.0 && behind > best.0 {
+                best = (behind, i);
+            }
+        }
+        self.given[best.1] += 1;
+        self.lines += 1;
+        if self.me == 0 { (self.mine, best.1) } else { (best.1, self.mine) }
+    }
+}
+
+/// The tree's lock taken by trying again and again, never by sleeping: it is held for well
+/// under a microsecond at a time, and a thread put to sleep over it takes many times that to
+/// wake (measured: three threads that slept on the lock did the work of 1.1).
+fn grab<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    let mut tries = 0u32;
+    loop {
+        match m.try_lock() {
+            Ok(g) => return g,
+            Err(std::sync::TryLockError::Poisoned(p)) => return p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                tries += 1;
+                if tries % 512 == 0 {
+                    std::thread::yield_now();
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+    }
+}
+
+/// While a line is on its way down in one thread, the turns it took count as one lost line
+/// each, so the other threads look elsewhere; the count is put right when the line reports.
+const ON_ITS_WAY: f32 = 1.0;
+
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, net: &'a PvNet, cfg: PvConfig) -> Search<'a> {
         Search { e, net, cfg, nodes: Vec::new(), index: HashMap::new(), path: Vec::new(), pass: Pass::default(), x: Inputs::default(), buf: Vec::new(), depth_hist: [0; 64] }
@@ -148,47 +254,11 @@ impl<'a> Search<'a> {
     }
 
     fn expand(&mut self, s: &State, even: f32) -> Node {
-        let mut g = [0.0f32; 2];
-        let mut acts: [Vec<Act>; 2] = [Vec::new(), Vec::new()];
-        for f in 0..2 {
-            encode(self.e, s, f, &mut self.x);
-            self.net.forward(&self.x, &mut self.pass);
-            g[f] = self.pass.g;
-            turns(self.e, s, f, &mut self.buf);
-            let logits = &self.pass.logits;
-            let top = self.buf.iter().map(|t| logits[class_of(t)]).fold(f32::MIN, f32::max);
-            let mut total = 0.0f32;
-            let mut list: Vec<Act> = self.buf.iter().map(|t| {
-                let p = (logits[class_of(t)] - top).exp();
-                total += p;
-                Act { turn: *t, prior: p, n: 0, w: 0.0 }
-            }).collect();
-            let flat = 1.0 / list.len() as f32;
-            for a in list.iter_mut() {
-                a.prior = (1.0 - even) * a.prior / total.max(1e-9) + even * flat;
-            }
-            acts[f] = list;
-        }
-        Node { acts, n: 0, v: ((g[0] - g[1]) * 0.5).tanh(), kids: Vec::new() }
+        expand_at(self.e, self.net, s, even, &mut self.x, &mut self.pass, &mut self.buf)
     }
 
     fn select(&self, node: usize, x: usize) -> usize {
-        let nd = &self.nodes[node];
-        let list = &nd.acts[x];
-        if list.len() == 1 {
-            return 0;
-        }
-        let root_n = (nd.n.max(1) as f32).sqrt();
-        let unseen = if x == 0 { nd.v } else { -nd.v } - self.cfg.fpu;
-        let mut best = (f32::MIN, 0);
-        for (i, a) in list.iter().enumerate() {
-            let q = if a.n > 0 { a.w / a.n as f32 } else { unseen };
-            let u = q + self.cfg.c * a.prior * root_n / (1.0 + a.n as f32);
-            if u > best.0 {
-                best = (u, i);
-            }
-        }
-        best.1
+        select_in(&self.nodes[node], x, &self.cfg)
     }
 
     /// Runs `count` lines from `root`.
@@ -236,6 +306,167 @@ impl<'a> Search<'a> {
             self.line(root, Some(first));
         }
         true
+    }
+
+    /// `iterate` on `threads` threads that share the one tree: lines until `count` are done
+    /// or the time `until` has come, whichever is first; returns the lines done. One thread
+    /// (or none to spare) is `iterate` itself, line for line. With more, each thread picks its
+    /// line's turns under a lock, plays them out and asks the network outside it (about two
+    /// thirds of a line's work), then reports back under the lock; a line on its way counts as
+    /// lost for the turns it took, so the threads spread over the tree. The result is not the
+    /// same from run to run.
+    ///
+    /// Measured on four cores (arena-21, 150 ms a position): 1.3 times one thread's lines on
+    /// two threads, 1.5 to 1.8 on three, and fewer again on four. The limit is the tree
+    /// itself: choosing turns and reporting back is a sixth of a line on one thread and three
+    /// times that when the positions' counts keep moving between cores. A line is worth what
+    /// one thread's is: at 25,600 lines three threads lost 0.00107 a decision against a deep
+    /// search's own results and one thread 0.00108 (480 decisions from real games).
+    pub fn iterate_threads(&mut self, root: &State, count: u32, threads: usize, until: Option<std::time::Instant>) -> u32 {
+        if root.result.is_some() {
+            return 0;
+        }
+        if self.nodes.is_empty() {
+            let nd = self.expand(root, self.cfg.even_root);
+            self.nodes.push(nd);
+        }
+        self.run(root, count, threads, until, None)
+    }
+
+    /// `ponder` on `threads` threads, until `count` lines are done or the time `until` has
+    /// come; the lines done, or None where `ponder` would return false.
+    pub fn ponder_threads(&mut self, root: &State, me: usize, ours: &RawTurn, count: u32, threads: usize, until: Option<std::time::Instant>) -> Option<u32> {
+        if root.result.is_some() || self.nodes.is_empty() {
+            return None;
+        }
+        let mine = self.nodes[0].acts[me].iter().position(|a| a.turn == *ours)?;
+        let theirs: Vec<f64> = self.nodes[0].acts[1 - me].iter().map(|a| a.n as f64).collect();
+        let total: f64 = theirs.iter().sum();
+        if total <= 0.0 {
+            return None;
+        }
+        let given = vec![0u32; theirs.len()];
+        Some(self.run(root, count, threads, until, Some(FirstTurns { me, mine, theirs, total, given, lines: 0 })))
+    }
+
+    fn run(&mut self, root: &State, count: u32, threads: usize, until: Option<std::time::Instant>, first: Option<FirstTurns>) -> u32 {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::sync::Mutex;
+        let late = |n: u32| n % 32 == 0 && until.map(|u| std::time::Instant::now() >= u).unwrap_or(false);
+        if threads <= 1 {
+            let mut first = first;
+            let mut done = 0u32;
+            while done < count && !late(done) {
+                let pair = first.as_mut().map(|f| f.next());
+                self.line(root, pair);
+                done += 1;
+            }
+            return done;
+        }
+        let (e, net, cfg) = (self.e, self.net, self.cfg);
+        let shared = Mutex::new(Shared { nodes: std::mem::take(&mut self.nodes), index: std::mem::take(&mut self.index), first });
+        let (taken, stop) = (AtomicU32::new(0), AtomicBool::new(false));
+        let parts: Vec<(u32, [u64; 64])> = std::thread::scope(|sc| {
+            let hs: Vec<_> = (0..threads)
+                .map(|_| {
+                    sc.spawn(|| {
+                        let (mut x, mut pass, mut buf) = (Inputs::default(), Pass::default(), Vec::new());
+                        let mut path: Vec<(u32, u16, u16)> = Vec::new();
+                        let mut pairs: Vec<[RawTurn; 2]> = Vec::new();
+                        let (mut done, mut hist) = (0u32, [0u64; 64]);
+                        loop {
+                            if stop.load(Ordering::Relaxed) || taken.fetch_add(1, Ordering::Relaxed) >= count {
+                                break;
+                            }
+                            if late(done) {
+                                stop.store(true, Ordering::Relaxed);
+                                break;
+                            }
+                            path.clear();
+                            pairs.clear();
+                            // down the tree under the lock: the turns, and the value when the line ends at a position already there
+                            let mut known: Option<f32> = None;
+                            {
+                                let mut t = grab(&shared);
+                                let forced = t.first.as_mut().map(|f| f.next());
+                                let mut node = 0usize;
+                                loop {
+                                    let (i0, i1) = match forced {
+                                        Some(pair) if node == 0 => pair,
+                                        _ => (select_in(&t.nodes[node], 0, &cfg), select_in(&t.nodes[node], 1, &cfg)),
+                                    };
+                                    path.push((node as u32, i0 as u16, i1 as u16));
+                                    let nd = &mut t.nodes[node];
+                                    pairs.push([nd.acts[0][i0].turn, nd.acts[1][i1].turn]);
+                                    nd.n += 1;
+                                    nd.acts[0][i0].n += 1;
+                                    nd.acts[0][i0].w -= ON_ITS_WAY;
+                                    nd.acts[1][i1].n += 1;
+                                    nd.acts[1][i1].w -= ON_ITS_WAY;
+                                    let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
+                                    match t.index.get(&key) {
+                                        Some(&child) => {
+                                            node = child as usize;
+                                            if path.len() as u32 >= cfg.depth {
+                                                known = Some(t.nodes[node].v);
+                                                break;
+                                            }
+                                        }
+                                        None => break,
+                                    }
+                                }
+                            }
+                            // outside it: the position the turns lead to, and the network's reading of it when it is new
+                            let mut s = *root;
+                            for pair in pairs.iter() {
+                                e.step(&mut s, pair);
+                            }
+                            let (value, child) = match (outcome(&s), known) {
+                                (Some(v), _) => (v, None),
+                                (None, Some(v)) => (v, None),
+                                (None, None) => {
+                                    let child = expand_at(e, net, &s, cfg.even, &mut x, &mut pass, &mut buf);
+                                    (child.v, Some(child))
+                                }
+                            };
+                            {
+                                let mut t = grab(&shared);
+                                if let Some(child) = child {
+                                    let (node, i0, i1) = *path.last().unwrap();
+                                    let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
+                                    if !t.index.contains_key(&key) && t.nodes.len() < cfg.max_nodes {
+                                        let id = t.nodes.len() as u32;
+                                        t.index.insert(key, id);
+                                        t.nodes[node as usize].kids.push(((i0 as u32) << 16 | i1 as u32, id));
+                                        t.nodes.push(child);
+                                    }
+                                }
+                                for &(n, i0, i1) in path.iter() {
+                                    let nd = &mut t.nodes[n as usize];
+                                    nd.acts[0][i0 as usize].w += ON_ITS_WAY + value;
+                                    nd.acts[1][i1 as usize].w += ON_ITS_WAY - value;
+                                }
+                            }
+                            hist[path.len().min(63)] += 1;
+                            done += 1;
+                        }
+                        (done, hist)
+                    })
+                })
+                .collect();
+            hs.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let t = shared.into_inner().unwrap();
+        self.nodes = t.nodes;
+        self.index = t.index;
+        let mut done = 0u32;
+        for (n, hist) in parts {
+            done += n;
+            for (i, h) in hist.iter().enumerate() {
+                self.depth_hist[i] += h;
+            }
+        }
+        done
     }
 
     /// One line from `root` to a new position or the end of the game; `first` fixes both

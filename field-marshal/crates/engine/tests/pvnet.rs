@@ -472,3 +472,59 @@ fn weighing_compares_our_turns_against_what_is_expected_and_their_best_answer() 
     let mut empty = Search::new(&e, &net, PvConfig::default());
     assert_eq!(empty.weigh(&e.new_match(5), 0, 100, 0.5).len(), 1);
 }
+
+#[test]
+fn threads_share_one_tree_and_leave_its_counts_whole() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(17);
+    let mut s = e.new_match(5);
+    for tick in 0..24 {
+        if s.result.is_some() {
+            break;
+        }
+        // one thread through the new entry is the plain search, line for line
+        let mut plain = Search::new(&e, &net, PvConfig::default());
+        plain.iterate(&s, 600);
+        let mut one = Search::new(&e, &net, PvConfig::default());
+        assert_eq!(one.iterate_threads(&s, 600, 1, None), 600);
+        assert_eq!(format!("{:?}", one.root()), format!("{:?}", plain.root()));
+        // three threads: every line counted once at the root and below, nothing left "on its way"
+        let mut many = Search::new(&e, &net, PvConfig::default());
+        assert_eq!(many.iterate_threads(&s, 600, 3, None), 600);
+        let root = many.root();
+        assert_eq!(many.visits(), 600);
+        for x in 0..2 {
+            assert_eq!(root[x].iter().map(|a| a.1).sum::<u32>(), 600);
+            for a in root[x].iter() {
+                assert!(a.2.abs() <= 1.0 + 1e-4, "a turn's mean result {} is outside -1..1: a line was left on its way", a.2);
+            }
+        }
+        // what one fighter won on the lines the other lost
+        let sum = |x: usize| root[x].iter().map(|a| a.1 as f64 * a.2 as f64).sum::<f64>();
+        assert!((sum(0) + sum(1)).abs() < 0.05, "the two fighters' results do not cancel: {} and {}", sum(0), sum(1));
+        // the positions below hold the root's lines between them (but for lines that ended the game)
+        let below: u32 = many.positions(&s).iter().filter(|p| p.0 == 1).map(|p| p.1 + 1).sum();
+        assert!(below <= 600, "{below} lines counted one tick down, 600 run");
+        // pondering on threads: every line begins with our turn
+        let ours = many.best(0);
+        let before = root[0].iter().find(|a| a.0 == ours).unwrap().1;
+        assert_eq!(many.ponder_threads(&s, 0, &ours, 300, 3, None), Some(300));
+        let after = many.root();
+        assert_eq!(after[0].iter().find(|a| a.0 == ours).unwrap().1, before + 300);
+        assert_eq!(after[1].iter().map(|a| a.1).sum::<u32>(), 900);
+        // a time already past stops the threads at once
+        let mut none = Search::new(&e, &net, PvConfig::default());
+        assert!(none.iterate_threads(&s, 100_000, 3, Some(std::time::Instant::now())) < 400);
+        // the tree is kept and moved on as ever
+        let pair = [many.best(0), many.best(1)];
+        let old = s;
+        e.step(&mut s, &pair);
+        if s.result.is_none() && tick % 3 == 0 {
+            assert!(many.advance_to(&old, &s));
+            assert!(many.visits() > 0);
+            many.iterate_threads(&s, 200, 3, None);
+            let r = many.root();
+            assert_eq!(r[0].iter().map(|a| a.1).sum::<u32>(), many.visits());
+        }
+    }
+}

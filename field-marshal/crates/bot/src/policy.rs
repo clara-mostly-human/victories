@@ -243,6 +243,12 @@ pub struct Playbook {
     /// against that answer as well (0.5) chose worse than the plain search on both maps
     /// tested, and all expectation chose a little better.
     pub tree_pv_trust: f64,
+    /// Threads for the learned search and its pondering, all on the one tree
+    /// (`pvsearch::Search::iterate_threads`). 1 (the default): the search as it was, line for
+    /// line. More gives more lines in the same time when the machine has cores to spare
+    /// (measured: 1.3 times on two, 1.5 to 1.8 on three, no more on four); the weighing of
+    /// `tree_pv_weigh` stays on one thread. The threads are plain threads started each tick.
+    pub tree_pv_threads: u32,
     /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
     /// past the time cap); 0: by time. For self-play: more games an hour, and the same game
     /// every time from the same seed.
@@ -435,6 +441,7 @@ impl Default for Playbook {
             tree_pv_ponder: 0,
             tree_pv_weigh: 0.0,
             tree_pv_trust: 1.0,
+            tree_pv_threads: 1,
             tree_iters: 0,
             book: std::collections::HashMap::new(),
             tree_quiet_buff: 0,
@@ -612,6 +619,9 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_pv_trust").and_then(Value::as_f64) {
             p.tree_pv_trust = x.clamp(0.0, 1.0);
+        }
+        if let Some(x) = v.get("tree_pv_threads").and_then(Value::as_u64) {
+            p.tree_pv_threads = (x as u32).clamp(1, 16);
         }
         if let Some(x) = v.get("tree_turn_model").and_then(Value::as_str) {
             p.tree_turn_model = x.to_string();
@@ -1703,13 +1713,20 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             // with `tree_pv_weigh`, that share of the lines (or of the time) is held back for it
             let hold = pb.tree_pv_weigh.clamp(0.0, 0.5);
             let (plain_iters, plain_until) = (((pb.tree_iters as f64) * (1.0 - hold)).round() as u32, ((deadline as f64) * (1.0 - hold)) as u64);
+            let threads = pb.tree_pv_threads.max(1) as usize;
             let mut done = 0u32;
-            loop {
-                let chunk = if pb.tree_iters > 0 { (plain_iters.max(1) - done).min(500) } else { 500 };
-                search.iterate(&s, chunk);
-                done += chunk;
-                if (pb.tree_iters > 0 && done >= plain_iters) || started.elapsed().as_millis() as u64 >= plain_until {
-                    break;
+            if threads > 1 {
+                // the threads stop at the count or the time themselves
+                let count = if pb.tree_iters > 0 { plain_iters.max(1) } else { u32::MAX };
+                done = search.iterate_threads(&s, count, threads, Some(started + std::time::Duration::from_millis(plain_until)));
+            } else {
+                loop {
+                    let chunk = if pb.tree_iters > 0 { (plain_iters.max(1) - done).min(500) } else { 500 };
+                    search.iterate(&s, chunk);
+                    done += chunk;
+                    if (pb.tree_iters > 0 && done >= plain_iters) || started.elapsed().as_millis() as u64 >= plain_until {
+                        break;
+                    }
                 }
             }
             let root = search.root();
@@ -1717,7 +1734,8 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             let value = search.value() as f64;
             let mut weighed: Vec<victris_engine::pvsearch::WeighedTurn> = Vec::new();
             if hold > 0.0 {
-                let lines = if pb.tree_iters > 0 { pb.tree_iters.saturating_sub(done) } else { ((done as f64) * hold / (1.0 - hold)).round() as u32 };
+                // by time, the weighing (one thread) gets the lines one thread does in its share of the tick
+                let lines = if pb.tree_iters > 0 { pb.tree_iters.saturating_sub(done) } else { ((done as f64) * hold / (1.0 - hold) / threads as f64).round() as u32 };
                 weighed = search.weigh(&s, me, lines.max(1), pb.tree_pv_trust as f32);
                 done += lines.max(1);
                 if let Some(first) = weighed.first() {
@@ -2490,12 +2508,16 @@ pub fn pv_ponder(t: &Tracker, pb: &Playbook, lines: u32, until: Option<Instant>)
     let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig::default());
     search.start_from(k.tree);
     let mut done = 0u32;
-    while done < lines && until.map(|u| Instant::now() < u).unwrap_or(true) {
-        let chunk = (lines - done).min(200);
-        if !search.ponder(&k.root, t.me, &k.ours, chunk) {
-            break;
+    if pb.tree_pv_threads > 1 {
+        done = search.ponder_threads(&k.root, t.me, &k.ours, lines, pb.tree_pv_threads as usize, until).unwrap_or(0);
+    } else {
+        while done < lines && until.map(|u| Instant::now() < u).unwrap_or(true) {
+            let chunk = (lines - done).min(200);
+            if !search.ponder(&k.root, t.me, &k.ours, chunk) {
+                break;
+            }
+            done += chunk;
         }
-        done += chunk;
     }
     let tree = search.into_tree();
     PV_KEPT.with(|m| m.borrow_mut().insert(key, PvKept { tick: k.tick, root: k.root, ours: k.ours, tree }));
