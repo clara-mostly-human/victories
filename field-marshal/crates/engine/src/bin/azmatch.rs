@@ -1,7 +1,7 @@
 //! azmatch: plays two searches against each other on the exact engine, everything in sight.
 //!
 //!   azmatch --a SPEC --b SPEC [--games 100] [--seed 1] [--threads 4] [--map columns-21] [--open 10]
-//!           [--book GAMES.az] [--soft 0]
+//!           [--book GAMES.az] [--book-from 20] [--book-to 220] [--soft 0]
 //!
 //! SPEC is `flag:N` (the flagship's search, the live playbook's settings, N lines a tick),
 //! `pv:NET.json:N` (the network-led search), `pvw:NET.json:N[:SHARE[:TRUST]]` (the same, its
@@ -20,7 +20,8 @@
 //! the same steps for both games of the pair, and the two players swap sides between them.
 //! Those openings are not enough: nothing has happened yet, so many games settle into the same
 //! few games anyway. With --book each pair instead starts from a position out of a saved game
-//! (azgen's file): a random tick from 20 to 220 with both alive and the hp within 20.
+//! (azgen's file): a random tick from --book-from to --book-to (20 to 220 unless given) with both
+//! alive and the hp within 20. A later range judges play in the small last zone.
 //! --soft K tests play from the spawn instead: before tick K each player draws its turn in
 //! proportion to its own search's visits, so every game is different and each player still
 //! plays its own opening (use with --open 0).
@@ -174,6 +175,9 @@ fn main() {
     let list = std::env::var("AZ_GAMES").is_ok();
     let soft: i32 = arg(&args, "--soft", 0);
     let book_path: String = arg(&args, "--book", String::new());
+    // the ticks a book position may come from
+    let book_from: i32 = arg(&args, "--book-from", 20);
+    let book_to: i32 = arg(&args, "--book-to", 220);
     let book: Vec<GameLog> = if book_path.is_empty() { Vec::new() } else { GameLog::read_all(&std::fs::read(&book_path).expect("cannot read the book")) };
     let players = [parse(&sa), parse(&sb)];
     let e = Engine::shipped(&map);
@@ -206,7 +210,7 @@ fn main() {
                                 let fit: Vec<usize> = (0..seen.len())
                                     .filter(|i| {
                                         let t = &seen[*i].s;
-                                        t.tick >= 20 && t.tick <= 220 && t.fighters[0].alive && t.fighters[1].alive && (t.fighters[0].hp - t.fighters[1].hp).abs() <= 20
+                                        t.tick >= book_from && t.tick <= book_to && t.fighters[0].alive && t.fighters[1].alive && (t.fighters[0].hp - t.fighters[1].hp).abs() <= 20
                                     })
                                     .collect();
                                 if !fit.is_empty() {

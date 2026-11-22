@@ -7,7 +7,18 @@
 //!
 //!   azgen --out FILE --games N [--net NET.json] [--iters 800] [--seed 1] [--threads 4]
 //!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25] [--earned 0] [--mix 0]
-//!         [--lead 0]
+//!         [--lead 0] [--from GAMES.az] [--from-share 0.5] [--from-tick 0]
+//!         [--from-level 1000]
+//!
+//! With --from a share of the games (--from-share) do not start at tick 0 but from a position
+//! out of a saved game (ladder games as `azreal` saves them): a game drawn from the file is
+//! replayed to a tick drawn evenly from --from-tick up to five ticks before its end, and the
+//! search plays both fighters on from there. Self-play on its own only ever learns the
+//! positions its own play reaches; ladder opponents take the bot to others (the small last
+//! zone, an opponent that keeps away while we hold a power pad). With --from-level H only
+//! positions with the two fighters' hp within H are taken, so the game that follows is long.
+//! The replayed ticks are saved with no lesson, so the trainer replays the whole game and
+//! learns from the searched ticks only.
 //!
 //! Which turn is played: before tick --open one drawn in proportion to the search's visits;
 //! after it the most visited one, or with chance --wander a drawn one. That plays a turn the
@@ -57,18 +68,23 @@ fn main() {
     let mix: u32 = arg(&args, "--mix", 0);
     let lead: u32 = arg(&args, "--lead", 0);
     let net_path: String = arg(&args, "--net", String::new());
+    let from_path: String = arg(&args, "--from", String::new());
+    let from_share: f64 = arg(&args, "--from-share", 0.5);
+    let from_tick: usize = arg(&args, "--from-tick", 0);
+    let from_level: i32 = arg(&args, "--from-level", 1000);
+    let from: Vec<GameLog> = if from_path.is_empty() { Vec::new() } else { GameLog::read_all(&std::fs::read(&from_path).expect("cannot read the --from games")) };
     let net = if net_path.is_empty() { None } else { Some(PvNet::load(std::path::Path::new(&net_path)).expect("cannot read the network")) };
     let e = Engine::shipped(&map);
     let flag = mcts::Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, slam_prior: 0.228, ..Default::default() };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let started = std::time::Instant::now();
-    let parts: Vec<(Vec<u8>, [u64; 6])> = std::thread::scope(|sc| {
+    let parts: Vec<(Vec<u8>, [u64; 7])> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 sc.spawn(|| {
                     let mut bytes: Vec<u8> = Vec::new();
-                    // games, positions, ticks, fighter 0 wins, fighter 1 wins, search lines
-                    let mut st = [0u64; 6];
+                    // games, positions, ticks, fighter 0 wins, fighter 1 wins, search lines, games from a saved position
+                    let mut st = [0u64; 7];
                     loop {
                         let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if g >= games {
@@ -78,6 +94,29 @@ fn main() {
                         let mut s = e.new_match((seed as i64).wrapping_mul(7919).wrapping_add(g as i64));
                         let match_seed = (seed as i64).wrapping_mul(7919).wrapping_add(g as i64);
                         let mut log = GameLog { seed: match_seed, z: 0, ticks: Vec::new() };
+                        if !from.is_empty() && rng.unit() < from_share {
+                            for _ in 0..200 {
+                                let real = &from[rng.below(from.len())];
+                                if real.ticks.len() < from_tick + 10 {
+                                    continue;
+                                }
+                                let at = from_tick + rng.below(real.ticks.len() - 5 - from_tick);
+                                let mut t = e.new_match(real.seed);
+                                for k in &real.ticks[..at] {
+                                    if t.result.is_some() {
+                                        break;
+                                    }
+                                    e.step(&mut t, &k.turns);
+                                }
+                                if t.result.is_some() || t.tick < at as i32 || (t.fighters[0].hp - t.fighters[1].hp).abs() > from_level {
+                                    continue;
+                                }
+                                s = t;
+                                log = GameLog { seed: real.seed, z: 0, ticks: real.ticks[..at].iter().map(|k| TickLog { turns: k.turns, q: None, pol: None }).collect() };
+                                st[6] += 1;
+                                break;
+                            }
+                        }
                         let mut searched = 0u64;
                         let mut pv = net.as_ref().map(|n| pvsearch::Search::new(&e, n, PvConfig { even_root: wide, lead_at: lead, ..Default::default() }));
                         while s.result.is_none() {
@@ -146,19 +185,20 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut file = std::io::BufWriter::new(std::fs::File::create(&out).expect("cannot write the output"));
-    let mut st = [0u64; 6];
+    let mut st = [0u64; 7];
     for (bytes, s) in &parts {
         file.write_all(bytes).unwrap();
-        for i in 0..6 {
+        for i in 0..7 {
             st[i] += s[i];
         }
     }
     file.flush().unwrap();
     let secs = started.elapsed().as_secs_f64();
     println!(
-        "azgen {}: {} games, {} positions, {:.0} ticks a game, fighter 0 won {} / fighter 1 won {} / drawn {}, {:.1} s ({:.1} games a minute, {:.0} lines a second a thread)",
+        "azgen {}: {} games ({} from a saved position), {} positions, {:.0} ticks a game, fighter 0 won {} / fighter 1 won {} / drawn {}, {:.1} s ({:.1} games a minute, {:.0} lines a second a thread)",
         if net.is_some() { "network" } else { "flagship" },
         st[0],
+        st[6],
         st[1],
         st[2] as f64 / st[0].max(1) as f64,
         st[3],

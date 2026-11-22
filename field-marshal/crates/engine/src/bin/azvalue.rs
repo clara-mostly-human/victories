@@ -25,7 +25,7 @@ use victris_engine::rules::AttackKind;
 use victris_engine::state::{FState, Fighter, State};
 use victris_engine::{Engine, RawTurn};
 
-const KINDS: [&str; 12] = [
+const KINDS: [&str; 19] = [
     "all positions",
     "in sight within 4 tiles",
     "X: dash and repulsor ready, other within 4",
@@ -38,6 +38,13 @@ const KINDS: [&str; 12] = [
     "X stunned now",
     "X ahead by 15 hp or more",
     "even hp (within 5), nobody powered",
+    "X powered, other not, other beyond 8 tiles or unseen",
+    "X powered, other not, other within 4 in sight",
+    "tick 380 or later (the small last zone)",
+    "tick 380 or later and hp within 10",
+    "X on a power pad that appears within 5 ticks",
+    "the same and the other within 2 tiles of that pad",
+    "X within 2 of a power pad appearing within 5 ticks, other not",
 ];
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -66,11 +73,15 @@ fn main() {
             games.push((r.seed, r.ticks.iter().map(|t| t.turns).collect()));
         }
     }
-    let (mut n, mut value, mut real) = ([0u64; 12], [0.0f64; 12], [0.0f64; 12]);
+    let (mut n, mut value, mut real) = ([0u64; 19], [0.0f64; 19], [0.0f64; 19]);
     // over every position: summed value loss and positions; right about the winner and positions of won games
     let (mut loss, mut positions, mut hit, mut decided) = (0.0f64, 0u64, 0u64, 0u64);
+    // the same four by part of the game: ticks 0-199, 200-379, 380 and later
+    let mut part = [[0.0f64; 4]; 3];
+    // and again for the positions with the two fighters' hp within 10
+    let mut level = [[0.0f64; 4]; 3];
     // per game and kind: summed (real - value) and positions
-    let mut per: Vec<([f64; 12], [f64; 12])> = Vec::new();
+    let mut per: Vec<([f64; 19], [f64; 19])> = Vec::new();
     for (seed, turns) in &games {
         let mut s = e.new_match(*seed);
         let mut seen: Vec<State> = Vec::new();
@@ -82,16 +93,30 @@ fn main() {
             e.step(&mut s, t);
         }
         let Some(z0) = outcome(&s) else { continue };
-        per.push(([0.0; 12], [0.0; 12]));
+        per.push(([0.0; 19], [0.0; 19]));
         let slot = per.len() - 1;
         for p in &seen {
             let v0 = net.eval(&e, p).v0 as f64;
             let (chance, target) = (0.5 * (1.0 + v0), 0.5 * (1.0 + z0 as f64));
             loss -= target * (chance + 1e-7).ln() + (1.0 - target) * (1.0 - chance + 1e-7).ln();
             positions += 1;
+            let b = if p.tick < 200 { 0 } else if p.tick < 380 { 1 } else { 2 };
+            part[b][0] -= target * (chance + 1e-7).ln() + (1.0 - target) * (1.0 - chance + 1e-7).ln();
+            part[b][1] += 1.0;
+            let close = (p.fighters[0].hp - p.fighters[1].hp).abs() <= 10;
+            if close {
+                level[b][0] -= target * (chance + 1e-7).ln() + (1.0 - target) * (1.0 - chance + 1e-7).ln();
+                level[b][1] += 1.0;
+            }
             if z0 != 0.0 {
                 decided += 1;
                 hit += ((v0 > 0.0) == (z0 > 0.0)) as u64;
+                part[b][2] += ((v0 > 0.0) == (z0 > 0.0)) as u64 as f64;
+                part[b][3] += 1.0;
+                if close {
+                    level[b][2] += ((v0 > 0.0) == (z0 > 0.0)) as u64 as f64;
+                    level[b][3] += 1.0;
+                }
             }
             for x in 0..2 {
                 let (me, op) = (&p.fighters[x], &p.fighters[1 - x]);
@@ -104,6 +129,8 @@ fn main() {
                 let powered = |f: &Fighter| f.power_until > p.tick;
                 let by_wall = (-1..=1).any(|dx| (-1..=1).any(|dy| (dx != 0 || dy != 0) && e.map.is_wall([me.pos[0] + dx, me.pos[1] + dy])));
                 let threat = near && ready(op);
+                // a power pad that is not out yet and appears within 5 ticks: how far each fighter is from the nearest to X
+                let soon = e.map.pads.iter().enumerate().filter(|(i, pd)| pd.kind == victris_engine::map::PadKind::Power && !p.pads[*i].available && p.pads[*i].respawn_tick - p.tick <= 5).map(|(_, pd)| (chebyshev(pd.pos, me.pos), chebyshev(pd.pos, op.pos))).min();
                 let kinds = [
                     true,
                     near,
@@ -117,8 +144,15 @@ fn main() {
                     me.state == FState::Stunned,
                     me.hp - op.hp >= 15,
                     (me.hp - op.hp).abs() <= 5 && !powered(me) && !powered(op),
+                    powered(me) && !powered(op) && (chebyshev(me.pos, op.pos) > 8 || !can_see(&e.rules, &e.map, me.pos, op.pos)),
+                    powered(me) && !powered(op) && near,
+                    p.tick >= 380,
+                    p.tick >= 380 && (me.hp - op.hp).abs() <= 10,
+                    matches!(soon, Some((0, _))),
+                    matches!(soon, Some((0, d)) if d <= 2),
+                    matches!(soon, Some((a, b)) if a <= 2 && b > 2),
                 ];
-                for k in 0..12 {
+                for k in 0..19 {
                     if kinds[k] {
                         n[k] += 1;
                         value[k] += v;
@@ -138,8 +172,20 @@ fn main() {
         loss / positions.max(1) as f64,
         100.0 * hit as f64 / decided.max(1) as f64
     );
+    for (b, name) in ["ticks 0-199", "ticks 200-379", "tick 380 and later"].iter().enumerate() {
+        println!(
+            "  {:<20} {:>8} positions: value loss {:.4}, picks the winner {:.1}%; with the hp within 10: {} positions, value loss {:.4}, picks the winner {:.1}%",
+            name,
+            part[b][1] as u64,
+            part[b][0] / part[b][1].max(1.0),
+            100.0 * part[b][2] / part[b][3].max(1.0),
+            level[b][1] as u64,
+            level[b][0] / level[b][1].max(1.0),
+            100.0 * level[b][2] / level[b][3].max(1.0)
+        );
+    }
     println!("For fighter X: the network's value, the real result, and the gap (real less value; negative: the network thinks too well of it for X)");
-    for k in 0..12 {
+    for k in 0..19 {
         let c = n[k].max(1) as f64;
         let gap = (real[k] - value[k]) / c;
         let err = per.iter().map(|(a, m)| (a[k] - gap * m[k]) * (a[k] - gap * m[k])).sum::<f64>().sqrt() / c;
