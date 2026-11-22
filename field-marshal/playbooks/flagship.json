@@ -1,7 +1,7 @@
 {
   "default": {
     "name": "learned",
-    "tree_ms": 300,
+    "tree_ms": 150,
     "tree_value": 1.0,
     "tree_gen": 13,
     "tree_dash_burst": true,
