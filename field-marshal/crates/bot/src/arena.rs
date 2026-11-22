@@ -79,11 +79,15 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
                 }
             }
             // ARENA_ORACLE=name: that playbook's learned search is told the true state while
-            // the opponent is out of sight (an experiment: the worth of a perfect guess).
+            // the opponent is out of sight (an experiment: the worth of a perfect guess). The
+            // name is the playbook's own, which the arena binary sets to A or B, not the
+            // file's: ARENA_ORACLE=A.
             let oracle = std::env::var("ARENA_ORACLE").map(|n| n == book.name).unwrap_or(false);
             crate::policy::PV_ORACLE.with(|o| *o.borrow_mut() = if oracle { Some(s) } else { None });
+            crate::policy::PV_TRUTH.with(|o| *o.borrow_mut() = Some(s));
             let d = decide(&trackers[i], &view, book);
             crate::policy::PV_ORACLE.with(|o| *o.borrow_mut() = None);
+            crate::policy::PV_TRUTH.with(|o| *o.borrow_mut() = None);
             if book.tree_pv_ponder > 0 && d.note == "pv" {
                 crate::policy::pv_ponder(&trackers[i], book, book.tree_pv_ponder, None);
             }
