@@ -357,6 +357,51 @@ fn axpy(acc: &mut [f32], x: f32, w: &[f32]) {
     }
 }
 
+/// One block of a layer: for each of `B` units from `at`, its bias and then every input times
+/// its weight to the unit, added in the order the inputs come. The running sums are a local
+/// array of a fixed size, so the compiler holds them in registers for the whole block where
+/// `axpy` over the layer loads and stores every unit's sum once for each input. A unit's sum is
+/// built from the same numbers in the same order either way, so it comes out the same to the
+/// last bit.
+#[inline(always)]
+fn block<'w, const B: usize>(out: &mut [f32], bias: &[f32], at: usize, n: usize, input: &impl Fn(usize) -> (f32, &'w [f32])) {
+    let mut acc = [0.0f32; B];
+    acc.copy_from_slice(&bias[at..at + B]);
+    for k in 0..n {
+        let (x, row) = input(k);
+        let row: &[f32; B] = row[at..at + B].try_into().unwrap();
+        for j in 0..B {
+            acc[j] += x * row[j];
+        }
+    }
+    out[at..at + B].copy_from_slice(&acc);
+}
+
+/// A whole layer before its units' curve: `out[j] = bias[j] + the sum over the n inputs of
+/// input k's value times its weight to unit j`, in blocks of 32 units (then 8, 4 and single
+/// ones for what is left).
+#[inline(always)]
+fn layer<'w>(out: &mut [f32], bias: &[f32], n: usize, input: impl Fn(usize) -> (f32, &'w [f32])) {
+    let h = out.len();
+    let mut at = 0;
+    while at + 32 <= h {
+        block::<32>(out, bias, at, n, &input);
+        at += 32;
+    }
+    while at + 8 <= h {
+        block::<8>(out, bias, at, n, &input);
+        at += 8;
+    }
+    while at + 4 <= h {
+        block::<4>(out, bias, at, n, &input);
+        at += 4;
+    }
+    while at < h {
+        block::<1>(out, bias, at, n, &input);
+        at += 1;
+    }
+}
+
 #[inline(always)]
 fn dot(a: &[f32], b: &[f32]) -> f32 {
     // four running sums, so the compiler can use vector instructions
@@ -461,31 +506,39 @@ impl PvNet {
 
     /// One pass over one view's inputs.
     pub fn forward(&self, x: &Inputs, p: &mut Pass) {
+        self.hidden(x, p);
+        self.numbers(p);
+    }
+
+    /// The first part of a pass: both hidden layers and the score `g`. A position's value needs
+    /// only this much of each view.
+    pub fn hidden(&self, x: &Inputs, p: &mut Pass) {
         let (h1, h2) = (self.h1, self.h2);
         let l = layout(h1, h2);
         let w = &self.w;
-        let z1 = &mut p.z1[..h1];
-        z1.copy_from_slice(&w[l.b1..l.b1 + h1]);
-        for k in 0..x.n {
+        layer(&mut p.z1[..h1], &w[l.b1..l.b1 + h1], x.n, |k| {
             let i = x.idx[k] as usize;
-            axpy(z1, x.val[k], &w[l.t1 + i * h1..l.t1 + (i + 1) * h1]);
-        }
+            (x.val[k], &w[l.t1 + i * h1..l.t1 + (i + 1) * h1])
+        });
         for j in 0..h1 {
             p.a1[j] = act(p.z1[j]);
         }
-        let z2 = &mut p.z2[..h2];
-        z2.copy_from_slice(&w[l.b2..l.b2 + h2]);
-        for i in 0..h1 {
-            axpy(z2, p.a1[i], &w[l.t2 + i * h2..l.t2 + (i + 1) * h2]);
-        }
+        let a1 = &p.a1;
+        layer(&mut p.z2[..h2], &w[l.b2..l.b2 + h2], h1, |i| (a1[i], &w[l.t2 + i * h2..l.t2 + (i + 1) * h2]));
         for j in 0..h2 {
             p.a2[j] = act(p.z2[j]);
         }
         p.g = w[l.vb] + dot(&w[l.vw..l.vw + h2], &p.a2[..h2]);
-        p.logits.copy_from_slice(&w[l.pb..l.pb + CLASSES]);
-        for j in 0..h2 {
-            axpy(&mut p.logits, p.a2[j], &w[l.tp + j * CLASSES..l.tp + (j + 1) * CLASSES]);
-        }
+    }
+
+    /// The rest of a pass: the number for each kind of turn, from the second hidden layer that
+    /// `hidden` left in `p`.
+    pub fn numbers(&self, p: &mut Pass) {
+        let h2 = self.h2;
+        let l = layout(self.h1, h2);
+        let w = &self.w;
+        let a2 = &p.a2;
+        layer(&mut p.logits, &w[l.pb..l.pb + CLASSES], h2, |j| (a2[j], &w[l.tp + j * CLASSES..l.tp + (j + 1) * CLASSES]));
     }
 
     /// Adds to `grad` the slope of a loss with respect to every weight, given the loss's slope

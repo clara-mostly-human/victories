@@ -4,7 +4,7 @@
 //! tree from one tick to the next.
 
 use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
-use victris_engine::pvnet::{class_of, encode, layout, loss_grad, turns, Inputs, PvNet, Sample, Scratch, Sym, CLASSES, IN};
+use victris_engine::pvnet::{act, class_of, encode, layout, loss_grad, turns, Inputs, Pass, PvNet, Sample, Scratch, Sym, CLASSES, IN};
 use victris_engine::pvsearch::{pick, PvConfig, Rng, Search};
 use victris_engine::{Engine, RawTurn};
 
@@ -527,4 +527,112 @@ fn threads_share_one_tree_and_leave_its_counts_whole() {
             assert_eq!(r[0].iter().map(|a| a.1).sum::<u32>(), many.visits());
         }
     }
+}
+
+#[test]
+fn a_pass_in_blocks_is_the_plain_pass_to_the_last_bit() {
+    // `PvNet::forward` works a layer through in blocks of units; a unit's sum must still be its
+    // bias and then each input times its weight, added in the order the inputs come
+    let e = Engine::shipped("columns-21");
+    let mut rng = Rng::new(3);
+    for (h1, h2) in [(64usize, 32usize), (24, 12), (37, 13), (128, 128)] {
+        let mut net = PvNet::blank("columns-21", h1, h2, 5 + h1 as u64);
+        for w in net.w.iter_mut() {
+            *w += (rng.unit() as f32 - 0.5) * 0.7;
+        }
+        let l = layout(h1, h2);
+        let w = &net.w;
+        let game = random_game(&e, 40 + h1 as u64, 60);
+        let mut s = e.new_match(game.seed);
+        let (mut x, mut p) = (Inputs::default(), Pass::default());
+        for t in game.ticks.iter().take(60) {
+            for f in 0..2 {
+                encode(&e, &s, f, &mut x);
+                net.forward(&x, &mut p);
+                let mut z1: Vec<f32> = w[l.b1..l.b1 + h1].to_vec();
+                for k in 0..x.n {
+                    for j in 0..h1 {
+                        z1[j] += x.val[k] * w[l.t1 + x.idx[k] as usize * h1 + j];
+                    }
+                }
+                let mut z2: Vec<f32> = w[l.b2..l.b2 + h2].to_vec();
+                for i in 0..h1 {
+                    for j in 0..h2 {
+                        z2[j] += act(z1[i]) * w[l.t2 + i * h2 + j];
+                    }
+                }
+                let mut numbers: Vec<f32> = w[l.pb..l.pb + CLASSES].to_vec();
+                for j in 0..h2 {
+                    for c in 0..CLASSES {
+                        numbers[c] += act(z2[j]) * w[l.tp + j * CLASSES + c];
+                    }
+                }
+                let bits = |v: &[f32]| v.iter().map(|a| a.to_bits()).collect::<Vec<u32>>();
+                assert_eq!(bits(&p.z1[..h1]), bits(&z1), "first layer, {h1} and {h2} units");
+                assert_eq!(bits(&p.z2[..h2]), bits(&z2), "second layer, {h1} and {h2} units");
+                assert_eq!(bits(&p.logits), bits(&numbers), "turn numbers, {h1} and {h2} units");
+                // the two halves of a pass, as the search takes them, are the whole pass
+                let mut q = Pass::default();
+                net.hidden(&x, &mut q);
+                assert_eq!(q.g.to_bits(), p.g.to_bits());
+                net.numbers(&mut q);
+                assert_eq!(bits(&q.logits), bits(&p.logits));
+            }
+            e.step(&mut s, &t.turns);
+            if s.result.is_some() {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn a_position_no_line_was_played_on_from_is_searched_like_a_fresh_one() {
+    // a new position gets only its value; its turn lists are made when a line is first played
+    // on from it. Moving the tree onto such a position and searching must be the search a new
+    // tree makes from there, line for line.
+    let e = Engine::shipped("columns-21");
+    let net = random_net(23);
+    let mut s = e.new_match(11);
+    let mut tried = 0;
+    for _ in 0..30 {
+        if s.result.is_some() {
+            break;
+        }
+        let mut kept = Search::new(&e, &net, PvConfig::default());
+        kept.iterate(&s, 400);
+        let pair = [kept.best(0), kept.best(1)];
+        // a position one tick down that was reached once and never played on from
+        let leaf = kept.positions(&s).into_iter().find(|p| p.0 == 1 && p.1 == 0);
+        if let Some((_, _, c)) = leaf {
+            if kept.advance_to(&s, &c) {
+                tried += 1;
+                assert_eq!(kept.visits(), 0);
+                kept.iterate(&c, 300);
+                let mut fresh = Search::new(&e, &net, PvConfig::default());
+                fresh.iterate(&c, 300);
+                assert_eq!(format!("{:?}", kept.root()), format!("{:?}", fresh.root()));
+                assert_eq!(kept.nodes(), fresh.nodes());
+                // and the same on threads: its lists are made before the threads start
+                let mut many = Search::new(&e, &net, PvConfig::default());
+                many.iterate(&s, 400);
+                assert!(many.advance_to(&s, &c));
+                assert_eq!(many.iterate_threads(&c, 300, 3, None), 300);
+                assert_eq!(many.root()[0].iter().map(|a| a.1).sum::<u32>(), 300);
+                // weighing right after the move reads the root's lists too
+                let mut moved = Search::new(&e, &net, PvConfig::default());
+                moved.iterate(&s, 400);
+                assert!(moved.advance_to(&s, &c));
+                assert!(!moved.weigh(&c, 0, 100, 0.5).is_empty());
+            }
+        }
+        // threads going on from a tree one thread made: the positions it left without lists get them
+        let mut both = Search::new(&e, &net, PvConfig::default());
+        both.iterate(&s, 300);
+        assert_eq!(both.iterate_threads(&s, 300, 3, None), 300);
+        assert_eq!(both.visits(), 600);
+        assert_eq!(both.root()[1].iter().map(|a| a.1).sum::<u32>(), 600);
+        e.step(&mut s, &pair);
+    }
+    assert!(tried >= 5, "only {tried} positions never played on from were found");
 }
