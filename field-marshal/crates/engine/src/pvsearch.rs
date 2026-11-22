@@ -608,6 +608,20 @@ impl<'a> Search<'a> {
     /// shows in the result. None when `ours` is not one of the root's turns or nothing was
     /// searched from `root` yet.
     pub fn answer(&mut self, root: &State, me: usize, ours: &RawTurn, lines: u32) -> Option<RawTurn> {
+        let got = self.answer_lines(root, me, ours, lines)?;
+        let mut best = (0u32, f32::MIN, RawTurn::IDLE);
+        for (i, g) in got.iter().enumerate() {
+            if i == 0 || g.1 > best.0 || (g.1 == best.0 && g.2 > best.1) {
+                best = (g.1, g.2, g.0);
+            }
+        }
+        Some(best.2)
+    }
+
+    /// The work of `answer`, and what it found: each turn of fighter `1 - me` (in the order
+    /// of `root()`) with the lines that began with it against `ours` and their mean result
+    /// for that fighter. With a single turn to answer with nothing is searched.
+    pub fn answer_lines(&mut self, root: &State, me: usize, ours: &RawTurn, lines: u32) -> Option<Vec<(RawTurn, u32, f32)>> {
         if root.result.is_some() || self.nodes.is_empty() {
             return None;
         }
@@ -618,7 +632,7 @@ impl<'a> Search<'a> {
             return None;
         }
         if count == 1 {
-            return Some(self.nodes[0].acts[other][0].turn);
+            return Some(vec![(self.nodes[0].acts[other][0].turn, 0, 0.0)]);
         }
         let mut order: Vec<usize> = (0..count).collect();
         order.sort_by(|a, b| self.nodes[0].acts[other][*b].prior.total_cmp(&self.nodes[0].acts[other][*a].prior));
@@ -658,14 +672,7 @@ impl<'a> Search<'a> {
             got[j].1 += side * value;
             total += 1;
         }
-        let mut best = (0u32, f32::MIN, 0usize);
-        for j in 0..count {
-            let mean = if got[j].0 > 0 { got[j].1 / got[j].0 as f32 } else { f32::MIN };
-            if got[j].0 > best.0 || (got[j].0 == best.0 && mean > best.1) {
-                best = (got[j].0, mean, j);
-            }
-        }
-        Some(turns[best.2])
+        Some((0..count).map(|j| (turns[j], got[j].0, if got[j].0 > 0 { got[j].1 / got[j].0 as f32 } else { f32::MIN })).collect())
     }
 
     /// `iterate` on `threads` threads: lines until `count` are done or the time `until` has

@@ -25,7 +25,7 @@ use victris_engine::rules::AttackKind;
 use victris_engine::state::{FState, Fighter, State};
 use victris_engine::{Engine, RawTurn};
 
-const KINDS: [&str; 21] = [
+const KINDS: [&str; 24] = [
     "all positions",
     "in sight within 4 tiles",
     "X: dash and repulsor ready, other within 4",
@@ -47,6 +47,9 @@ const KINDS: [&str; 21] = [
     "X within 2 of a power pad appearing within 5 ticks, other not",
     "other ready, X within 4 and by a wall or the map edge",
     "the same and X can step this tick",
+    "X slowed (inside the other's slow area)",
+    "X slowed, the other's shot ready, within 6 in sight",
+    "X slowed and the other within 6 in sight, its shot not ready",
 ];
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -58,6 +61,7 @@ fn main() {
     let net = PvNet::load(std::path::Path::new(&arg(&args, "--net").expect("--net NET.json"))).expect("cannot read the network");
     let e = Engine::shipped(&net.map);
     let burst = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Burst { .. }));
+    let shot = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Projectile { .. }));
     // the games as a seed and the turns played
     let mut games: Vec<(i64, Vec<[RawTurn; 2]>)> = Vec::new();
     if let Some(path) = arg(&args, "--az") {
@@ -75,7 +79,7 @@ fn main() {
             games.push((r.seed, r.ticks.iter().map(|t| t.turns).collect()));
         }
     }
-    let (mut n, mut value, mut real) = ([0u64; 21], [0.0f64; 21], [0.0f64; 21]);
+    let (mut n, mut value, mut real) = ([0u64; 24], [0.0f64; 24], [0.0f64; 24]);
     // over every position: summed value loss and positions; right about the winner and positions of won games
     let (mut loss, mut positions, mut hit, mut decided) = (0.0f64, 0u64, 0u64, 0u64);
     // the same four by part of the game: ticks 0-199, 200-379, 380 and later
@@ -83,7 +87,7 @@ fn main() {
     // and again for the positions with the two fighters' hp within 10
     let mut level = [[0.0f64; 4]; 3];
     // per game and kind: summed (real - value) and positions
-    let mut per: Vec<([f64; 21], [f64; 21])> = Vec::new();
+    let mut per: Vec<([f64; 24], [f64; 24])> = Vec::new();
     for (seed, turns) in &games {
         let mut s = e.new_match(*seed);
         let mut seen: Vec<State> = Vec::new();
@@ -95,7 +99,7 @@ fn main() {
             e.step(&mut s, t);
         }
         let Some(z0) = outcome(&s) else { continue };
-        per.push(([0.0; 21], [0.0; 21]));
+        per.push(([0.0; 24], [0.0; 24]));
         let slot = per.len() - 1;
         for p in &seen {
             let v0 = net.eval(&e, p).v0 as f64;
@@ -138,6 +142,9 @@ fn main() {
                 }));
                 // a power pad that is not out yet and appears within 5 ticks: how far each fighter is from the nearest to X
                 let soon = e.map.pads.iter().enumerate().filter(|(i, pd)| pd.kind == victris_engine::map::PadKind::Power && !p.pads[*i].available && p.pads[*i].respawn_tick - p.tick <= 5).map(|(_, pd)| (chebyshev(pd.pos, me.pos), chebyshev(pd.pos, op.pos))).min();
+                let slowed = victris_engine::observe::slow_ticks_left(&e.map, p, x) > 0;
+                let in6 = chebyshev(me.pos, op.pos) <= 6 && can_see(&e.rules, &e.map, me.pos, op.pos);
+                let shot_ready = op.state == FState::Idle && shot.map(|b| op.cd_attack[b] == 0).unwrap_or(false);
                 let kinds = [
                     true,
                     near,
@@ -160,8 +167,11 @@ fn main() {
                     matches!(soon, Some((a, b)) if a <= 2 && b > 2),
                     threat && by_edge,
                     threat && by_edge && me.cd_move == 0 && me.state == FState::Idle,
+                    slowed,
+                    slowed && in6 && shot_ready,
+                    slowed && in6 && !shot_ready,
                 ];
-                for k in 0..21 {
+                for k in 0..24 {
                     if kinds[k] {
                         n[k] += 1;
                         value[k] += v;
@@ -194,7 +204,7 @@ fn main() {
         );
     }
     println!("For fighter X: the network's value, the real result, and the gap (real less value; negative: the network thinks too well of it for X)");
-    for k in 0..21 {
+    for k in 0..24 {
         let c = n[k].max(1) as f64;
         let gap = (real[k] - value[k]) / c;
         let err = per.iter().map(|(a, m)| (a[k] - gap * m[k]) * (a[k] - gap * m[k])).sum::<f64>().sqrt() / c;

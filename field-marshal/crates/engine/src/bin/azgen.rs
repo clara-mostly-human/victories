@@ -8,7 +8,7 @@
 //!   azgen --out FILE --games N [--net NET.json] [--iters 800] [--seed 1] [--threads 4]
 //!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25] [--earned 0] [--mix 0]
 //!         [--lead 0] [--from GAMES.az] [--from-share 0.5] [--from-tick 0]
-//!         [--from-level 1000] [--read 0] [--read-lines N]
+//!         [--from-level 1000] [--read 0] [--read-lines N] [--read-teach 0] [--teach-answer 0]
 //!
 //! With --from a share of the games (--from-share) do not start at tick 0 but from a position
 //! out of a saved game (ladder games as `azreal` saves them): a game drawn from the file is
@@ -38,6 +38,16 @@
 //! position is cheap. Here a habit that can be read is punished as soon as it is shown,
 //! and the game's result teaches what the position costs. What is saved for the trainer
 //! at that tick is still the plain search's visits for both fighters: no bot is told.
+//! With --read-teach 1 the fighter that was told is taught its answer instead: the shares of
+//! the lines each of its turns got against the told turn (less the one line every turn is
+//! given to begin with). Its lesson is then the best play against what the other fighter
+//! really does in that position, not against everything the search thought it might do: a
+//! network taught so comes to expect the punishment of its own habits, and its search stops
+//! having them (each side answering what the other has been doing settles on the mix).
+//! With --teach-answer P the same lesson is made without the answer being played: at each
+//! tick with chance P one fighter's answer to the turn the other really plays is worked out
+//! and saved as its lesson, and the game goes on with the turns the plain search chose. The
+//! games and their results are then plain self-play; only what the moves are taught changes.
 //!
 //! --wide makes the search look wider at the root than anywhere else, so self-play tries turns
 //! the network thinks little of. With --earned 1 what is saved for the trainer is the visits
@@ -84,19 +94,21 @@ fn main() {
     let from_level: i32 = arg(&args, "--from-level", 1000);
     let read: f64 = arg(&args, "--read", 0.0);
     let read_lines: u32 = arg(&args, "--read-lines", iters / 2);
+    let read_teach: u32 = arg(&args, "--read-teach", 0);
+    let teach_answer: f64 = arg(&args, "--teach-answer", 0.0);
     let from: Vec<GameLog> = if from_path.is_empty() { Vec::new() } else { GameLog::read_all(&std::fs::read(&from_path).expect("cannot read the --from games")) };
     let net = if net_path.is_empty() { None } else { Some(PvNet::load(std::path::Path::new(&net_path)).expect("cannot read the network")) };
     let e = Engine::shipped(&map);
     let flag = mcts::Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, slam_prior: 0.228, ..Default::default() };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let started = std::time::Instant::now();
-    let parts: Vec<(Vec<u8>, [u64; 9])> = std::thread::scope(|sc| {
+    let parts: Vec<(Vec<u8>, [u64; 11])> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 sc.spawn(|| {
                     let mut bytes: Vec<u8> = Vec::new();
                     // games, positions, ticks, fighter 0 wins, fighter 1 wins, search lines, games from a saved position
-                    let mut st = [0u64; 9];
+                    let mut st = [0u64; 11];
                     loop {
                         let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if g >= games {
@@ -178,10 +190,38 @@ fn main() {
                             if read > 0.0 && visits[0].len() > 1 && visits[1].len() > 1 && rng.unit() < read {
                                 // one fighter is told the other's turn and answers it
                                 let reader = rng.below(2);
-                                if let Some(t) = pv.as_mut().and_then(|p| p.answer(&s, 1 - reader, &pair[1 - reader], read_lines)) {
+                                if let Some(got) = pv.as_mut().and_then(|p| p.answer_lines(&s, 1 - reader, &pair[1 - reader], read_lines)) {
+                                    let mut best = 0usize;
+                                    for i in 1..got.len() {
+                                        if got[i].1 > got[best].1 || (got[i].1 == got[best].1 && got[i].2 > got[best].2) {
+                                            best = i;
+                                        }
+                                    }
+                                    let t = got[best].0;
                                     st[7] += 1;
                                     st[8] += (t != pair[reader]) as u64;
                                     pair[reader] = t;
+                                    if read_teach > 0 && got.len() > 1 {
+                                        let answer: Vec<(RawTurn, u32)> = got.iter().map(|g| (g.0, g.1.saturating_sub(1))).collect();
+                                        if answer.iter().any(|a| a.1 > 0) {
+                                            let mut both = pol.take().unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])]);
+                                            both[reader] = shares(&answer);
+                                            pol = Some(both);
+                                        }
+                                    }
+                                }
+                            } else if teach_answer > 0.0 && visits[0].len() > 1 && visits[1].len() > 1 && rng.unit() < teach_answer {
+                                // one fighter's answer to the turn the other plays is its lesson; it is not played
+                                let reader = rng.below(2);
+                                if let Some(got) = pv.as_mut().and_then(|p| p.answer_lines(&s, 1 - reader, &pair[1 - reader], read_lines)) {
+                                    let answer: Vec<(RawTurn, u32)> = got.iter().map(|g| (g.0, g.1.saturating_sub(1))).collect();
+                                    if let Some(top) = answer.iter().max_by_key(|a| a.1).filter(|a| a.1 > 0) {
+                                        st[9] += 1;
+                                        st[10] += (top.0 != pair[reader]) as u64;
+                                        let mut both = pol.take().unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])]);
+                                        both[reader] = shares(&answer);
+                                        pol = Some(both);
+                                    }
                                 }
                             }
                             log.ticks.push(TickLog { turns: pair, q, pol: Some(pol.unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])])) });
@@ -206,22 +246,24 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut file = std::io::BufWriter::new(std::fs::File::create(&out).expect("cannot write the output"));
-    let mut st = [0u64; 9];
+    let mut st = [0u64; 11];
     for (bytes, s) in &parts {
         file.write_all(bytes).unwrap();
-        for i in 0..9 {
+        for i in 0..11 {
             st[i] += s[i];
         }
     }
     file.flush().unwrap();
     let secs = started.elapsed().as_secs_f64();
     println!(
-        "azgen {}: {} games ({} from a saved position; a fighter was told the other's turn at {} ticks and changed its own at {}), {} positions, {:.0} ticks a game, fighter 0 won {} / fighter 1 won {} / drawn {}, {:.1} s ({:.1} games a minute, {:.0} lines a second a thread)",
+        "azgen {}: {} games ({} from a saved position; a fighter was told the other's turn at {} ticks and changed its own at {}; taught its answer unplayed at {} ticks, not the turn it played at {}), {} positions, {:.0} ticks a game, fighter 0 won {} / fighter 1 won {} / drawn {}, {:.1} s ({:.1} games a minute, {:.0} lines a second a thread)",
         if net.is_some() { "network" } else { "flagship" },
         st[0],
         st[6],
         st[7],
         st[8],
+        st[9],
+        st[10],
         st[1],
         st[2] as f64 / st[0].max(1) as f64,
         st[3],
