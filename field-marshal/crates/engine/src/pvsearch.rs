@@ -52,6 +52,11 @@ struct Node {
     /// the network's value of this position for fighter 0
     v: f32,
     kids: Vec<(u32, u32)>,
+    /// The position itself, kept from the first time a line is played on from here. A line
+    /// then starts from the kept position nearest its end and plays only the turns after it,
+    /// where it used to play every turn from the root again: on a line of four or five
+    /// ticks all but the last were positions the search had already been through.
+    state: Option<std::sync::Arc<State>>,
 }
 
 pub struct Search<'a> {
@@ -139,7 +144,7 @@ fn expand_at(e: &Engine, net: &PvNet, s: &State, even: f32, x: &mut Inputs, pass
         }
         acts[f] = list;
     }
-    Node { acts, n: 0, v: ((g[0] - g[1]) * 0.5).tanh(), kids: Vec::new() }
+    Node { acts, n: 0, v: ((g[0] - g[1]) * 0.5).tanh(), kids: Vec::new(), state: None }
 }
 
 /// The turn of fighter `x` the next line through `nd` takes.
@@ -316,12 +321,13 @@ impl<'a> Search<'a> {
     /// lost for the turns it took, so the threads spread over the tree. The result is not the
     /// same from run to run.
     ///
-    /// Measured on four cores (arena-21, 150 ms a position): 1.3 times one thread's lines on
-    /// two threads, 1.5 to 1.8 on three, and fewer again on four. The limit is the tree
-    /// itself: choosing turns and reporting back is a sixth of a line on one thread and three
-    /// times that when the positions' counts keep moving between cores. A line is worth what
-    /// one thread's is: at 25,600 lines three threads lost 0.00107 a decision against a deep
-    /// search's own results and one thread 0.00108 (480 decisions from real games).
+    /// Measured on four cores (arena-21, 150 ms a position), against one thread: 1.05 to
+    /// 1.15 times the lines on two threads, 1.3 to 1.6 on three, and fewer again on four.
+    /// The limit is the tree itself: choosing turns and reporting back is a quarter of a line
+    /// on one thread and about three times that when the positions' counts keep moving
+    /// between cores, and one thread does it at a time. A line is worth what one thread's is:
+    /// at 25,600 lines three threads lost 0.00107 a decision against a deep search's own
+    /// results and one thread 0.00108 (480 decisions from real games).
     pub fn iterate_threads(&mut self, root: &State, count: u32, threads: usize, until: Option<std::time::Instant>) -> u32 {
         if root.result.is_some() {
             return 0;
@@ -373,6 +379,7 @@ impl<'a> Search<'a> {
                         let (mut x, mut pass, mut buf) = (Inputs::default(), Pass::default(), Vec::new());
                         let mut path: Vec<(u32, u16, u16)> = Vec::new();
                         let mut pairs: Vec<[RawTurn; 2]> = Vec::new();
+                        let mut fresh: Vec<(usize, std::sync::Arc<State>)> = Vec::new();
                         let (mut done, mut hist) = (0u32, [0u64; 64]);
                         loop {
                             if stop.load(Ordering::Relaxed) || taken.fetch_add(1, Ordering::Relaxed) >= count {
@@ -384,8 +391,12 @@ impl<'a> Search<'a> {
                             }
                             path.clear();
                             pairs.clear();
-                            // down the tree under the lock: the turns, and the value when the line ends at a position already there
+                            fresh.clear();
+                            // down the tree under the lock: the turns, the kept position nearest the
+                            // line's end, and the value when the line ends at a position already there
                             let mut known: Option<f32> = None;
+                            let mut kept: (usize, Option<std::sync::Arc<State>>) = (0, None);
+                            let mut deepest = (0usize, 0usize);
                             {
                                 let mut t = grab(&shared);
                                 let forced = t.first.as_mut().map(|f| f.next());
@@ -407,6 +418,9 @@ impl<'a> Search<'a> {
                                     match t.index.get(&key) {
                                         Some(&child) => {
                                             node = child as usize;
+                                            if t.nodes[node].state.is_some() {
+                                                deepest = (path.len(), node);
+                                            }
                                             if path.len() as u32 >= cfg.depth {
                                                 known = Some(t.nodes[node].v);
                                                 break;
@@ -415,22 +429,43 @@ impl<'a> Search<'a> {
                                         None => break,
                                     }
                                 }
+                                if known.is_none() && deepest.0 > 0 {
+                                    kept = (deepest.0, t.nodes[deepest.1].state.clone());
+                                }
                             }
-                            // outside it: the position the turns lead to, and the network's reading of it when it is new
-                            let mut s = *root;
-                            for pair in pairs.iter() {
-                                e.step(&mut s, pair);
-                            }
-                            let (value, child) = match (outcome(&s), known) {
-                                (Some(v), _) => (v, None),
-                                (None, Some(v)) => (v, None),
-                                (None, None) => {
-                                    let child = expand_at(e, net, &s, cfg.even, &mut x, &mut pass, &mut buf);
-                                    (child.v, Some(child))
+                            // outside it: the turns after the kept position, on the engine, and the
+                            // network's reading of the position they lead to when it is new
+                            let (value, child) = match known {
+                                Some(v) => (v, None),
+                                None => {
+                                    let mut s = match &kept.1 {
+                                        Some(state) => **state,
+                                        None => *root,
+                                    };
+                                    for k in kept.0..pairs.len() {
+                                        if k > kept.0 {
+                                            fresh.push((k, std::sync::Arc::new(s)));
+                                        }
+                                        e.step(&mut s, &pairs[k]);
+                                    }
+                                    match outcome(&s) {
+                                        Some(v) => (v, None),
+                                        None => {
+                                            let child = expand_at(e, net, &s, cfg.even, &mut x, &mut pass, &mut buf);
+                                            (child.v, Some(child))
+                                        }
+                                    }
                                 }
                             };
+                            drop(kept);
                             {
                                 let mut t = grab(&shared);
+                                for (k, state) in fresh.drain(..) {
+                                    let nd = &mut t.nodes[path[k].0 as usize];
+                                    if nd.state.is_none() {
+                                        nd.state = Some(state);
+                                    }
+                                }
                                 if let Some(child) = child {
                                     let (node, i0, i1) = *path.last().unwrap();
                                     let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
@@ -472,44 +507,68 @@ impl<'a> Search<'a> {
     /// One line from `root` to a new position or the end of the game; `first` fixes both
     /// fighters' turns at the root. Returns the line's result for fighter 0.
     fn line(&mut self, root: &State, first: Option<(usize, usize)>) -> f32 {
-        let mut s = *root;
         let mut node = 0usize;
         self.path.clear();
-        let value;
-        loop {
+        // the position furthest down the line whose state is kept: the turns played to reach it, and the position
+        let mut kept: (usize, Option<usize>) = (0, None);
+        let mut capped: Option<f32> = None;
+        // down the tree by the counts alone, to a pair of turns not tried from its position (or the longest line allowed)
+        let key = loop {
             let (i0, i1) = match first {
                 Some(pair) if node == 0 => pair,
                 _ => (self.select(node, 0), self.select(node, 1)),
             };
             self.path.push((node as u32, i0 as u16, i1 as u16));
-            let pair = [self.nodes[node].acts[0][i0].turn, self.nodes[node].acts[1][i1].turn];
-            self.e.step(&mut s, &pair);
-            if let Some(v) = outcome(&s) {
-                value = v;
-                break;
-            }
             let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
             match self.index.get(&key) {
                 Some(&child) => {
                     node = child as usize;
+                    if self.nodes[node].state.is_some() {
+                        kept = (self.path.len(), Some(node));
+                    }
                     if self.path.len() as u32 >= self.cfg.depth {
-                        value = self.nodes[node].v;
-                        break;
+                        capped = Some(self.nodes[node].v);
+                        break key;
                     }
                 }
-                None => {
-                    let child = self.expand(&s, self.cfg.even);
-                    value = child.v;
-                    if self.nodes.len() < self.cfg.max_nodes {
-                        let id = self.nodes.len() as u32;
-                        self.index.insert(key, id);
-                        self.nodes[node].kids.push(((i0 as u32) << 16 | i1 as u32, id));
-                        self.nodes.push(child);
+                None => break key,
+            }
+        };
+        let value = match capped {
+            Some(v) => v,
+            None => {
+                // the turns after the kept position, on the engine; a pair that has a position
+                // under it did not end the game, so only the last turn can
+                let mut s = match kept.1 {
+                    Some(n) => **self.nodes[n].state.as_ref().unwrap(),
+                    None => *root,
+                };
+                for k in kept.0..self.path.len() {
+                    let (n, i0, i1) = self.path[k];
+                    let nd = &mut self.nodes[n as usize];
+                    if k > 0 && nd.state.is_none() {
+                        nd.state = Some(std::sync::Arc::new(s));
                     }
-                    break;
+                    let pair = [nd.acts[0][i0 as usize].turn, nd.acts[1][i1 as usize].turn];
+                    self.e.step(&mut s, &pair);
+                }
+                match outcome(&s) {
+                    Some(v) => v,
+                    None => {
+                        let child = self.expand(&s, self.cfg.even);
+                        let v = child.v;
+                        if self.nodes.len() < self.cfg.max_nodes {
+                            let (n, i0, i1) = *self.path.last().unwrap();
+                            let id = self.nodes.len() as u32;
+                            self.index.insert(key, id);
+                            self.nodes[n as usize].kids.push(((i0 as u32) << 16 | i1 as u32, id));
+                            self.nodes.push(child);
+                        }
+                        v
+                    }
                 }
             }
-        }
+        };
         self.depth_hist[self.path.len().min(63)] += 1;
         for k in 0..self.path.len() {
             let (n, i0, i1) = self.path[k];

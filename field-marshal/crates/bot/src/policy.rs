@@ -246,7 +246,7 @@ pub struct Playbook {
     /// Threads for the learned search and its pondering, all on the one tree
     /// (`pvsearch::Search::iterate_threads`). 1 (the default): the search as it was, line for
     /// line. More gives more lines in the same time when the machine has cores to spare
-    /// (measured: 1.3 times on two, 1.5 to 1.8 on three, no more on four); the weighing of
+    /// (measured: 1.05 to 1.15 times on two, 1.3 to 1.6 on three, no more on four); the weighing of
     /// `tree_pv_weigh` stays on one thread. The threads are plain threads started each tick.
     pub tree_pv_threads: u32,
     /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
