@@ -10,7 +10,8 @@
     "tree_threads": 1,
     "tree_reuse": true,
     "tree_slam_prior": 0.228,
-    "tree_pv_dir": "/Users/clara/Projects/victris/field-marshal/models/pv"
+    "tree_pv_dir": "/Users/clara/Projects/victris/field-marshal/models/pv",
+    "tree_pv_weigh": 0.2
   },
   "opponents": {}
 }
