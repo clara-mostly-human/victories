@@ -2,6 +2,8 @@
 //!
 //!   azvalue --net NET.json --list FILES.txt     (ladder replays, one .jsonl a line)
 //!   azvalue --net NET.json --az FILE.az         (saved games: azgen's self-play, azreal's)
+//!   azvalue --net NET.json --list FILES.txt --who NAME   (only fighters X that face the bot NAME,
+//!                                                 or whose name starts with it when it ends in *)
 //!
 //! For every position of every game that ends in a result, and each fighter X: the network's
 //! value for X (-1 to 1, no search) beside the game's real result for X, averaged over the
@@ -63,10 +65,22 @@ fn main() {
     let burst = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Burst { .. }));
     let shot = e.rules.attacks.iter().position(|a| matches!(a.kind, AttackKind::Projectile { .. }));
     // the games as a seed and the turns played
+    // --who: only positions of the fighter that faces this bot (replays only: saved games carry no names)
+    let who = arg(&args, "--who");
+    let named = |name: &str| match &who {
+        Some(w) => match w.strip_suffix('*') {
+            Some(start) => name.to_lowercase().starts_with(&start.to_lowercase()),
+            None => name == w,
+        },
+        None => true,
+    };
+    // per game: which fighters are the bot --who names (both when not given)
+    let mut faced: Vec<[bool; 2]> = Vec::new();
     let mut games: Vec<(i64, Vec<[RawTurn; 2]>)> = Vec::new();
     if let Some(path) = arg(&args, "--az") {
         for g in GameLog::read_all(&std::fs::read(&path).expect("cannot read the saved games")) {
             games.push((g.seed, g.ticks.iter().map(|t| t.turns).collect()));
+            faced.push([who.is_none(); 2]);
         }
     } else {
         let list = arg(&args, "--list").expect("--list FILES.txt or --az FILE.az");
@@ -76,10 +90,17 @@ fn main() {
             if r.engine.map.name != e.map.name || r.engine.rules.hash != e.rules.hash {
                 continue;
             }
+            let is = [r.bots.first().map(|b| named(b)).unwrap_or(false), r.bots.get(1).map(|b| named(b)).unwrap_or(false)];
+            if !is[0] && !is[1] {
+                continue;
+            }
             games.push((r.seed, r.ticks.iter().map(|t| t.turns).collect()));
+            faced.push(is);
         }
     }
     let (mut n, mut value, mut real) = ([0u64; 24], [0.0f64; 24], [0.0f64; 24]);
+    // per kind: the positions where the other fighter can act, and where its turn is a dash with the repulsor
+    let (mut could, mut slams) = ([0u64; 24], [0u64; 24]);
     // over every position: summed value loss and positions; right about the winner and positions of won games
     let (mut loss, mut positions, mut hit, mut decided) = (0.0f64, 0u64, 0u64, 0u64);
     // the same four by part of the game: ticks 0-199, 200-379, 380 and later
@@ -88,7 +109,7 @@ fn main() {
     let mut level = [[0.0f64; 4]; 3];
     // per game and kind: summed (real - value) and positions
     let mut per: Vec<([f64; 24], [f64; 24])> = Vec::new();
-    for (seed, turns) in &games {
+    for (game, (seed, turns)) in games.iter().enumerate() {
         let mut s = e.new_match(*seed);
         let mut seen: Vec<State> = Vec::new();
         for t in turns {
@@ -101,7 +122,7 @@ fn main() {
         let Some(z0) = outcome(&s) else { continue };
         per.push(([0.0; 24], [0.0; 24]));
         let slot = per.len() - 1;
-        for p in &seen {
+        for (at, p) in seen.iter().enumerate() {
             let v0 = net.eval(&e, p).v0 as f64;
             let (chance, target) = (0.5 * (1.0 + v0), 0.5 * (1.0 + z0 as f64));
             loss -= target * (chance + 1e-7).ln() + (1.0 - target) * (1.0 - chance + 1e-7).ln();
@@ -126,9 +147,11 @@ fn main() {
             }
             for x in 0..2 {
                 let (me, op) = (&p.fighters[x], &p.fighters[1 - x]);
-                if !(me.alive && op.alive) {
+                if !(me.alive && op.alive) || !faced[game][1 - x] {
                     continue;
                 }
+                let theirs = &turns[at][1 - x];
+                let slam = theirs.dash != victris_engine::turn::DirIn::None && matches!(theirs.attack, victris_engine::turn::AttackIn::Named { attack, .. } if Some(attack as usize) == burst);
                 let (v, z) = if x == 0 { (v0, z0 as f64) } else { (-v0, -(z0 as f64)) };
                 let near = chebyshev(me.pos, op.pos) <= 4 && can_see(&e.rules, &e.map, me.pos, op.pos);
                 let ready = |f: &Fighter| f.state == FState::Idle && f.cd_dash == 0 && burst.map(|b| f.cd_attack[b] == 0).unwrap_or(false);
@@ -178,6 +201,8 @@ fn main() {
                         real[k] += z;
                         per[slot].0[k] += z - v;
                         per[slot].1[k] += 1.0;
+                        could[k] += (op.state == FState::Idle) as u64;
+                        slams[k] += slam as u64;
                     }
                 }
             }
@@ -208,6 +233,15 @@ fn main() {
         let c = n[k].max(1) as f64;
         let gap = (real[k] - value[k]) / c;
         let err = per.iter().map(|(a, m)| (a[k] - gap * m[k]) * (a[k] - gap * m[k])).sum::<f64>().sqrt() / c;
-        println!("  {:<54} {:>8} positions   value {:+.3}   real {:+.3}   gap {:+.3} +-{:.3}", KINDS[k], n[k], value[k] / c, real[k] / c, gap, err);
+        println!(
+            "  {:<54} {:>8} positions   value {:+.3}   real {:+.3}   gap {:+.3} +-{:.3}   the other dashes with the repulsor {:.1}%",
+            KINDS[k],
+            n[k],
+            value[k] / c,
+            real[k] / c,
+            gap,
+            err,
+            100.0 * slams[k] as f64 / could[k].max(1) as f64
+        );
     }
 }
