@@ -292,8 +292,9 @@ pub fn overload(root: &Path, cfg: &Config) -> Option<String> {
     }
     for b in cfg.bots.iter().filter(|b| b.expect_online) {
         if let Some(p99) = recent_think_p99_ms(root, &b.name) {
-            if p99 > cfg.guard_think_p99_ms {
-                return Some(format!("{} think time p99 is {p99:.0} ms, above {:.0} ms", b.name, cfg.guard_think_p99_ms));
+            let limit = b.think_p99_ms.unwrap_or(cfg.guard_think_p99_ms);
+            if p99 > limit {
+                return Some(format!("{} think time p99 is {p99:.0} ms, above {limit:.0} ms", b.name));
             }
         }
     }

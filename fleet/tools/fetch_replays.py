@@ -7,7 +7,10 @@ The GitHub workflow .github/workflows/corpus.yml runs it and commits the result 
 `corpus` branch; the Mac pulls that branch (`fleet collect import`), verifies every replay
 on the exact engine and indexes it.
 
-  fetch_replays.py --out DIR [--max 300] [--gap 1.5] [--top 12] [--ours a,b,c] [--ours-share 0.4]
+  fetch_replays.py --out DIR [--max 300] [--gap 1.5] [--top 12] [--full 5] [--ours a,b,c] [--ours-share 0.5]
+
+Each run: our own bots' new games up to --ours-share of --max, then every new game of the
+--full best other bots, then the rest of the --top bots, taking turns, with what is left.
 
 DIR gets replays/<first 5 characters of the id>/<id>.jsonl.gz and index.jsonl, one line per
 replay: the ladder's own record of the match (bots, versions, ratings, result).
@@ -53,9 +56,12 @@ def main():
     ap.add_argument("--max", type=int, default=300)
     ap.add_argument("--gap", type=float, default=1.5)
     ap.add_argument("--top", type=int, default=12)
+    # The best bots' games in full: real-game value lessons and loss reviews learn from them
+    # (2026-11-22: at 80% for our own games, only 21 of about 60 Slopocalypse games came in).
+    ap.add_argument("--full", type=int, default=5)
     ap.add_argument("--ours", default="field-marshal,foot-soldier,shock-trooper,quarter-master,spy-master")
-    # Our own games first: the fight scorecards are about our arms (2026-11-18).
-    ap.add_argument("--ours-share", type=float, default=0.8)
+    # Our own games are capped at this share; what they leave goes to the top bots.
+    ap.add_argument("--ours-share", type=float, default=0.5)
     a = ap.parse_args()
 
     index_path = os.path.join(a.out, "index.jsonl")
@@ -77,28 +83,30 @@ def main():
         top = [r["name"] for r in rows if r.get("name") and r["name"] not in ours][: a.top]
         print("top bots:", ", ".join(top), flush=True)
 
+        chosen = set()
+
         def wanted(names, budget):
-            """Newest unfetched matches of these bots, taking turns between the bots."""
+            """Newest unfetched, not yet chosen matches of these bots, taking turns between the bots."""
             lists = []
             for name in names:
                 body = get(f"{HOST}/api/matches?bot={urllib.parse.quote(name)}&limit=200", a.gap)
                 ms = json.loads(body) if body else []
                 ms = ms if isinstance(ms, list) else ms.get("matches", [])
                 lists.append([m for m in ms if safe(m.get("id", "")) and m["id"] not in have and not m.get("voided") and m.get("ended")])
-            out, seen, k = [], set(), 0
+            out, k = [], 0
             while len(out) < budget and any(k < len(l) for l in lists):
                 for l in lists:
-                    if k < len(l) and l[k]["id"] not in seen and len(out) < budget:
-                        seen.add(l[k]["id"])
+                    if k < len(l) and l[k]["id"] not in chosen and len(out) < budget:
+                        chosen.add(l[k]["id"])
                         out.append(l[k])
                 k += 1
             return out
 
-        ours_budget = int(a.max * a.ours_share)
-        todo = wanted(top, a.max - ours_budget)
-        chosen = {m["id"] for m in todo}
-        todo += [m for m in wanted(ours, ours_budget + (a.max - ours_budget - len(todo))) if m["id"] not in chosen]
-        print(f"{len(todo)} replays to fetch", flush=True)
+        mine = wanted(ours, int(a.max * a.ours_share))
+        best = wanted(top[: a.full], a.max - len(mine))
+        rest = wanted(top[a.full:], a.max - len(mine) - len(best))
+        todo = best + mine + rest
+        print(f"{len(todo)} replays to fetch: {len(best)} of the best {a.full} bots, {len(mine)} of ours, {len(rest)} of the other top bots", flush=True)
 
         with open(index_path, "a") as index:
             for m in todo[: a.max]:

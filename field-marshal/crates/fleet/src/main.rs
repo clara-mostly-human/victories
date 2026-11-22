@@ -1219,7 +1219,7 @@ fn main_inner() -> Result<i32, String> {
                 );
                 for b in cfg.bots.iter().filter(|b| b.expect_online) {
                     if let Some(p99) = fleet::online::recent_think_p99_ms(&root, &b.name) {
-                        println!("{:<15} think time p99 over the last 90 s: {p99:.0} ms (guard at {:.0})", b.name, cfg.guard_think_p99_ms);
+                        println!("{:<15} think time p99 over the last 90 s: {p99:.0} ms (guard at {:.0})", b.name, b.think_p99_ms.unwrap_or(cfg.guard_think_p99_ms));
                     }
                 }
                 for b in &cfg.bots {

@@ -144,27 +144,42 @@ fn run_stdio(mut session: Session, provisional: bool) {
     // Frames are read on a thread of their own, so this thread can ponder between ticks and
     // still see the next frame within a few milliseconds of its arrival. Deciding and
     // pondering stay on this thread: the learned search keeps its tree in a thread local.
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    // Each frame carries the moment it arrived. After a stall on the connection the ladder's
+    // frames come in a burst: a frame with a newer observation behind it is answered at once
+    // (the ladder has moved past it), and the newest gets what is left of the think time
+    // after its wait, so the bot catches up instead of thinking in full on stale positions
+    // (2026-11-22: a 2.5 s stall cost foot-soldier two turns at 450 ms).
+    let (tx, rx) = std::sync::mpsc::channel::<(Instant, String)>();
     std::thread::spawn(move || {
         for line in stdin.lock().lines() {
             let Ok(line) = line else { break };
-            if tx.send(line).is_err() {
+            if tx.send((Instant::now(), line)).is_err() {
                 break;
             }
         }
     });
-    let mut pending: Option<String> = None;
+    let mut queued: std::collections::VecDeque<(Instant, String)> = std::collections::VecDeque::new();
     loop {
-        let line = match pending.take() {
-            Some(l) => l,
-            None => match rx.recv() {
-                Ok(l) => l,
+        if queued.is_empty() {
+            match rx.recv() {
+                Ok(x) => queued.push_back(x),
                 Err(_) => break,
-            },
-        };
+            }
+        }
+        while let Ok(x) = rx.try_recv() {
+            queued.push_back(x);
+        }
+        let Some((arrived, line)) = queued.pop_front() else { continue };
         if line.trim().is_empty() {
             continue;
         }
+        session.frame_wait_ms = if !queued.is_empty() && is_observation(&line) && queued.iter().any(|(_, l)| is_observation(l)) {
+            u64::MAX
+        } else {
+            // A few milliseconds is the normal hand-over (a ponder slice): not a wait.
+            let w = arrived.elapsed().as_millis() as u64;
+            if w < 5 { 0 } else { w }
+        };
         let mut sent_turn = false;
         for o in session.handle(&line) {
             match o {
@@ -191,16 +206,24 @@ fn run_stdio(mut session: Session, provisional: bool) {
                 Out::Done => return,
             }
         }
-        if sent_turn {
-            pending = ponder_until_next_frame(&mut session, &rx);
+        session.frame_wait_ms = 0;
+        if sent_turn && queued.is_empty() {
+            if let Some(x) = ponder_until_next_frame(&mut session, &rx) {
+                queued.push_back(x);
+            }
         }
     }
+}
+
+/// A ladder observation (the frames worth a decision). Parsed only while frames are queued.
+fn is_observation(line: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(line).ok().is_some_and(|v| v.get("type").and_then(serde_json::Value::as_str) == Some("observation"))
 }
 
 /// Grows the learned search's kept tree in short slices until the next frame arrives (or
 /// there is nothing to ponder, or 1.5 s have gone by without a frame), and returns that frame.
 /// Each slice is sized to take about 1 to 2 ms, so a frame waits at most a couple of milliseconds.
-fn ponder_until_next_frame(session: &mut Session, rx: &std::sync::mpsc::Receiver<String>) -> Option<String> {
+fn ponder_until_next_frame(session: &mut Session, rx: &std::sync::mpsc::Receiver<(Instant, String)>) -> Option<(Instant, String)> {
     use std::sync::mpsc::TryRecvError;
     let started = Instant::now();
     let mut slice: u32 = 16;

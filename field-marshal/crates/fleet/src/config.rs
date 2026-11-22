@@ -34,6 +34,9 @@ pub struct BotConfig {
     /// override test (gateway bots): on every Nth tick send an empty turn first, then the
     /// engine's; 0 is off
     pub provisional_test_every: u64,
+    /// this bot's own think-time guard (p99, ms) in place of guard.think_p99_ms, for a bot
+    /// given a longer think time on purpose (foot-soldier at 450 ms, 2026-11-22)
+    pub think_p99_ms: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,6 +115,7 @@ impl Config {
                     owner: text("owner"),
                     gateway: flag("gateway"),
                     provisional_test_every: b.get("provisional_test_every").and_then(Value::as_u64).unwrap_or(0),
+                    think_p99_ms: b.get("think_p99_ms").and_then(Value::as_f64),
                 });
             }
         }

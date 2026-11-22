@@ -132,6 +132,10 @@ struct Match {
     sims: u64,
     /// learned-search lines grown between ticks (pondering)
     pondered: u64,
+    /// observations answered at once because a newer one was already queued, and ones whose
+    /// think was cut by the time they had waited behind another
+    frames_behind: u32,
+    frames_waited: u32,
     rejected: u32,
     server_refusals: u32,
     panics: u32,
@@ -184,6 +188,9 @@ pub struct Session {
     log_day: String,
     /// behind the gateway: the state of the ladder connection as the gateway last told us
     gateway_connection: Option<String>,
+    /// set by the frame loop before `handle`: how long this frame waited behind others, in
+    /// ms, or u64::MAX when a newer observation is already queued (see Tracker::think_cap_ms)
+    pub frame_wait_ms: u64,
 }
 
 fn utc_day() -> String {
@@ -253,7 +260,7 @@ fn diff_paths(a: &Value, b: &Value, path: &str, out: &mut Vec<String>) {
 
 impl Session {
     pub fn new(cfg: Config) -> Session {
-        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, refusals: 0, remote: None, slow_streak: 0, early: None, log: None, log_day: String::new(), gateway_connection: None }
+        Session { cfg, cur: None, played: 0, wins: 0, losses: 0, draws: 0, stop_after_match: false, refusals: 0, remote: None, slow_streak: 0, early: None, log: None, log_day: String::new(), gateway_connection: None, frame_wait_ms: 0 }
     }
 
     pub fn queue_frame(&self) -> String {
@@ -442,6 +449,8 @@ impl Session {
                 think_us: Vec::new(),
                 sims: 0,
                 pondered: 0,
+                frames_behind: 0,
+                frames_waited: 0,
                 rejected: 0,
                 server_refusals: 0,
                 panics: 0,
@@ -468,6 +477,7 @@ impl Session {
 
     fn observe_in(&mut self, m: &mut Match, msg: &Value, tick: i32, received: Instant) -> Vec<Out> {
         let idle = json!({ "tick": tick }).to_string();
+        let frame_wait = std::mem::take(&mut self.frame_wait_ms);
         let events: &[Value] = msg.get("events").and_then(Value::as_array).map(|a| a.as_slice()).unwrap_or(&[]);
         let my_id = msg.get("self").and_then(|s| s.get("id")).and_then(Value::as_i64);
         for e in events {
@@ -508,6 +518,14 @@ impl Session {
             if let Some(tracker) = m.tracker.as_ref() {
                 tracker.note_budget_left(b);
             }
+        }
+        if let Some(tracker) = m.tracker.as_ref() {
+            tracker.note_frame_wait(frame_wait);
+        }
+        match frame_wait {
+            0 => {}
+            u64::MAX => m.frames_behind += 1,
+            _ => m.frames_waited += 1,
         }
         let Some(tracker) = m.tracker.as_mut() else { return vec![Out::Send(idle)] };
 
@@ -607,13 +625,16 @@ impl Session {
         let us = received.elapsed().as_micros() as u32;
         m.think_us.push(us);
         m.sims += decision.sims as u64;
-        let line = json!({
+        let mut line = json!({
             "t": "tick", "match": m.id, "tick": tick, "us": us, "sync": sync.name(), "sims": decision.sims,
             "why": decision.note, "score": (decision.score * 100.0).round() / 100.0, "turn": turn,
             "hp": [view.me.hp, view.enemy.as_ref().map(|e| e.hp)], "enemy_seen": view.enemy.is_some(),
             "budget_ms": msg.get("self").and_then(|s| s.get("budget_ms_left")),
             "truth_diff": truth_note,
         });
+        if frame_wait > 0 {
+            line["waited_ms"] = if frame_wait == u64::MAX { json!("behind") } else { json!(frame_wait) };
+        }
         if sync == Sync::Mismatch {
             let why: String = tracker.last_mismatch.take().unwrap_or_default().chars().take(1500).collect();
             let detail = json!({ "match": m.id, "tick": tick, "why": why, "events": events });
@@ -658,7 +679,7 @@ impl Session {
                 "final_tick": msg.get("final_tick"), "rating_change": msg.get("rating_change"), "voided": msg.get("voided"),
                 "replay_url": msg.get("replay_url"),
                 "think_us": { "p50": pct(0.5), "p99": pct(0.99), "max": m.think_us.last() },
-                "sims": m.sims, "pondered": m.pondered, "rejected_parts": m.rejected, "server_refusals": m.server_refusals, "panics": m.panics,
+                "sims": m.sims, "pondered": m.pondered, "frames_behind": m.frames_behind, "frames_waited": m.frames_waited, "rejected_parts": m.rejected, "server_refusals": m.server_refusals, "panics": m.panics,
                 "min_budget_ms": if m.min_budget_ms == i64::MAX { Value::Null } else { json!(m.min_budget_ms) },
                 "charge_ms": if m.charges.is_empty() { Value::Null } else { json!({ "p50": charge(0.5), "p99": charge(0.99), "lost_turns": lost }) },
                 "remote": self.remote,
