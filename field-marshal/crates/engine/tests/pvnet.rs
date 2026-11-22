@@ -512,6 +512,16 @@ fn threads_share_one_tree_and_leave_its_counts_whole() {
         let after = many.root();
         assert_eq!(after[0].iter().find(|a| a.0 == ours).unwrap().1, before + 300);
         assert_eq!(after[1].iter().map(|a| a.1).sum::<u32>(), 900);
+        // lines kept short: many of them end on a position already there, or wait for a pair
+        // another line is having played, and every one is still counted once
+        let mut short = Search::new(&e, &net, PvConfig { depth: 2, ..PvConfig::default() });
+        assert_eq!(short.iterate_threads(&s, 500, 4, None), 500);
+        let r = short.root();
+        assert_eq!(short.visits(), 500);
+        for x in 0..2 {
+            assert_eq!(r[x].iter().map(|a| a.1).sum::<u32>(), 500);
+            assert!(r[x].iter().all(|a| a.2.abs() <= 1.0 + 1e-4), "a short line was left on its way");
+        }
         // a time already past stops the threads at once
         let mut none = Search::new(&e, &net, PvConfig::default());
         assert!(none.iterate_threads(&s, 100_000, 3, Some(std::time::Instant::now())) < 400);

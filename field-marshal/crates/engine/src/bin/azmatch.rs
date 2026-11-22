@@ -9,8 +9,8 @@
 //! weighing, and TRUST, 1 unless given, in the turns expected of the opponent),
 //! `pvd:NET.json:N:K` (the network-led search with K times the lines at a standoff: what a
 //! memory of that one situation, searched deep beforehand, could be worth),
-//! `pvt:NET.json:N:K` (the network-led search on K threads sharing its tree,
-//! `Search::iterate_threads`; against `pv` at the same N it shows what the sharing costs a line), or
+//! `pvt:NET.json:N:K` (the network-led search on K threads, `Search::iterate_threads`;
+//! against `pv` at the same N it shows what a line from several threads is worth), or
 //! `flag`/`pv` with `Nms` in place of N for a time limit a tick. Each fighter runs its own search every tick it can act, fresh, and plays its
 //! most visited turn. Both searches are repeatable, so without help every game would be one of
 //! two: each pair of games starts with --open ticks of random steps (no attacks, no dashes),

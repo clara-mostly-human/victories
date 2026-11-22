@@ -227,12 +227,63 @@ fn select_in(nd: &Node, x: usize, cfg: &PvConfig) -> usize {
     best.1
 }
 
-/// The tree while several threads search it (`Search::iterate_threads`), and for pondering
-/// the opponent's first turns handed out so far.
-struct Shared {
-    nodes: Vec<Node>,
-    index: Index,
-    first: Option<FirstTurns>,
+/// Work for a thread that does not own the tree (`Search::iterate_threads`): play the last
+/// `steps` pairs of `pairs` from the position `base` (None: the root) and read the position
+/// they lead to. `key` names the last pair in the tree, `line` the line that asked.
+struct Job {
+    line: u32,
+    key: u64,
+    base: Option<std::sync::Arc<State>>,
+    pairs: [[RawTurn; 2]; 2],
+    steps: u8,
+}
+
+/// A `Job` done: the line's result, the new position (with its turn lists) unless the pair
+/// ended the game, and when two pairs were played the position between them, to keep.
+struct Seen {
+    line: u32,
+    key: u64,
+    value: f32,
+    child: Option<Node>,
+    between: Option<std::sync::Arc<State>>,
+}
+
+/// The lines under way while several threads search: each one's path so far (slots are used
+/// again), for every pair of turns that is being played out the lines that came to the same
+/// pair meanwhile and wait for its position, and the work not handed out yet.
+struct Flight {
+    paths: Vec<Vec<(u32, u16, u16)>>,
+    free: Vec<u32>,
+    waiting: HashMap<u64, Vec<u32>, BuildHasherDefault<KeyHasher>>,
+    active: usize,
+    out: Vec<Job>,
+}
+
+/// What a thread that does not own the tree does with a `Job`.
+fn work(e: &Engine, net: &PvNet, root: &State, even: f32, job: Job, x: &mut Inputs, pass: &mut Pass, buf: &mut Vec<RawTurn>) -> Seen {
+    let mut s = match &job.base {
+        Some(state) => **state,
+        None => *root,
+    };
+    let mut between = None;
+    if job.steps == 2 {
+        e.step(&mut s, &job.pairs[0]);
+        between = Some(std::sync::Arc::new(s));
+    }
+    e.step(&mut s, &job.pairs[1]);
+    let (value, child) = match outcome(&s) {
+        Some(v) => (v, None),
+        None => {
+            // the turn lists too, at once: this thread has the position and the time, and the
+            // tree's owner is the one that must not be kept
+            let mut child = sight_at(e, net, &s, x, pass);
+            if let Some(rest) = child.rest.take() {
+                child.acts = lists_at(e, net, &s, even, &rest, pass, buf);
+            }
+            (child.v, Some(child))
+        }
+    };
+    Seen { line: job.line, key: job.key, value, child, between }
 }
 
 /// Pondering's first pair of turns (`Search::ponder`): ours fixed, theirs spread over their
@@ -262,9 +313,9 @@ impl FirstTurns {
     }
 }
 
-/// The tree's lock taken by trying again and again, never by sleeping: it is held for well
-/// under a microsecond at a time, and a thread put to sleep over it takes many times that to
-/// wake (measured: three threads that slept on the lock did the work of 1.1).
+/// A lock taken by trying again and again, never by sleeping (the two short lists the
+/// threads of `iterate_threads` pass work and results through): it is held for well under a
+/// microsecond at a time, and a thread put to sleep over it takes many times that to wake.
 fn grab<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     let mut tries = 0u32;
     loop {
@@ -283,9 +334,11 @@ fn grab<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     }
 }
 
-/// While a line is on its way down in one thread, the turns it took count as one lost line
-/// each, so the other threads look elsewhere; the count is put right when the line reports.
+/// While a line's result is still out (`iterate_threads`), the turns it took count as one
+/// lost line each, so the lines started meanwhile look elsewhere; the count is put right
+/// when the result is in.
 const ON_ITS_WAY: f32 = 1.0;
+
 
 impl<'a> Search<'a> {
     pub fn new(e: &'a Engine, net: &'a PvNet, cfg: PvConfig) -> Search<'a> {
@@ -391,23 +444,30 @@ impl<'a> Search<'a> {
         true
     }
 
-    /// `iterate` on `threads` threads that share the one tree: lines until `count` are done
-    /// or the time `until` has come, whichever is first; returns the lines done. One thread
-    /// (or none to spare) is `iterate` itself, line for line. With more, each thread picks its
-    /// line's turns under a lock, plays them out and asks the network outside it (about two
-    /// thirds of a line's work), then reports back under the lock; a line on its way counts as
-    /// lost for the turns it took, so the threads spread over the tree. The result is not the
-    /// same from run to run.
+    /// `iterate` on `threads` threads: lines until `count` are done or the time `until` has
+    /// come, whichever is first; returns the lines done. One thread (or none to spare) is
+    /// `iterate` itself, line for line. With more, the calling thread owns the tree: it alone
+    /// chooses each line's turns, adds positions and counts results, so the tree stays in
+    /// one core's cache and has no lock. The other threads get the part of a line that does
+    /// not touch the tree: the last turns played on the engine and the new position read by
+    /// the network, its turn lists included (they have the time; the owner is the one that
+    /// must not be kept). A line whose result is still out counts as lost for the turns it
+    /// took, so the lines under way spread over the tree; a line that comes to a pair of
+    /// turns already being played out waits for that position and goes on from it. With
+    /// nothing to choose and nothing back, the owner plays a pair out itself. The result is
+    /// not the same from run to run.
     ///
-    /// Measured on four cores (arena-21, 150 ms a position). While a line cost five and a half
-    /// microseconds this gave 1.3 to 1.6 times one thread's lines on three threads, a line
-    /// worth what one thread's is (at 25,600 lines three threads lost 0.00107 a decision
-    /// against a deep search's own results and one thread 0.00108, 480 decisions from real
-    /// games). Since then the work outside the lock was cut (the network pass in blocks, turn
-    /// lists made only where a line is played on from), what is done under the lock is about
-    /// half of a line, and the threads give nothing: 0.97 times one thread on two, 0.89 on
-    /// three. Leave `threads` at 1 until the tree has one owner and the other threads only
-    /// play turns out and ask the network.
+    /// Measured on four cores (arena-21, 150 ms a position), against one thread: 1.3 to 1.45
+    /// times the lines on two threads, 1.7 to 2.0 on three, 1.85 to 2.3 on four. The owner is
+    /// the limit: about two microseconds of a line are its own (the turns chosen down the
+    /// tree, the results counted back). A line is worth what one thread's is: at 25,600
+    /// lines three threads lost 0.00111 a decision (+-0.00017) against a deep search's own
+    /// results, one thread 0.00108 (480 decisions from real games).
+    ///
+    /// The first version had every thread walk the one tree under a lock. That gave 1.3 to
+    /// 1.6 times on three threads while a line cost five and a half microseconds, and 0.89
+    /// once the line was cheap: what was done under the lock had become half of a line, and
+    /// cost three times as much with the positions' counts moving between cores.
     pub fn iterate_threads(&mut self, root: &State, count: u32, threads: usize, until: Option<std::time::Instant>) -> u32 {
         if root.result.is_some() {
             return 0;
@@ -433,11 +493,12 @@ impl<'a> Search<'a> {
     }
 
     fn run(&mut self, root: &State, count: u32, threads: usize, until: Option<std::time::Instant>, first: Option<FirstTurns>) -> u32 {
-        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Mutex;
         let late = |n: u32| n % 32 == 0 && until.map(|u| std::time::Instant::now() >= u).unwrap_or(false);
+        let mut first = first;
         if threads <= 1 {
-            let mut first = first;
             let mut done = 0u32;
             while done < count && !late(done) {
                 let pair = first.as_mut().map(|f| f.next());
@@ -446,192 +507,248 @@ impl<'a> Search<'a> {
             }
             return done;
         }
-        let (e, net, cfg) = (self.e, self.net, self.cfg);
-        let shared = Mutex::new(Shared { nodes: std::mem::take(&mut self.nodes), index: std::mem::take(&mut self.index), first });
-        let (taken, stop) = (AtomicU32::new(0), AtomicBool::new(false));
-        let parts: Vec<(u32, [u64; 64])> = std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..threads)
-                .map(|_| {
-                    sc.spawn(|| {
-                        let (mut x, mut pass, mut buf) = (Inputs::default(), Pass::default(), Vec::new());
-                        let mut path: Vec<(u32, u16, u16)> = Vec::new();
-                        let mut pairs: Vec<[RawTurn; 2]> = Vec::new();
-                        // positions worked out on this line whose state the tree does not keep yet
-                        let mut fresh: Vec<(u32, std::sync::Arc<State>)> = Vec::new();
-                        let mut rest: Vec<f32> = Vec::new();
-                        let (mut done, mut hist) = (0u32, [0u64; 64]);
-                        loop {
-                            if stop.load(Ordering::Relaxed) || taken.fetch_add(1, Ordering::Relaxed) >= count {
-                                break;
-                            }
-                            if late(done) {
-                                stop.store(true, Ordering::Relaxed);
-                                break;
-                            }
-                            path.clear();
-                            pairs.clear();
-                            fresh.clear();
-                            // where the line stands, and the position furthest down it whose state is
-                            // at hand: the turns played to reach it and the state (None: the root's)
-                            let mut node = 0usize;
-                            let mut base: (usize, Option<std::sync::Arc<State>>) = (0, None);
-                            let mut made: Option<[Vec<Act>; 2]> = None;
-                            let mut forced: Option<Option<(usize, usize)>> = None;
-                            // down the tree under the lock, by the counts alone. The lock is let go
-                            // where the line comes to a position no line was played on from yet: its
-                            // state and turn lists are made outside, then the line goes on from it.
-                            let known: Option<f32> = loop {
-                                let mut known: Option<f32> = None;
-                                let mut make = false;
-                                {
-                                    let mut t = grab(&shared);
-                                    for (n, state) in fresh.drain(..) {
-                                        let nd = &mut t.nodes[n as usize];
-                                        if nd.state.is_none() {
-                                            nd.state = Some(state);
-                                        }
-                                    }
-                                    if let Some(lists) = made.take() {
-                                        let nd = &mut t.nodes[node];
-                                        if nd.rest.is_some() {
-                                            nd.rest = None;
-                                            nd.acts = lists;
-                                        }
-                                    }
-                                    let first_pair = match forced {
-                                        Some(f) => f,
-                                        None => {
-                                            let f = t.first.as_mut().map(|f| f.next());
-                                            forced = Some(f);
-                                            f
-                                        }
-                                    };
-                                    let mut deepest = (0usize, 0usize);
-                                    loop {
-                                        if let Some(r) = t.nodes[node].rest.as_ref() {
-                                            rest.clear();
-                                            rest.extend_from_slice(r);
-                                            make = true;
-                                            break;
-                                        }
-                                        let (i0, i1) = match first_pair {
-                                            Some(pair) if node == 0 => pair,
-                                            _ => (select_in(&t.nodes[node], 0, &cfg), select_in(&t.nodes[node], 1, &cfg)),
-                                        };
-                                        path.push((node as u32, i0 as u16, i1 as u16));
-                                        let nd = &mut t.nodes[node];
-                                        pairs.push([nd.acts[0][i0].turn, nd.acts[1][i1].turn]);
-                                        nd.n += 1;
-                                        nd.acts[0][i0].n += 1;
-                                        nd.acts[0][i0].w -= ON_ITS_WAY;
-                                        nd.acts[1][i1].n += 1;
-                                        nd.acts[1][i1].w -= ON_ITS_WAY;
-                                        let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
-                                        match t.index.get(&key) {
-                                            Some(&child) => {
-                                                node = child as usize;
-                                                if t.nodes[node].state.is_some() {
-                                                    deepest = (path.len(), node);
-                                                }
-                                                if path.len() as u32 >= cfg.depth {
-                                                    known = Some(t.nodes[node].v);
-                                                    break;
-                                                }
-                                            }
-                                            None => break,
-                                        }
-                                    }
-                                    if known.is_none() && deepest.0 > base.0 {
-                                        base = (deepest.0, t.nodes[deepest.1].state.clone());
-                                    }
-                                }
-                                if !make {
-                                    break known;
-                                }
-                                let mut s = match &base.1 {
-                                    Some(state) => **state,
-                                    None => *root,
-                                };
-                                for k in base.0..pairs.len() {
-                                    if k > base.0 {
-                                        fresh.push((path[k].0, std::sync::Arc::new(s)));
-                                    }
-                                    e.step(&mut s, &pairs[k]);
-                                }
-                                made = Some(lists_at(e, net, &s, cfg.even, &rest, &mut pass, &mut buf));
-                                let state = std::sync::Arc::new(s);
-                                fresh.push((node as u32, state.clone()));
-                                base = (pairs.len(), Some(state));
-                            };
-                            // outside it: the turns after the kept position, on the engine, and the
-                            // network's value of the position they lead to when it is new
-                            let (value, child) = match known {
-                                Some(v) => (v, None),
-                                None => {
-                                    let mut s = match &base.1 {
-                                        Some(state) => **state,
-                                        None => *root,
-                                    };
-                                    for k in base.0..pairs.len() {
-                                        if k > base.0 {
-                                            fresh.push((path[k].0, std::sync::Arc::new(s)));
-                                        }
-                                        e.step(&mut s, &pairs[k]);
-                                    }
-                                    match outcome(&s) {
-                                        Some(v) => (v, None),
-                                        None => {
-                                            let child = sight_at(e, net, &s, &mut x, &mut pass);
-                                            (child.v, Some(child))
-                                        }
-                                    }
-                                }
-                            };
-                            drop(base);
-                            {
-                                let mut t = grab(&shared);
-                                for (n, state) in fresh.drain(..) {
-                                    let nd = &mut t.nodes[n as usize];
-                                    if nd.state.is_none() {
-                                        nd.state = Some(state);
-                                    }
-                                }
-                                if let Some(child) = child {
-                                    let (node, i0, i1) = *path.last().unwrap();
-                                    let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
-                                    if !t.index.contains_key(&key) && t.nodes.len() < cfg.max_nodes {
-                                        let id = t.nodes.len() as u32;
-                                        t.index.insert(key, id);
-                                        t.nodes[node as usize].kids.push(((i0 as u32) << 16 | i1 as u32, id));
-                                        t.nodes.push(child);
-                                    }
-                                }
-                                for &(n, i0, i1) in path.iter() {
-                                    let nd = &mut t.nodes[n as usize];
-                                    nd.acts[0][i0 as usize].w += ON_ITS_WAY + value;
-                                    nd.acts[1][i1 as usize].w += ON_ITS_WAY - value;
-                                }
-                            }
-                            hist[path.len().min(63)] += 1;
-                            done += 1;
-                        }
-                        (done, hist)
-                    })
-                })
-                .collect();
-            hs.into_iter().map(|h| h.join().unwrap()).collect()
-        });
-        let t = shared.into_inner().unwrap();
-        self.nodes = t.nodes;
-        self.index = t.index;
+        // This thread owns the tree: it alone chooses turns, adds positions and reports
+        // results, so the tree stays in one core's cache and needs no lock. What it hands
+        // out is the part of a line that does not touch the tree: playing the last turns on
+        // the engine and reading the new position with the network.
+        let (e, net, even) = (self.e, self.net, self.cfg.even);
+        let jobs: Mutex<VecDeque<Job>> = Mutex::new(VecDeque::new());
+        let outs: Mutex<Vec<Seen>> = Mutex::new(Vec::new());
+        let (asked, answered, stop) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicBool::new(false));
         let mut done = 0u32;
-        for (n, hist) in parts {
-            done += n;
-            for (i, h) in hist.iter().enumerate() {
-                self.depth_hist[i] += h;
+        std::thread::scope(|sc| {
+            for _ in 1..threads {
+                sc.spawn(|| {
+                    let (mut x, mut pass, mut buf) = (Inputs::default(), Pass::default(), Vec::new());
+                    let mut idle = 0u32;
+                    loop {
+                        let job = if asked.load(Ordering::Relaxed) > 0 { grab(&jobs).pop_front() } else { None };
+                        let Some(job) = job else {
+                            if stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            idle += 1;
+                            if idle % 2048 == 0 {
+                                std::thread::yield_now();
+                            } else {
+                                std::hint::spin_loop();
+                            }
+                            continue;
+                        };
+                        asked.fetch_sub(1, Ordering::Relaxed);
+                        idle = 0;
+                        let seen = work(e, net, root, even, job, &mut x, &mut pass, &mut buf);
+                        grab(&outs).push(seen);
+                        answered.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            // lines under way at once: enough that the others' work comes and goes in batches
+            // (4 a thread gave a tenth fewer lines, 16 a few percent more), and a line chosen
+            // with up to 17 others' results still out lost no more a decision than one
+            // thread's line (measured at 25,600 lines with 1, 2, 4 and 8 a thread)
+            let limit = 8 * (threads - 1) + 1;
+            let mut fl = Flight { paths: Vec::new(), free: Vec::new(), waiting: HashMap::default(), active: 0, out: Vec::new() };
+            let mut taken: Vec<Seen> = Vec::new();
+            let (mut started, mut closing) = (0u32, false);
+            loop {
+                let mut moved = false;
+                if answered.load(Ordering::Relaxed) > 0 {
+                    std::mem::swap(&mut *grab(&outs), &mut taken);
+                    answered.fetch_sub(taken.len(), Ordering::Relaxed);
+                    moved = !taken.is_empty();
+                    for seen in taken.drain(..) {
+                        done += self.land(root, seen, &mut fl);
+                    }
+                }
+                while !closing && fl.active < limit {
+                    if started >= count || late(started) {
+                        closing = true;
+                        break;
+                    }
+                    let pair = first.as_mut().map(|f| f.next());
+                    started += 1;
+                    let line = match fl.free.pop() {
+                        Some(l) => l,
+                        None => {
+                            fl.paths.push(Vec::new());
+                            fl.paths.len() as u32 - 1
+                        }
+                    };
+                    fl.active += 1;
+                    done += self.descend(root, line, 0, pair, &mut fl);
+                    moved = true;
+                }
+                if !fl.out.is_empty() {
+                    let n = fl.out.len();
+                    grab(&jobs).extend(fl.out.drain(..));
+                    asked.fetch_add(n, Ordering::Relaxed);
+                }
+                if closing && fl.active == 0 {
+                    break;
+                }
+                if !moved {
+                    // nothing to choose and nothing back yet: this thread plays a pair out itself
+                    let job = if asked.load(Ordering::Relaxed) > 0 { grab(&jobs).pop_front() } else { None };
+                    match job {
+                        Some(job) => {
+                            asked.fetch_sub(1, Ordering::Relaxed);
+                            let seen = work(e, net, root, even, job, &mut self.x, &mut self.pass, &mut self.buf);
+                            done += self.land(root, seen, &mut fl);
+                        }
+                        None => std::hint::spin_loop(),
+                    }
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        done
+    }
+
+    /// The position the turns of `path` lead to from `root`, from the kept position nearest its end.
+    fn state_at(&self, root: &State, path: &[(u32, u16, u16)]) -> State {
+        let (mut s, mut from) = (*root, 0);
+        for k in (1..path.len()).rev() {
+            if let Some(state) = &self.nodes[path[k].0 as usize].state {
+                s = **state;
+                from = k;
+                break;
             }
         }
-        done
+        for &(n, i0, i1) in &path[from..] {
+            let nd = &self.nodes[n as usize];
+            self.e.step(&mut s, &[nd.acts[0][i0 as usize].turn, nd.acts[1][i1 as usize].turn]);
+        }
+        s
+    }
+
+    /// A line under way (`iterate_threads`) goes down the tree from `node`, by the counts
+    /// alone and counting itself lost for the turns it takes until its result is in. It
+    /// stops at a pair of turns not tried from its position: the pair is handed out to be
+    /// played, or, when another line's pair is being played already, the line waits for that
+    /// position. Returns 1 when the line ended here (it reached the longest line allowed).
+    fn descend(&mut self, root: &State, line: u32, mut node: usize, first: Option<(usize, usize)>, fl: &mut Flight) -> u32 {
+        let mut path = std::mem::take(&mut fl.paths[line as usize]);
+        let ended: Option<f32> = loop {
+            if self.nodes[node].rest.is_some() {
+                // the first line played on from this position: its state is kept, its turn lists made
+                let s = self.state_at(root, &path);
+                self.lists(node, &s, self.cfg.even);
+                if node > 0 {
+                    self.nodes[node].state = Some(std::sync::Arc::new(s));
+                }
+            }
+            let (i0, i1) = match first {
+                Some(pair) if node == 0 => pair,
+                _ => (self.select(node, 0), self.select(node, 1)),
+            };
+            path.push((node as u32, i0 as u16, i1 as u16));
+            let nd = &mut self.nodes[node];
+            nd.n += 1;
+            nd.acts[0][i0].n += 1;
+            nd.acts[0][i0].w -= ON_ITS_WAY;
+            nd.acts[1][i1].n += 1;
+            nd.acts[1][i1].w -= ON_ITS_WAY;
+            let key = (node as u64) << 32 | (i0 as u64) << 16 | i1 as u64;
+            match self.index.get(&key) {
+                Some(&child) => {
+                    node = child as usize;
+                    if path.len() as u32 >= self.cfg.depth {
+                        break Some(self.nodes[node].v);
+                    }
+                }
+                None => {
+                    if let Some(others) = fl.waiting.get_mut(&key) {
+                        others.push(line);
+                    } else {
+                        fl.waiting.insert(key, Vec::new());
+                        let nd = &self.nodes[node];
+                        let last = [nd.acts[0][i0].turn, nd.acts[1][i1].turn];
+                        // from this position's kept state; when it has none yet, from the one
+                        // above with both pairs (the state between comes back to be kept)
+                        let job = if node == 0 || nd.state.is_some() {
+                            Job { line, key, base: nd.state.clone().filter(|_| node > 0), pairs: [last, last], steps: 1 }
+                        } else {
+                            let (above, j0, j1) = path[path.len() - 2];
+                            let up = &self.nodes[above as usize];
+                            if above > 0 && up.state.is_none() {
+                                let s = self.state_at(root, &path[..path.len() - 1]);
+                                let state = std::sync::Arc::new(s);
+                                self.nodes[node].state = Some(state.clone());
+                                Job { line, key, base: Some(state), pairs: [last, last], steps: 1 }
+                            } else {
+                                let before = [up.acts[0][j0 as usize].turn, up.acts[1][j1 as usize].turn];
+                                Job { line, key, base: up.state.clone().filter(|_| above > 0), pairs: [before, last], steps: 2 }
+                            }
+                        };
+                        fl.out.push(job);
+                    }
+                    break None;
+                }
+            }
+        };
+        fl.paths[line as usize] = path;
+        match ended {
+            Some(value) => {
+                self.report(line, value, fl);
+                1
+            }
+            None => 0,
+        }
+    }
+
+    /// A line under way ends with `value` for fighter 0: its turns get the result in place of
+    /// the loss they were counted with, and its slot is free.
+    fn report(&mut self, line: u32, value: f32, fl: &mut Flight) {
+        let path = &mut fl.paths[line as usize];
+        self.depth_hist[path.len().min(63)] += 1;
+        for &(n, i0, i1) in path.iter() {
+            let nd = &mut self.nodes[n as usize];
+            nd.acts[0][i0 as usize].w += ON_ITS_WAY + value;
+            nd.acts[1][i1 as usize].w += ON_ITS_WAY - value;
+        }
+        path.clear();
+        fl.free.push(line);
+        fl.active -= 1;
+    }
+
+    /// A pair of turns has been played out by another thread: its position joins the tree,
+    /// the line that asked ends with its value, and the lines that waited for the position go
+    /// on down from it. Returns the lines that ended.
+    fn land(&mut self, root: &State, seen: Seen, fl: &mut Flight) -> u32 {
+        let Seen { line, key, value, child, between } = seen;
+        if let Some(state) = between {
+            let nd = &mut self.nodes[(key >> 32) as usize];
+            if nd.state.is_none() {
+                nd.state = Some(state);
+            }
+        }
+        let mut at: Option<u32> = None;
+        if let Some(child) = child {
+            if self.nodes.len() < self.cfg.max_nodes {
+                let id = self.nodes.len() as u32;
+                self.index.insert(key, id);
+                self.nodes[(key >> 32) as usize].kids.push(((key & 0xffff_ffff) as u32, id));
+                self.nodes.push(child);
+                at = Some(id);
+            }
+        }
+        self.report(line, value, fl);
+        let mut ended = 1;
+        for other in fl.waiting.remove(&key).unwrap_or_default() {
+            match at {
+                Some(id) if (fl.paths[other as usize].len() as u32) < self.cfg.depth => ended += self.descend(root, other, id as usize, None, fl),
+                Some(id) => {
+                    self.report(other, self.nodes[id as usize].v, fl);
+                    ended += 1;
+                }
+                None => {
+                    self.report(other, value, fl);
+                    ended += 1;
+                }
+            }
+        }
+        ended
     }
 
     /// One line from `root` to a new position or the end of the game; `first` fixes both

@@ -243,11 +243,14 @@ pub struct Playbook {
     /// against that answer as well (0.5) chose worse than the plain search on both maps
     /// tested, and all expectation chose a little better.
     pub tree_pv_trust: f64,
-    /// Threads for the learned search and its pondering, all on the one tree
-    /// (`pvsearch::Search::iterate_threads`). 1 (the default): the search as it was, line for
-    /// line. More is no gain as the search stands (measured 0.97 times one thread's lines on
-    /// two and 0.89 on three, see `iterate_threads`): leave it at 1. The weighing of
-    /// `tree_pv_weigh` stays on one thread. The threads are plain threads started each tick.
+    /// Threads for the learned search and its pondering (`pvsearch::Search::iterate_threads`):
+    /// one owns the tree, the others play turns out and read the new positions. 1 (the
+    /// default): the search as it was, line for line. More gives more lines in the same time
+    /// when the machine has cores to spare (measured on four cloud cores: 1.3 to 1.45 times
+    /// on two threads, 1.7 to 2.0 on three, 1.85 to 2.3 on four), each line worth what one
+    /// thread's is. The weighing of `tree_pv_weigh` stays on one thread. The threads are
+    /// plain threads started each tick; they spin while they wait, so they need cores of
+    /// their own.
     pub tree_pv_threads: u32,
     /// Fixed search size: stop after this many iterations instead of at `tree_ms` (still never
     /// past the time cap); 0: by time. For self-play: more games an hour, and the same game
