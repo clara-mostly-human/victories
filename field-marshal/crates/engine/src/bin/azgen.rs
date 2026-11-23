@@ -68,6 +68,7 @@ use victris_engine::mcts;
 use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
 use victris_engine::pvnet::{PvNet, CLASSES};
 use victris_engine::pvsearch::{self, outcome, pick, PvConfig, Rng};
+use victris_engine::map::PadKind;
 use victris_engine::state::FState;
 use victris_engine::{Engine, RawTurn};
 
@@ -99,19 +100,27 @@ fn main() {
     let read_lines: u32 = arg(&args, "--read-lines", iters / 2);
     let read_teach: u32 = arg(&args, "--read-teach", 0);
     let teach_answer: f64 = arg(&args, "--teach-answer", 0.0);
+    let chase: f64 = arg(&args, "--chase", 0.0);
+    let chase_early: i32 = arg(&args, "--chase-early", 0);
+    // --hunt P: each time a fighter comes to hold the power-up alone, with chance P it is sent
+    // walking at the other for as long as that lasts (the most searched turn that ends nearer;
+    // within --hunt-reach tiles and in sight the search plays on as ever). The lessons keep
+    // the search's own shares. Prints how the fighters sent did against those left to the search.
+    let hunt: f64 = arg(&args, "--hunt", 0.0);
+    let hunt_reach: i32 = arg(&args, "--hunt-reach", 3);
     let from: Vec<GameLog> = if from_path.is_empty() { Vec::new() } else { GameLog::read_all(&std::fs::read(&from_path).expect("cannot read the --from games")) };
     let net = if net_path.is_empty() { None } else { Some(PvNet::load(std::path::Path::new(&net_path)).expect("cannot read the network")) };
     let e = Engine::shipped(&map);
     let flag = mcts::Config { value_weight: 1.0, value_gen: 13, buff_value: 0.0, dash_burst: true, slam_prior: 0.228, ..Default::default() };
     let next = std::sync::atomic::AtomicUsize::new(0);
     let started = std::time::Instant::now();
-    let parts: Vec<(Vec<u8>, [u64; 11])> = std::thread::scope(|sc| {
+    let parts: Vec<(Vec<u8>, [u64; 32])> = std::thread::scope(|sc| {
         let hs: Vec<_> = (0..threads)
             .map(|_| {
                 sc.spawn(|| {
                     let mut bytes: Vec<u8> = Vec::new();
                     // games, positions, ticks, fighter 0 wins, fighter 1 wins, search lines, games from a saved position
-                    let mut st = [0u64; 11];
+                    let mut st = [0u64; 32];
                     loop {
                         let g = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         if g >= games {
@@ -146,6 +155,18 @@ fn main() {
                             }
                         }
                         let mut searched = 0u64;
+                        // --chase: the pad each fighter is walking to, whether a pad lay there for it last tick,
+                        // and how its first such moment went (0 not yet, 1 left to the search, 2 sent walking)
+                        let mut chasing: [Option<usize>; 2] = [None, None];
+                        let mut lay = [(false, false); 2];
+                        let mut first = [[0u8; 2]; 2];
+                        let mut got = [false; 2];
+                        // --hunt: is each fighter being sent at the other, did it hold the power-up alone last tick,
+                        // how its first such spell went (0 not yet, 1 left to the search, 2 sent) and its hp lead then
+                        let mut hunting = [false; 2];
+                        let mut was_alone = [false; 2];
+                        let mut hunt_first = [0u8; 2];
+                        let mut hunt_lead = [0i32; 2];
                         let mut pv = net.as_ref().map(|n| pvsearch::Search::new(&e, n, PvConfig { even_root: wide, lead_at: lead, ..Default::default() }));
                         while s.result.is_none() {
                             let free = |x: usize| s.fighters[x].alive && s.fighters[x].state == FState::Idle;
@@ -228,8 +249,95 @@ fn main() {
                                     }
                                 }
                             }
+                            if chase > 0.0 {
+                                for x in 0..2 {
+                                    let f = s.fighters[x];
+                                    let out: Vec<usize> = (0..e.map.pads.len()).filter(|i| e.map.pads[*i].kind == PadKind::Power && (s.pads[*i].available || s.pads[*i].respawn_tick - s.tick <= chase_early)).collect();
+                                    let wants = f.alive && f.power_until < s.tick && !out.is_empty();
+                                    // a new moment: a pad comes out for it, or the other fighter has just taken one and one still lies
+                                    let theirs = s.fighters[1 - x].power_until >= s.tick;
+                                    if wants && lay[x] != (wants, theirs) {
+                                        let go = rng.unit() < chase;
+                                        if first[x][theirs as usize] == 0 {
+                                            first[x][theirs as usize] = 1 + go as u8;
+                                        }
+                                        chasing[x] = if go { out.iter().copied().min_by_key(|i| victris_engine::strategy::path(&e, e.map.pads[*i].pos, f.pos)) } else { None };
+                                    }
+                                    lay[x] = (wants, theirs);
+                                    if let Some(i) = chasing[x] {
+                                        if !wants || !out.contains(&i) {
+                                            chasing[x] = None;
+                                            continue;
+                                        }
+                                        // the most visited turn that ends nearer the pad (the other standing still), else one that ends no further
+                                        let to = e.map.pads[i].pos;
+                                        let was = victris_engine::strategy::path(&e, to, f.pos);
+                                        let mut best: Option<(i32, u32, RawTurn)> = None;
+                                        for (turn, n) in visits[x].iter() {
+                                            let mut t = s;
+                                            let mut both = [RawTurn::IDLE; 2];
+                                            both[x] = *turn;
+                                            e.step(&mut t, &both);
+                                            let now = victris_engine::strategy::path(&e, to, t.fighters[x].pos);
+                                            let gain = (was - now).clamp(-1, 1);
+                                            if best.map(|b| (gain, *n) > (b.0, b.1)).unwrap_or(true) {
+                                                best = Some((gain, *n, *turn));
+                                            }
+                                        }
+                                        if let Some((gain, _, turn)) = best {
+                                            if gain >= 0 {
+                                                pair[x] = turn;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if hunt > 0.0 {
+                                for x in 0..2 {
+                                    let (f, o) = (s.fighters[x], s.fighters[1 - x]);
+                                    let alone = f.alive && o.alive && f.power_until >= s.tick && o.power_until < s.tick;
+                                    if alone && !was_alone[x] {
+                                        hunting[x] = rng.unit() < hunt;
+                                        if hunt_first[x] == 0 {
+                                            hunt_first[x] = 1 + hunting[x] as u8;
+                                            hunt_lead[x] = f.hp - o.hp;
+                                        }
+                                    }
+                                    if !alone {
+                                        hunting[x] = false;
+                                    }
+                                    was_alone[x] = alone;
+                                    let near = victris_engine::geom::chebyshev(f.pos, o.pos) <= hunt_reach && victris_engine::observe::can_see(&e.rules, &e.map, f.pos, o.pos);
+                                    if hunting[x] && !near {
+                                        let was = victris_engine::strategy::path(&e, o.pos, f.pos);
+                                        let mut best: Option<(i32, u32, RawTurn)> = None;
+                                        for (turn, n) in visits[x].iter() {
+                                            let mut t = s;
+                                            let mut both = [RawTurn::IDLE; 2];
+                                            both[x] = *turn;
+                                            e.step(&mut t, &both);
+                                            let now = victris_engine::strategy::path(&e, o.pos, t.fighters[x].pos);
+                                            let gain = (was - now).clamp(-1, 1);
+                                            if best.map(|b| (gain, *n) > (b.0, b.1)).unwrap_or(true) {
+                                                best = Some((gain, *n, *turn));
+                                            }
+                                        }
+                                        if let Some((gain, _, turn)) = best {
+                                            if gain >= 0 {
+                                                pair[x] = turn;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             log.ticks.push(TickLog { turns: pair, q, pol: Some(pol.unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])])) });
+                            let had = [s.fighters[0].power_until >= s.tick, s.fighters[1].power_until >= s.tick];
                             e.step(&mut s, &pair);
+                            for x in 0..2 {
+                                if chasing[x].is_some() && !had[x] && s.fighters[x].power_until >= s.tick {
+                                    got[x] = true;
+                                }
+                            }
                             if let Some(p) = pv.as_mut() {
                                 p.advance(&pair[0], &pair[1]);
                             }
@@ -240,6 +348,26 @@ fn main() {
                         st[2] += s.tick.max(0) as u64;
                         st[3] += (z > 0) as u64;
                         st[4] += (z < 0) as u64;
+                        // --chase: by how each fighter's first moment with a pad lying went: games, wins (st[11..15]), pads reached walking
+                        for x in 0..2 {
+                            let won = (x == 0 && z > 0) || (x == 1 && z < 0);
+                            for k in 0..2 {
+                                if first[x][k] > 0 {
+                                    let at = 11 + 4 * k + 2 * (first[x][k] as usize - 1);
+                                    st[at] += 1;
+                                    st[at + 1] += won as u64;
+                                }
+                            }
+                            st[19] += got[x] as u64;
+                            // --hunt: by arm (left, sent) and by whether it was ahead on hp then: fighter-games, wins; and the hp leads summed (+200 each)
+                            if hunt_first[x] > 0 {
+                                let arm = hunt_first[x] as usize - 1;
+                                let at = 21 + 4 * arm + 2 * (hunt_lead[x] >= 0) as usize;
+                                st[at] += 1;
+                                st[at + 1] += won as u64;
+                                st[29 + arm] += (hunt_lead[x] + 200) as u64;
+                            }
+                        }
                         log.z = z;
                         log.write(&mut bytes);
                     }
@@ -250,10 +378,10 @@ fn main() {
         hs.into_iter().map(|h| h.join().unwrap()).collect()
     });
     let mut file = std::io::BufWriter::new(std::fs::File::create(&out).expect("cannot write the output"));
-    let mut st = [0u64; 11];
+    let mut st = [0u64; 32];
     for (bytes, s) in &parts {
         file.write_all(bytes).unwrap();
-        for i in 0..11 {
+        for i in 0..32 {
             st[i] += s[i];
         }
     }
@@ -277,4 +405,39 @@ fn main() {
         st[0] as f64 / secs * 60.0,
         st[5] as f64 / secs / threads as f64
     );
+    if chase > 0.0 {
+        let pc = |a: u64, b: u64| if b > 0 { 100.0 * a as f64 / b as f64 } else { 0.0 };
+        for (k, label) in ["with the other unpowered", "with the other powered"].iter().enumerate() {
+            let at = 11 + 4 * k;
+            println!(
+                "chase {}: the first time a power pad lay there for an unpowered fighter {}: sent walking to it in {} fighter-games, won {:.1}%; left to the search in {}, won {:.1}%",
+                chase,
+                label,
+                st[at + 2],
+                pc(st[at + 3], st[at + 2]),
+                st[at],
+                pc(st[at + 1], st[at])
+            );
+        }
+        println!("chase: {} fighter-games reached a pad walking", st[19]);
+    }
+    if hunt > 0.0 {
+        let pc = |a: u64, b: u64| if b > 0 { 100.0 * a as f64 / b as f64 } else { 0.0 };
+        for (arm, label) in ["left to the search", "sent walking at the other"].iter().enumerate() {
+            let at = 21 + 4 * arm;
+            let (games, wins) = (st[at] + st[at + 2], st[at + 1] + st[at + 3]);
+            println!(
+                "hunt {}: the first time a fighter held the power-up alone, {}: {} fighter-games, won {:.1}% (behind on hp then: {} games, won {:.1}%; level or ahead: {} games, won {:.1}%); mean hp lead then {:+.1}",
+                hunt,
+                label,
+                games,
+                pc(wins, games),
+                st[at],
+                pc(st[at + 1], st[at]),
+                st[at + 2],
+                pc(st[at + 3], st[at + 2]),
+                if games > 0 { st[29 + arm] as f64 / games as f64 - 200.0 } else { 0.0 }
+            );
+        }
+    }
 }

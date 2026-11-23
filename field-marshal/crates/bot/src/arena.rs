@@ -59,7 +59,16 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
         format!("{header}\n")
     });
     let mut trace: Vec<([f32; victris_engine::valuefeat::NV], f64)> = Vec::new();
+    // ARENA_AZ=file: the game as lessons for `aztrain`, in azgen's format: for every tick each
+    // fighter's learned search decided (opponent in sight or over its guesses at a hidden
+    // one), where that fighter's own search put its lines among its turns, and the mean of the
+    // fighters' own values of the position. Each fighter decides from what it can know, so
+    // these are games under the game's real fog, which azgen's are not.
+    let az = std::env::var_os("ARENA_AZ");
+    let mut lessons: Vec<victris_engine::azdata::TickLog> = Vec::new();
     while s.result.is_none() {
+        let mut pol = [[0u8; victris_engine::pvnet::CLASSES]; 2];
+        let mut values: Vec<f32> = Vec::new();
         let before = (s.fighters[0].hp, s.fighters[1].hp);
         let feats = if dumping { Some(victris_engine::valuefeat::diff(engine, &s, 0)) } else { None };
         let mut turns = [RawTurn::IDLE; 2];
@@ -85,7 +94,19 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
             let oracle = std::env::var("ARENA_ORACLE").map(|n| n == book.name).unwrap_or(false);
             crate::policy::PV_ORACLE.with(|o| *o.borrow_mut() = if oracle { Some(s) } else { None });
             crate::policy::PV_TRUTH.with(|o| *o.borrow_mut() = Some(s));
+            crate::policy::LAST_ROOT.with(|l| *l.borrow_mut() = None);
             let d = decide(&trackers[i], &view, book);
+            if az.is_some() && d.note.starts_with("pv") {
+                crate::policy::LAST_ROOT.with(|l| {
+                    if let Some(r) = l.borrow().as_ref() {
+                        let visits: Vec<(RawTurn, u32)> = r.acts[i].iter().map(|a| (a.0, a.1)).collect();
+                        if visits.iter().any(|v| v.1 > 0) {
+                            pol[i] = victris_engine::azdata::shares(&visits);
+                            values.push(r.value as f32);
+                        }
+                    }
+                });
+            }
             crate::policy::PV_ORACLE.with(|o| *o.borrow_mut() = None);
             crate::policy::PV_TRUTH.with(|o| *o.borrow_mut() = None);
             if book.tree_pv_ponder > 0 && d.note == "pv" {
@@ -133,6 +154,10 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
             let line = serde_json::json!({ "type": "tick", "tick": s.tick, "turns": {
                 "1": crate::session::turn_json(s.tick, &turns[0], engine), "2": crate::session::turn_json(s.tick, &turns[1], engine) } });
             text.push_str(&format!("{line}\n"));
+        }
+        if az.is_some() {
+            let q = if values.is_empty() { None } else { Some(values.iter().sum::<f32>() / values.len() as f32) };
+            lessons.push(victris_engine::azdata::TickLog { turns, q, pol: if values.is_empty() { None } else { Some(pol) } });
         }
         engine.step_events(&mut s, &turns, &mut events);
         if let Some(f) = feats {
@@ -187,6 +212,33 @@ pub fn play_with(engine: &Engine, seed: i64, books: [Option<&Playbook>; 2]) -> G
         }
     }
     let r = s.result.unwrap();
+    if let Some(path) = az {
+        // saved only when the saved game replays to the same end (the format must carry every turn exactly)
+        if let Some(z) = victris_engine::pvsearch::outcome(&s) {
+            let log = victris_engine::azdata::GameLog { seed, z: z as i8, ticks: lessons };
+            let mut bytes = Vec::new();
+            log.write(&mut bytes);
+            let back = victris_engine::azdata::GameLog::read_all(&bytes);
+            let mut again = engine.new_match(seed);
+            if let Some(g) = back.first() {
+                for t in &g.ticks {
+                    if again.result.is_some() {
+                        break;
+                    }
+                    engine.step(&mut again, &t.turns);
+                }
+            }
+            static FILE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            if engine.state_hash(&again) == engine.state_hash(&s) {
+                let _guard = FILE.lock();
+                if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                    let _ = std::io::Write::write_all(&mut file, &bytes);
+                }
+            } else {
+                eprintln!("ARENA_AZ: map {} seed {seed}: the saved game does not replay to the same end, left out", engine.map.name);
+            }
+        }
+    }
     if let (Some(mut text), Some(dir)) = (replay, std::env::var_os("ARENA_REPLAYS")) {
         static WRITTEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let n = WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

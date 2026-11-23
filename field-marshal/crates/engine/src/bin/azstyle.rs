@@ -50,6 +50,44 @@ struct Tk {
 }
 
 /// Sums by label, for X (0) and for O (1), kept in the order the labels were first used.
+/// A power pad is out and this fighter holds no power-up, with the other fighter powered ([0]) or not ([1]):
+/// ticks, tiles to the nearest such pad (sum), ended the tick nearer it, further from it, took one.
+const LYING: [[&str; 5]; 2] = [
+    [
+        "unpowered, the other powered, a power pad lying: ticks",
+        "  unpowered, the other powered, a power pad lying: tiles to it (sum)",
+        "  unpowered, the other powered, a power pad lying: ended the tick nearer it",
+        "  unpowered, the other powered, a power pad lying: ended the tick further from it",
+        "  unpowered, the other powered, a power pad lying: took it",
+    ],
+    [
+        "neither powered, a power pad lying: ticks",
+        "  neither powered, a power pad lying: tiles to it (sum)",
+        "  neither powered, a power pad lying: ended the tick nearer it",
+        "  neither powered, a power pad lying: ended the tick further from it",
+        "  neither powered, a power pad lying: took it",
+    ],
+];
+
+/// The fighters come back into each other's sight: after how long, and who held the power-up alone.
+const MEET: [&str; 6] = [
+    "meets the other again after 1-10 ticks out of sight, powered alone",
+    "meets the other again after 1-10 ticks out of sight, the other powered alone",
+    "meets the other again after 1-10 ticks out of sight, neither or both powered",
+    "meets the other again after 11+ ticks out of sight, powered alone",
+    "meets the other again after 11+ ticks out of sight, the other powered alone",
+    "meets the other again after 11+ ticks out of sight, neither or both powered",
+];
+/// hp gained on the other over the 15 ticks after such a meeting (sum)
+const MEET_GAIN: [&str; 6] = [
+    "  hp gained on the other in the 15 ticks after: 1-10 ticks, powered alone",
+    "  hp gained on the other in the 15 ticks after: 1-10 ticks, the other powered alone",
+    "  hp gained on the other in the 15 ticks after: 1-10 ticks, neither or both powered",
+    "  hp gained on the other in the 15 ticks after: 11+ ticks, powered alone",
+    "  hp gained on the other in the 15 ticks after: 11+ ticks, the other powered alone",
+    "  hp gained on the other in the 15 ticks after: 11+ ticks, neither or both powered",
+];
+
 #[derive(Default)]
 struct Tally {
     order: Vec<&'static str>,
@@ -86,8 +124,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let who = arg(&args, "--who");
     let vs = arg(&args, "--vs");
+    // --result W or L: only the games X won, or only the ones it lost
+    let only = arg(&args, "--result");
     let map = arg(&args, "--map");
     let per_game = args.iter().any(|a| a == "--per-game");
+    // --trace N: the opening of X's first N games in which it took none of the first two power pads, tick by tick
+    let trace: usize = arg(&args, "--trace").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut traced = 0usize;
     let mut t = Tally::default();
     // every label once, so the print order does not depend on what happened first
     for k in [
@@ -145,6 +188,11 @@ fn main() {
         let mut appeared = false;
         let mut stood: [Option<i32>; 2] = [None; 2];
         let power_pads: Vec<_> = e.map.pads.iter().filter(|p| p.kind == PadKind::Power).map(|p| p.pos).collect();
+        // ticks since the fighters last saw each other (0 while in sight)
+        let mut unseen = 0u32;
+        let mut story: Vec<String> = Vec::new();
+        // the fighters meet again after being out of each other's sight: (tick to read at, kind by fighter, hp then)
+        let mut meets: Vec<(i32, [usize; 2], [i32; 2])> = Vec::new();
         for turns in &r.turns {
             let tk = Tk { turns: *turns };
             if s.result.is_some() {
@@ -153,6 +201,27 @@ fn main() {
             let before = s;
             let see = can_see(&e.rules, &e.map, before.fighters[0].pos, before.fighters[1].pos);
             let d = chebyshev(before.fighters[0].pos, before.fighters[1].pos);
+            // read the meetings of 15 ticks ago: what each fighter gained on the other since
+            meets.retain(|(at, kind, hp)| {
+                if before.tick < *at {
+                    return true;
+                }
+                for x in 0..2 {
+                    let gain = (before.fighters[x].hp.max(0) - hp[x]) - (before.fighters[1 - x].hp.max(0) - hp[1 - x]);
+                    g[x].add(0, MEET_GAIN[kind[x]], gain as f64);
+                }
+                false
+            });
+            if see && unseen >= 1 && before.fighters[0].alive && before.fighters[1].alive {
+                let mut kind = [0usize; 2];
+                for x in 0..2 {
+                    let (mine, theirs) = (before.fighters[x].power_until >= before.tick, before.fighters[1 - x].power_until >= before.tick);
+                    kind[x] = (if unseen <= 10 { 0 } else { 3 }) + if mine && !theirs { 0 } else if theirs && !mine { 1 } else { 2 };
+                    g[x].add(0, MEET[kind[x]], 1.0);
+                }
+                meets.push((before.tick + 15, kind, [before.fighters[0].hp, before.fighters[1].hp]));
+            }
+            unseen = if see { 0 } else { unseen + 1 };
             // a fighter standing inside a frost area of the other is slowed
             let slowed = |x: usize| before.areas().iter().any(|a| a.owner as usize == 1 - x && chebyshev(a.pos, before.fighters[x].pos) <= a.radius);
             let stuck = |x: usize| before.fighters[x].state != FState::Idle || before.fighters[x].cd_move > 0;
@@ -201,6 +270,12 @@ fn main() {
                     if me.state == FState::Idle && me.cd_move <= 0 && tk.turns[x].mv == DirIn::None && tk.turns[x].dash == DirIn::None {
                         g[x].add(0, "  powered alone: stood still when free to step", 1.0);
                     }
+                    // how long the other has been out of sight: the live bot's learned search decides
+                    // for the first ticks of that only
+                    if !see {
+                        g[x].add(0, if unseen <= 10 { "  powered alone: the other out of sight 1-10 ticks" } else { "  powered alone: the other out of sight 11+ ticks" }, 1.0);
+                        g[x].add(0, if unseen <= 10 { "  powered alone: tiles to the other, out of sight 1-10 ticks (sum)" } else { "  powered alone: tiles to the other, out of sight 11+ ticks (sum)" }, d as f64);
+                    }
                 }
                 if op.power_until >= before.tick && me.power_until < before.tick {
                     g[x].add(0, "the other powered alone: ticks", 1.0);
@@ -210,7 +285,41 @@ fn main() {
                 }
             }
             e.step_events(&mut s, &tk.turns, &mut events);
+            if trace > 0 && (8..=70).contains(&before.tick) && before.tick % 2 == 0 {
+                let f = &before.fighters;
+                let pads: String = e.map.pads.iter().enumerate().filter(|(_, d)| d.kind == PadKind::Power).map(|(i, _)| if before.pads[i].available { 'o' } else { '.' }).collect();
+                let pw = |x: usize| if f[x].power_until >= before.tick { "P" } else { " " };
+                let st = |x: usize| if f[x].state == FState::Stunned { "S" } else { " " };
+                story.push(format!(
+                    "  t{:>3} pads {} | 0 at {:>2},{:>2} hp {:>3}{}{} {:?}{:?}{:?} | 1 at {:>2},{:>2} hp {:>3}{}{} {:?}{:?}{:?} | {} apart{}",
+                    before.tick, pads, f[0].pos[0], f[0].pos[1], f[0].hp, pw(0), st(0), tk.turns[0].mv, tk.turns[0].dash, tk.turns[0].attack,
+                    f[1].pos[0], f[1].pos[1], f[1].hp, pw(1), st(1), tk.turns[1].mv, tk.turns[1].dash, tk.turns[1].attack, d, if see { "" } else { ", out of sight" }
+                ));
+            }
             let opening = (12..=21).contains(&before.tick);
+            // a power pad lies there for the taking and this fighter holds no power-up: does it go for it
+            let lying: Vec<[i32; 2]> = e.map.pads.iter().enumerate().filter(|(i, d)| d.kind == PadKind::Power && before.pads[*i].available).map(|(_, d)| d.pos).collect();
+            if !lying.is_empty() {
+                for x in 0..2 {
+                    let (me, op) = (&before.fighters[x], &before.fighters[1 - x]);
+                    if !(me.alive && op.alive) || me.power_until >= before.tick {
+                        continue;
+                    }
+                    let k = if op.power_until >= before.tick { 0 } else { 1 };
+                    let was = lying.iter().map(|p| chebyshev(*p, me.pos)).min().unwrap_or(0);
+                    let now = lying.iter().map(|p| chebyshev(*p, s.fighters[x].pos)).min().unwrap_or(0);
+                    g[x].add(0, LYING[k][0], 1.0);
+                    g[x].add(0, LYING[k][1], was as f64);
+                    if now < was {
+                        g[x].add(0, LYING[k][2], 1.0);
+                    } else if now > was {
+                        g[x].add(0, LYING[k][3], 1.0);
+                    }
+                    if s.fighters[x].power_until >= s.tick {
+                        g[x].add(0, LYING[k][4], 1.0);
+                    }
+                }
+            }
             // one powered alone: does each fighter end the tick nearer to where the other stood, or further
             for x in 0..2 {
                 let (me, op) = (&before.fighters[x], &before.fighters[1 - x]);
@@ -222,6 +331,15 @@ fn main() {
                     continue;
                 }
                 let now = chebyshev(s.fighters[x].pos, op.pos);
+                if mine && !see && now != d {
+                    let k = match (unseen <= 10, now < d) {
+                        (true, true) => "  powered alone: ended the tick nearer, out of sight 1-10 ticks",
+                        (true, false) => "  powered alone: ended the tick further, out of sight 1-10 ticks",
+                        (false, true) => "  powered alone: ended the tick nearer, out of sight 11+ ticks",
+                        (false, false) => "  powered alone: ended the tick further, out of sight 11+ ticks",
+                    };
+                    g[x].add(0, k, 1.0);
+                }
                 if now < d {
                     g[x].add(0, if mine { "  powered alone: ended the tick nearer the other" } else { "  the other powered alone: ended the tick nearer it" }, 1.0);
                 } else if now > d {
@@ -451,8 +569,21 @@ fn main() {
                 }
             }
         }
+        // meetings the game ended on: read at its last position
+        for (_, kind, hp) in meets.drain(..) {
+            for x in 0..2 {
+                let gain = (s.fighters[x].hp.max(0) - hp[x]) - (s.fighters[1 - x].hp.max(0) - hp[1 - x]);
+                g[x].add(0, MEET_GAIN[kind[x]], gain as f64);
+            }
+        }
         let Some(res) = s.result else { continue };
         for &x in &xs {
+            if let Some(o) = only.as_deref() {
+                let w = res.winner.map(|w| w as usize - 1);
+                if (o == "W" && w != Some(x)) || (o == "L" && w != Some(1 - x)) {
+                    continue;
+                }
+            }
             *names.entry(r.bots[x].clone()).or_default() += 1;
             t.add(0, "games", 1.0);
             let won = res.winner.map(|w| w as usize - 1);
@@ -486,10 +617,18 @@ fn main() {
                     }
                 }
             }
+            if trace > 0 && wave[x] == 0 && traced < trace {
+                traced += 1;
+                let w = res.winner.map(|w| w as usize - 1);
+                println!("trace {} {} (fighter {}) v {} {}: first pads {}-{}, {} ticks", e.map.name, r.bots[x], x, r.bots[1 - x], if w == Some(x) { "W" } else if w.is_some() { "L" } else { "D" }, wave[x], wave[1 - x], s.tick);
+                for l in &story {
+                    println!("{}", l);
+                }
+            }
             if per_game {
                 let w = res.winner.map(|w| w as usize - 1);
                 println!(
-                    "game {} {} v {} {} first pads {}-{} stood {:?}/{:?} lead40 {:?} lead100 {:?} end {}",
+                    "game {} {} v {} {} first pads {}-{} stood {:?}/{:?} lead40 {:?} lead100 {:?} end {} hp {}-{} alone {}-{} seen {}-{} hid11 {}-{} pdmg {}-{} dmg {}-{}",
                     e.map.name,
                     r.bots[x],
                     r.bots[1 - x],
@@ -500,7 +639,19 @@ fn main() {
                     stood[1 - x].unwrap_or(-1),
                     marks[0][x].unwrap_or(0),
                     marks[1][x].unwrap_or(0),
-                    s.tick
+                    s.tick,
+                    s.fighters[x].hp.max(0),
+                    s.fighters[1 - x].hp.max(0),
+                    g[x].get("powered alone: ticks")[0],
+                    g[1 - x].get("powered alone: ticks")[0],
+                    g[x].get("  powered alone: the other in sight")[0],
+                    g[1 - x].get("  powered alone: the other in sight")[0],
+                    g[x].get("  powered alone: the other out of sight 11+ ticks")[0],
+                    g[1 - x].get("  powered alone: the other out of sight 11+ ticks")[0],
+                    g[x].get("  damage dealt while powered")[0],
+                    g[1 - x].get("  damage dealt while powered")[0],
+                    g[x].get("damage dealt")[0],
+                    g[1 - x].get("damage dealt")[0]
                 );
             }
             t.add(0, "game length (ticks)", s.tick as f64);
@@ -557,7 +708,23 @@ fn main() {
     rate("shot ready, of ticks in sight", "in sight: own shot ready", "ticks the other is in sight");
     rate("frost ready, of ticks in sight", "in sight: own frost ready", "ticks the other is in sight");
     rate("damage dealt while powered, of damage dealt", "  damage dealt while powered", "damage dealt");
+    for k in 0..6 {
+        rate(&format!("{} (x100)", MEET_GAIN[k].trim()), MEET_GAIN[k], MEET[k]);
+    }
+    for k in 0..2 {
+        rate(&format!("{} (x100)", LYING[k][1].trim()), LYING[k][1], LYING[k][0]);
+        rate(&format!("{}, of those ticks", LYING[k][2].trim()), LYING[k][2], LYING[k][0]);
+        rate(&format!("{}, of those ticks", LYING[k][3].trim()), LYING[k][3], LYING[k][0]);
+    }
     rate("powered alone: the other in sight, of those ticks", "  powered alone: the other in sight", "powered alone: ticks");
+    rate("powered alone: out of sight 1-10 ticks, of those ticks", "  powered alone: the other out of sight 1-10 ticks", "powered alone: ticks");
+    rate("powered alone: out of sight 11+ ticks, of those ticks", "  powered alone: the other out of sight 11+ ticks", "powered alone: ticks");
+    rate("powered alone, out of sight 1-10 ticks: tiles to the other (x100)", "  powered alone: tiles to the other, out of sight 1-10 ticks (sum)", "  powered alone: the other out of sight 1-10 ticks");
+    rate("powered alone, out of sight 11+ ticks: tiles to the other (x100)", "  powered alone: tiles to the other, out of sight 11+ ticks (sum)", "  powered alone: the other out of sight 11+ ticks");
+    rate("powered alone, out of sight 1-10 ticks: ended the tick nearer", "  powered alone: ended the tick nearer, out of sight 1-10 ticks", "  powered alone: the other out of sight 1-10 ticks");
+    rate("powered alone, out of sight 1-10 ticks: ended the tick further", "  powered alone: ended the tick further, out of sight 1-10 ticks", "  powered alone: the other out of sight 1-10 ticks");
+    rate("powered alone, out of sight 11+ ticks: ended the tick nearer", "  powered alone: ended the tick nearer, out of sight 11+ ticks", "  powered alone: the other out of sight 11+ ticks");
+    rate("powered alone, out of sight 11+ ticks: ended the tick further", "  powered alone: ended the tick further, out of sight 11+ ticks", "  powered alone: the other out of sight 11+ ticks");
     rate("powered alone: in sight within 4 tiles, of those ticks", "  powered alone: the other in sight within 4 tiles", "powered alone: ticks");
     rate("powered alone: ended the tick nearer the other, of those ticks", "  powered alone: ended the tick nearer the other", "powered alone: ticks");
     rate("powered alone: ended the tick further away, of those ticks", "  powered alone: ended the tick further from the other", "powered alone: ticks");
