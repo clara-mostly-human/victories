@@ -7,6 +7,7 @@
       "experiments": false,
       "note": "Run by the search thread from its own launchd agent. The fleet only reads its logs.",
       "expect_online": true,
+      "think_p99_ms": 510,
       "owner": "the search thread (Build the main bot engine and client)"
     },
     "foot-soldier": {
