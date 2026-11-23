@@ -115,6 +115,11 @@ pub struct Tracker {
     /// how long the frame being decided waited before its decision started, in ms; u64::MAX
     /// when a newer observation already waits behind it (the ladder has moved on: answer at once)
     frame_wait_ms: std::cell::Cell<u64>,
+    /// the worst network time (charge minus think) of the match's last few turns, in ms;
+    /// 0 when not known yet
+    wire_worst_ms: std::cell::Cell<u64>,
+    /// the cap the network set on the current decision when it was the binding one, else 0
+    pub net_cap_ms: std::cell::Cell<u64>,
 }
 
 /// What a reply costs on top of thinking: network and server handling, as measured from
@@ -122,6 +127,10 @@ pub struct Tracker {
 const TICK_OVERHEAD_MS: u64 = 125;
 /// Budget kept in hand for the rest of a match.
 const BUDGET_RESERVE_MS: u64 = 25_000;
+/// think plus the worst recent network time stays under this (the ladder's limit is 1000 ms)
+const NET_LIMIT_MS: u64 = 900;
+/// ... but the search always gets at least this much
+const NET_FLOOR_MS: u64 = 100;
 
 /// Which parts of a predicted view differ from the real one, with both values.
 fn view_diff(ours: &View, theirs: &View) -> Vec<String> {
@@ -216,6 +225,8 @@ impl Tracker {
             spent_ms: std::cell::Cell::new(0),
             budget_left_ms: std::cell::Cell::new(None),
             frame_wait_ms: std::cell::Cell::new(0),
+            wire_worst_ms: std::cell::Cell::new(0),
+            net_cap_ms: std::cell::Cell::new(0),
         })
     }
 
@@ -238,6 +249,8 @@ impl Tracker {
             spent_ms: std::cell::Cell::new(0),
             budget_left_ms: std::cell::Cell::new(None),
             frame_wait_ms: std::cell::Cell::new(0),
+            wire_worst_ms: std::cell::Cell::new(0),
+            net_cap_ms: std::cell::Cell::new(0),
         }
     }
 
@@ -260,6 +273,12 @@ impl Tracker {
     /// How long the frame about to be decided has waited (see `frame_wait_ms`).
     pub fn note_frame_wait(&self, ms: u64) {
         self.frame_wait_ms.set(ms);
+        self.net_cap_ms.set(0);
+    }
+
+    /// The worst network time of the last few turns (see `wire_worst_ms`).
+    pub fn note_wire_worst(&self, ms: u64) {
+        self.wire_worst_ms.set(ms);
     }
 
     /// The think cap for this tick: the playbook's, cut down when the match budget could
@@ -276,7 +295,18 @@ impl Tracker {
         // Most games end long before the tick limit, so allow double the sustainable rate,
         // but never more than the tick deadline can carry.
         let per_tick_limit = (rules.limits.tick_ms.max(0) as u64).saturating_sub(400);
-        let cap = wanted.min(sustainable * 2).min(per_tick_limit);
+        let mut cap = wanted.min(sustainable * 2).min(per_tick_limit);
+        // On a bad network spell the think leaves room for the worst recent trip, so the
+        // answer still lands inside the ladder's second; it comes back by itself once the
+        // trips are short again (2026-11-23: wire p99 up to 544 ms lost turns at 450 ms).
+        let w = self.wire_worst_ms.get();
+        if w > 0 {
+            let net = NET_LIMIT_MS.saturating_sub(w).max(NET_FLOOR_MS);
+            if net < cap {
+                cap = net;
+                self.net_cap_ms.set(net);
+            }
+        }
         // A frame that waited behind another (a burst after a stall on the connection) gets
         // what is left of the think time, at least 20 ms so the search still runs; one with a
         // newer observation behind it gets none: the ladder has moved past it (2026-11-22).
