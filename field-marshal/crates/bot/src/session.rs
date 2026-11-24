@@ -136,6 +136,10 @@ struct Match {
     /// think was cut by the time they had waited behind another
     frames_behind: u32,
     frames_waited: u32,
+    /// network time (charge minus think) of the last 10 turns, and turns whose think the
+    /// network cut
+    recent_wire: std::collections::VecDeque<u32>,
+    net_capped: u32,
     rejected: u32,
     server_refusals: u32,
     panics: u32,
@@ -451,6 +455,8 @@ impl Session {
                 pondered: 0,
                 frames_behind: 0,
                 frames_waited: 0,
+                recent_wire: std::collections::VecDeque::new(),
+                net_capped: 0,
                 rejected: 0,
                 server_refusals: 0,
                 panics: 0,
@@ -511,7 +517,14 @@ impl Session {
         if let Some(b) = msg.get("self").and_then(|s| s.get("budget_ms_left")).and_then(Value::as_i64) {
             m.min_budget_ms = m.min_budget_ms.min(b);
             if let Some(prev) = m.last_budget {
-                m.charges.push((prev - b).clamp(0, 60_000) as u32);
+                let charge = (prev - b).clamp(0, 60_000) as u32;
+                m.charges.push(charge);
+                if let Some(&think) = m.think_us.last() {
+                    m.recent_wire.push_back(charge.saturating_sub(think / 1000));
+                    if m.recent_wire.len() > 10 {
+                        m.recent_wire.pop_front();
+                    }
+                }
             }
             m.last_budget = Some(b);
             // The search's think cap follows the budget the ladder says is left.
@@ -521,6 +534,7 @@ impl Session {
         }
         if let Some(tracker) = m.tracker.as_ref() {
             tracker.note_frame_wait(frame_wait);
+            tracker.note_wire_worst(m.recent_wire.iter().copied().max().unwrap_or(0) as u64);
         }
         match frame_wait {
             0 => {}
@@ -632,6 +646,12 @@ impl Session {
             "budget_ms": msg.get("self").and_then(|s| s.get("budget_ms_left")),
             "truth_diff": truth_note,
         });
+        let net_cap = tracker.net_cap_ms.get();
+        if net_cap > 0 {
+            line["net_cap_ms"] = json!(net_cap);
+            line["wire_ms"] = json!(m.recent_wire.iter().copied().max().unwrap_or(0));
+            m.net_capped += 1;
+        }
         if frame_wait > 0 {
             line["waited_ms"] = if frame_wait == u64::MAX { json!("behind") } else { json!(frame_wait) };
         }
@@ -679,7 +699,7 @@ impl Session {
                 "final_tick": msg.get("final_tick"), "rating_change": msg.get("rating_change"), "voided": msg.get("voided"),
                 "replay_url": msg.get("replay_url"),
                 "think_us": { "p50": pct(0.5), "p99": pct(0.99), "max": m.think_us.last() },
-                "sims": m.sims, "pondered": m.pondered, "frames_behind": m.frames_behind, "frames_waited": m.frames_waited, "rejected_parts": m.rejected, "server_refusals": m.server_refusals, "panics": m.panics,
+                "sims": m.sims, "pondered": m.pondered, "frames_behind": m.frames_behind, "frames_waited": m.frames_waited, "net_capped": m.net_capped, "rejected_parts": m.rejected, "server_refusals": m.server_refusals, "panics": m.panics,
                 "min_budget_ms": if m.min_budget_ms == i64::MAX { Value::Null } else { json!(m.min_budget_ms) },
                 "charge_ms": if m.charges.is_empty() { Value::Null } else { json!({ "p50": charge(0.5), "p99": charge(0.99), "lost_turns": lost }) },
                 "remote": self.remote,
