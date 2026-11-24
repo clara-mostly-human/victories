@@ -4,7 +4,7 @@
 //! tree from one tick to the next.
 
 use victris_engine::azdata::{shares, shares_earned, GameLog, TickLog};
-use victris_engine::pvnet::{act, class_of, encode, layout, loss_grad, turns, Inputs, Pass, PvNet, Sample, Scratch, Sym, CLASSES, IN, IN_OLD};
+use victris_engine::pvnet::{act, class_of, encode, layout, loss_grad, turns, Inputs, Pass, PvNet, Sample, Scratch, Sym, CLASSES, IN, IN_OLD, IN_RING};
 use victris_engine::pvsearch::{pick, PvConfig, Rng, Search};
 use victris_engine::{Engine, RawTurn};
 
@@ -680,7 +680,7 @@ fn the_walls_three_tiles_from_the_opponent_are_inputs_and_older_networks_read_as
             for f in 0..2 {
                 encode(&e, &s, f, &mut x);
                 // the older inputs first and unchanged in number, the ring after them
-                assert!((0..x.n0).all(|k| (x.idx[k] as usize) < IN_OLD) && (x.n0..x.n).all(|k| (x.idx[k] as usize) >= IN_OLD));
+                assert!((0..x.n0).all(|k| (x.idx[k] as usize) < IN_OLD) && (x.n0..x.n1).all(|k| (IN_OLD..IN_RING).contains(&(x.idx[k] as usize))) && (x.n1..x.n).all(|k| (x.idx[k] as usize) >= IN_RING));
                 // the ring is exactly the walls at three tiles from the opponent
                 let o = s.fighters[1 - f].pos;
                 let mut ring = 0;
@@ -691,7 +691,7 @@ fn the_walls_three_tiles_from_the_opponent_are_inputs_and_older_networks_read_as
                         }
                     }
                 }
-                assert_eq!(x.n - x.n0, ring, "tick {}: {} ring inputs for {ring} walls three tiles from the opponent", s.tick, x.n - x.n0);
+                assert_eq!(x.n1 - x.n0, ring, "tick {}: {} ring inputs for {ring} walls three tiles from the opponent", s.tick, x.n1 - x.n0);
                 if ring > 0 {
                     ring_seen += 1;
                     // a wall the push can reach that the older inputs did not show at all
@@ -728,8 +728,72 @@ fn the_walls_three_tiles_from_the_opponent_are_inputs_and_older_networks_read_as
         loss_grad(&wide, &e, r, 0.5, 1.0, &mut sc, Some(&mut grad));
     }
     let l = wide.layout();
-    let ring = &grad[l.t1 + IN_OLD * wide.h1..l.b1];
+    let ring = &grad[l.t1 + IN_OLD * wide.h1..l.t1 + IN_RING * wide.h1];
     assert!(ring.iter().filter(|g| **g != 0.0).count() > ring.len() / 4, "the ring's weights have no slope");
+}
+
+#[test]
+fn how_soon_a_pad_appears_is_an_input_and_networks_made_before_it_read_as_before() {
+    let e = Engine::shipped("arena-21");
+    // a network with the inputs networks had before the pads' last-ticks inputs
+    let mut rng = Rng::new(31);
+    let w = (0..layout(IN_RING, 24, 12).len).map(|_| (rng.unit() as f32 - 0.5) * 0.6).collect();
+    let ring = PvNet { map: "arena-21".to_string(), n_in: IN_RING, h1: 24, h2: 12, w };
+    let wide = ring.widened();
+    assert_eq!((wide.n_in, wide.w.len()), (IN, layout(IN, 24, 12).len));
+    let path = std::env::temp_dir().join(format!("{}-pvnet-ring.json", std::process::id()));
+    ring.save(&path, &serde_json::json!({})).unwrap();
+    let back = PvNet::load(&path).expect("the saved network does not load");
+    std::fs::remove_file(&path).ok();
+    assert_eq!((back.n_in, &back.w), (IN_RING, &ring.w));
+    let (mut x, mut p) = (Inputs::default(), Pass::default());
+    let (mut positions, mut soon_seen) = (0, 0);
+    for seed in 0..4 {
+        let game = random_game(&e, 60 + seed, 300);
+        let mut s = e.new_match(game.seed);
+        for t in &game.ticks {
+            for f in 0..2 {
+                encode(&e, &s, f, &mut x);
+                // the new inputs come last, and say exactly how soon each pad that is not out appears
+                let dense = x.dense();
+                for (i, _) in e.map.pads.iter().enumerate() {
+                    let left = (s.pads[i].respawn_tick - s.tick).max(0);
+                    let (short, long) = if s.pads[i].available { (0.0, 0.0) } else { ((10 - left).max(0) as f32 / 10.0, (40 - left).max(0) as f32 / 40.0) };
+                    assert_eq!((dense[IN_RING + 2 * i], dense[IN_RING + 2 * i + 1]), (short, long), "tick {} pad {i}", s.tick);
+                    soon_seen += (short > 0.0) as u32;
+                }
+                // the network made before them reads the position from the inputs before them alone
+                let l = ring.layout();
+                ring.forward(&x, &mut p);
+                for j in 0..ring.h1 {
+                    let mut z = ring.w[l.b1 + j];
+                    for k in 0..x.n1 {
+                        z += x.val[k] * ring.w[l.t1 + x.idx[k] as usize * ring.h1 + j];
+                    }
+                    assert_eq!(z.to_bits(), p.z1[j].to_bits(), "unit {j} of the network made before the new inputs");
+                }
+            }
+            // made wider it still reads every position the same, to the last bit
+            let (a, b) = (ring.eval(&e, &s), wide.eval(&e, &s));
+            assert_eq!(a.v0.to_bits(), b.v0.to_bits());
+            assert!(a.logits.iter().flatten().zip(b.logits.iter().flatten()).all(|(u, v)| u == v));
+            positions += 1;
+            e.step(&mut s, &t.turns);
+        }
+    }
+    println!("{positions} positions; a pad within 10 ticks of appearing in {soon_seen} views");
+    assert!(soon_seen > 50);
+    // and the wider one learns from them: its slope for those weights is not zero
+    let mut all = Vec::new();
+    assert!(random_game(&e, 61, 300).samples(&e, &mut all));
+    let mut grad = vec![0.0f32; wide.layout().len];
+    let mut sc = Scratch::default();
+    for r in &all {
+        loss_grad(&wide, &e, r, 0.5, 1.0, &mut sc, Some(&mut grad));
+    }
+    let l = wide.layout();
+    let soon = &grad[l.t1 + IN_RING * wide.h1..l.b1];
+    assert!(soon.iter().filter(|g| **g != 0.0).count() > soon.len() / 4, "the new inputs' weights have no slope");
 }
 
 #[test]
@@ -884,4 +948,128 @@ fn a_full_tree_makes_room_and_goes_on_growing() {
     }
     assert_eq!(many.root()[0].iter().map(|a| a.1).sum::<u32>(), 12_000);
     assert!(many.nodes() > cap / 2);
+}
+
+#[test]
+fn told_the_other_fighters_turn_a_fighter_answers_that_turn() {
+    let e = Engine::shipped("columns-21");
+    let net = random_net(23);
+    let mut s = e.new_match(9);
+    let mut answered = 0u32;
+    for tick in 0..24 {
+        if s.result.is_some() {
+            break;
+        }
+        let told = tick % 2; // the fighter whose turn is given away
+        let mut search = Search::new(&e, &net, PvConfig::default());
+        assert!(search.answer(&s, told, &RawTurn::IDLE, 10).is_none(), "nothing searched yet");
+        search.iterate(&s, 400);
+        let ours = search.best(told);
+        let before = search.root();
+        let other = 1 - told;
+        let cells_before = search.root_cells(other);
+        let answer = search.answer(&s, told, &ours, 300).expect("the turn is at the root");
+        let after = search.root();
+        // every one of the 300 lines began with the turn that was told (with one turn to
+        // answer with there is nothing to search)
+        let more = if before[other].len() > 1 { 300 } else { 0 };
+        for (b, a) in before[told].iter().zip(after[told].iter()) {
+            assert_eq!(a.1, b.1 + if a.0 == ours { more } else { 0 });
+        }
+        assert_eq!(after[other].iter().map(|a| a.1).sum::<u32>(), 400 + more);
+        // the answer is one of the other fighter's turns: the one that got the most of the 300
+        // lines (not the one with the most lines in all, which after a long search is the
+        // usual turn whatever was told), and every turn it has was tried against the told turn
+        let mine = after[told].iter().position(|a| a.0 == ours).unwrap();
+        let cells = search.root_cells(other);
+        let lines = |j: usize| cells.cells[j * cells.cols + mine].1;
+        let new = |j: usize| lines(j) - cells_before.cells[j * cells.cols + mine].1;
+        let j = after[other].iter().position(|a| a.0 == answer).expect("the answer is not one of its turns");
+        if cells.rows > 1 && cells.rows <= 300 {
+            for k in 0..cells.rows {
+                assert!(lines(k) > 0, "turn {k} of {} was never tried against the told turn", cells.rows);
+                assert!(new(k) <= new(j), "turn {k} got {} of the new lines, the answer {}", new(k), new(j));
+            }
+            assert_eq!((0..cells.rows).map(new).sum::<u32>(), 300);
+            answered += 1;
+        }
+        // a turn that is not at the root is refused
+        let mut odd = RawTurn::step(0);
+        odd.dash = RawTurn::dash(0).dash;
+        if !after[told].iter().any(|a| a.0 == odd) {
+            assert!(search.answer(&s, told, &odd, 10).is_none());
+        }
+        let mut pair = [ours; 2];
+        pair[other] = answer;
+        e.step(&mut s, &pair);
+    }
+    assert!(answered > 6, "only {answered} ticks had a choice to answer with");
+}
+
+#[test]
+fn turns_rated_the_same_are_set_against_the_answers_and_the_table_solved() {
+    let e = Engine::shipped("arena-21");
+    let net = random_net(31);
+    let mut s = e.new_match(4);
+    let mut solved = 0u32;
+    for tick in 0..20 {
+        if s.result.is_some() {
+            break;
+        }
+        let x = tick % 2;
+        let mut search = Search::new(&e, &net, PvConfig::default());
+        assert!(search.rated_same(x, 0.02).is_empty() && search.mixed(&s, x, 100, 0.02).0.is_empty(), "nothing searched yet");
+        search.iterate(&s, 600);
+        let before = search.root();
+        let top = search.best(x);
+        // no turn can be rated the same with a margin below nothing: the most visited turn alone, and no line run
+        let (alone, _) = search.mixed(&s, x, 200, -3.0);
+        assert_eq!((alone.len(), alone[0].turn, alone[0].share), (1, top, 1.0));
+        assert_eq!(search.root()[x].iter().map(|a| a.1).sum::<u32>(), 600);
+        // with a wide margin: the most visited turn first of at most four, each with a tenth of its visits
+        let same = search.rated_same(x, 3.0);
+        let most = before[x].iter().map(|a| a.1).max().unwrap();
+        assert_eq!(same[0].0, top);
+        assert!(same.len() <= 4 && same.iter().all(|a| a.1 * 10 >= most));
+        assert!(same.windows(2).skip(1).all(|w| w[0].1 >= w[1].1));
+        let (table, worth) = search.mixed(&s, x, 400, 3.0);
+        if same.len() > 1 && before[1 - x].len() > 1 {
+            // our turns in the table are those rated the same, in that order, and the shares are shares
+            assert_eq!(table.len(), same.len());
+            for (t, a) in table.iter().zip(same.iter()) {
+                assert_eq!((t.turn, t.visits), (a.0, a.1));
+                assert!(t.share >= 0.0 && t.share <= 1.0 + 1e-4);
+            }
+            assert!((table.iter().map(|t| t.share).sum::<f32>() - 1.0).abs() < 1e-3);
+            // no line began with a turn outside the table, and the table got lines
+            let after = search.root();
+            let mut more = 0u32;
+            for (b, a) in before[x].iter().zip(after[x].iter()) {
+                if same.iter().any(|t| t.0 == a.0) {
+                    more += a.1 - b.1;
+                } else {
+                    assert_eq!(a.1, b.1);
+                }
+            }
+            assert!(more >= 200 && more <= 400 + 32, "{more} lines went to the table");
+            // the solved mix leaves no answer in the table better than the table's worth (regret matching, to a small error),
+            // and the worth is no less than what the best single turn is left with
+            let guard = table.iter().map(|t| t.worst).fold(f32::MIN, f32::max);
+            assert!(worth >= guard - 0.02, "worth {worth} below the best single turn's worst cell {guard}");
+            assert!(table.iter().all(|t| after[1 - x].iter().any(|a| a.0 == t.worst_to)));
+            solved += 1;
+        } else {
+            assert_eq!((table.len(), table[0].turn), (1, top));
+        }
+        // the same search solves the same table
+        let mut again = Search::new(&e, &net, PvConfig::default());
+        again.iterate(&s, 600);
+        let (twice, worth2) = again.mixed(&s, x, 400, 3.0);
+        assert_eq!(twice.len(), table.len());
+        assert!(twice.iter().zip(table.iter()).all(|(a, b)| a.turn == b.turn && a.share == b.share) && worth2 == worth);
+        let mut pair = [search.best(0), search.best(1)];
+        pair[x] = table.iter().max_by(|a, b| a.share.total_cmp(&b.share)).unwrap().turn;
+        e.step(&mut s, &pair);
+    }
+    assert!(solved > 3, "only {solved} ticks had a table to solve");
 }

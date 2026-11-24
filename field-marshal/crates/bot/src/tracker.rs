@@ -98,6 +98,9 @@ pub struct Tracker {
     pub enemy_visible: bool,
     /// when and where the opponent was last seen
     pub enemy_last_seen: Option<(i32, P)>,
+    /// the belief was started at tick 0 from the map's spawns: until the opponent is first seen,
+    /// where it can be follows from a tile we know
+    pub from_spawn: bool,
     /// tiles the opponent could be on, by tile index (`y * w + x`)
     pub possible: Vec<bool>,
     pub stats: TrackStats,
@@ -217,6 +220,7 @@ impl Tracker {
             belief: None,
             enemy_visible: false,
             enemy_last_seen: None,
+            from_spawn: false,
             possible: vec![false; n],
             stats: TrackStats::default(),
             last_mismatch: None,
@@ -241,6 +245,7 @@ impl Tracker {
             belief: None,
             enemy_visible: false,
             enemy_last_seen: None,
+            from_spawn: false,
             possible: vec![false; n],
             stats: TrackStats::default(),
             last_mismatch: None,
@@ -598,9 +603,11 @@ impl Tracker {
             let s = e.new_match(self.seed);
             if View::from_state(e, &s, me) == *view {
                 self.belief = Some(s);
+                self.from_spawn = true;
                 return;
             }
         }
+        self.from_spawn = false;
         // A match already under way, or a map we have no spawns for: start from the
         // observation and place the unseen opponent opposite us.
         let mut s = e.new_match(self.seed);

@@ -257,6 +257,27 @@ pub struct Playbook {
     pub tree_pv_fog_maps: Vec<String>,
     /// With `tree_pv_fog_ticks`: how many guesses at the hidden opponent are searched (1 to 8).
     pub tree_pv_fog_guesses: u32,
+    /// With `tree_pv_dir`: the learned search also decides the ticks before the opponent is
+    /// first seen, over its guesses as under `tree_pv_fog_ticks` (on every map with a network,
+    /// whatever `tree_pv_fog_maps` says). The first guess is the opponent on its spawn, which
+    /// is known; each later one is moved on by what the search of the guess before expected.
+    /// Off (the default): the hand-written policy plays those ticks, as it always has.
+    ///
+    /// Why: `tree_pv_fog_ticks` counts from the last tick in sight, and before first sight
+    /// there is none, so the opening was left to the hand-written policy: 6 to 10 ticks on
+    /// arena-21 and 12 to 24 on columns-21 and pillars-21, which is the whole walk to the two
+    /// power pads that appear at tick 20. In foot-soldier's ladder games of Nov 22 it took
+    /// neither of those two pads in 33% of games on columns-21 and 31% on pillars-21, against
+    /// 2% and 6% for Slopracle. What this is worth depends on a network that has learned the
+    /// walk to the pads; measure it with one.
+    pub tree_pv_open: bool,
+    /// For self-play between two copies of the bot only (0 = off, the live setting): the
+    /// learned search's turn is drawn in proportion to the visits each turn got, on every tick
+    /// before tick 12 and with this chance on every later one, as `azgen` does. Without it two
+    /// copies of the bot play the same game every time. `tree_pv_wander_seed` tells the two
+    /// copies' draws apart.
+    pub tree_pv_wander: f64,
+    pub tree_pv_wander_seed: u64,
     /// For the arena only: after each decision of the learned search, this many more lines
     /// under the turn it sent (`pv_ponder`), standing in for the live bot's wait for the next
     /// tick. 0 (the default): none. A live session ponders by time instead.
@@ -286,6 +307,26 @@ pub struct Playbook {
     /// other fighter could be on after its move, for us to fire and for the opponent to fire
     /// at us. 0 (the default): every shot is aimed at the tile the other stands on.
     pub tree_pv_lead: u32,
+    /// With `tree_pv_dir`: on a tick with the opponent out of sight that the learned search does
+    /// not decide over its guesses (`tree_pv_fog_ticks` has run out, or the opponent has not
+    /// been seen yet and `tree_pv_open` is off), walks are tried instead of the hand-written
+    /// policy: to every tile we can reach in this many ticks, on the exact engine, against the
+    /// places the opponent may stand, each walk scored by the network's value of the positions
+    /// along it. We take the first step of the best walk. Nothing says where to go: a pad, the
+    /// zone, toward or away from the opponent are wherever the network's value is highest.
+    /// 0 (the default): off.
+    ///
+    /// Why: with the opponent hidden and far the learned search's lines are a few ticks long,
+    /// every turn scores the same and it stands still (measured Nov 23: the same value within
+    /// 0.005 for every turn with the walk to anything worth having 8 or more ticks long).
+    pub tree_pv_plan: u32,
+    /// With `tree_pv_plan`: how many places the opponent may stand each walk is tried against
+    /// (the tracker's standing guess, and tiles spread over the ones it can still be on).
+    pub tree_pv_plan_places: u32,
+    /// With `tree_pv_plan`: the maps it is on for; empty (the default) means every map. A
+    /// network has to have learned from games played under fog for the walks to be worth
+    /// having (measured on pillars-21, Nov 23), and that is so map by map.
+    pub tree_pv_plan_maps: Vec<String>,
     /// The most positions the learned search's tree holds (`pvsearch::PvConfig::max_nodes`);
     /// 400,000 by default. The tree is kept from tick to tick and grown by pondering, so at
     /// long thinking times it is this full for most of a match: a position takes about 3 kB
@@ -484,11 +525,17 @@ impl Default for Playbook {
             tree_pv_fog_ticks: 0,
             tree_pv_fog_maps: Vec::new(),
             tree_pv_fog_guesses: 3,
+            tree_pv_open: false,
+            tree_pv_wander: 0.0,
+            tree_pv_wander_seed: 0,
             tree_pv_ponder: 0,
             tree_pv_weigh: 0.0,
             tree_pv_trust: 1.0,
             tree_pv_threads: 1,
             tree_pv_lead: 0,
+            tree_pv_plan: 0,
+            tree_pv_plan_places: 6,
+            tree_pv_plan_maps: Vec::new(),
             tree_pv_nodes: 400_000,
             tree_iters: 0,
             book: std::collections::HashMap::new(),
@@ -668,6 +715,15 @@ impl Playbook {
         if let Some(x) = v.get("tree_pv_fog_guesses").and_then(Value::as_u64) {
             p.tree_pv_fog_guesses = (x as u32).clamp(1, 8);
         }
+        if let Some(x) = v.get("tree_pv_open").and_then(Value::as_bool) {
+            p.tree_pv_open = x;
+        }
+        if let Some(x) = v.get("tree_pv_wander").and_then(Value::as_f64) {
+            p.tree_pv_wander = x.clamp(0.0, 1.0);
+        }
+        if let Some(x) = v.get("tree_pv_wander_seed").and_then(Value::as_u64) {
+            p.tree_pv_wander_seed = x;
+        }
         if let Some(x) = v.get("tree_pv_ponder").and_then(Value::as_u64) {
             p.tree_pv_ponder = x as u32;
         }
@@ -682,6 +738,15 @@ impl Playbook {
         }
         if let Some(x) = v.get("tree_pv_lead").and_then(Value::as_u64) {
             p.tree_pv_lead = x as u32;
+        }
+        if let Some(x) = v.get("tree_pv_plan").and_then(Value::as_u64) {
+            p.tree_pv_plan = x as u32;
+        }
+        if let Some(x) = v.get("tree_pv_plan_places").and_then(Value::as_u64) {
+            p.tree_pv_plan_places = (x as u32).clamp(1, 16);
+        }
+        if let Some(a) = v.get("tree_pv_plan_maps").and_then(Value::as_array) {
+            p.tree_pv_plan_maps = a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
         }
         if let Some(x) = v.get("tree_pv_nodes").and_then(Value::as_u64) {
             p.tree_pv_nodes = (x as u32).clamp(1_000, 4_000_000);
@@ -1590,6 +1655,9 @@ thread_local! {
 /// it; the same two for the tracker's ghost; guesses searched; and guesses that stood on a
 /// tile we could see (there should be none).
 pub static PV_GUESS_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+/// Counters of the `tree_pv_plan` decisions on ticks we could step: decisions, the ones that
+/// took a step, walks tried.
+pub static PV_PLAN_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// What the tree search found at the root of its latest decision on this thread: the position
 /// it searched (the tracker's belief), each side's turns with their visits and average result
@@ -1608,6 +1676,21 @@ pub struct RootSeen {
 
 thread_local! {
     pub static LAST_ROOT: std::cell::RefCell<Option<RootSeen>> = const { std::cell::RefCell::new(None) };
+    /// For measuring only (set when the arena or `rehunt` hands over the true state): how the
+    /// last decision over guesses at a hidden opponent stood against where it really was.
+    pub static PV_GUESS_LAST: std::cell::Cell<Option<GuessSeen>> = const { std::cell::Cell::new(None) };
+}
+
+/// `PV_GUESS_LAST`: the weight the guesses searched put on the opponent's true tile, how many
+/// tiles the likeliest guess was off, how many guesses were searched, how many tiles the
+/// tracker holds possible, and whether the true tile is one of them.
+#[derive(Clone, Copy, Debug)]
+pub struct GuessSeen {
+    pub on_truth: f32,
+    pub off_by: i32,
+    pub guesses: u32,
+    pub possible: u32,
+    pub truth_possible: bool,
 }
 
 pub fn decide(t: &Tracker, view: &View, pb: &Playbook) -> Decision {
@@ -1653,6 +1736,10 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
         && !pb.tree_pv_dir.is_empty()
         && t.enemy_last_seen.map(|(tick, _)| s.tick - tick <= pb.tree_pv_fog_ticks as i32).unwrap_or(false)
         && pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)).is_some();
+    // `tree_pv_open`: the same before the opponent has been seen at all; the guesses then
+    // start from its spawn.
+    let pv_open = !visible && pb.tree_pv_open && t.from_spawn && t.enemy_last_seen.is_none() && !pb.tree_pv_dir.is_empty() && pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)).is_some();
+    let pv_guess = pv_guess || pv_open;
     if pb.tree_ms > 0 && pb.search && (visible || guessed || pv_hidden || pv_guess) && t.think_cap_ms(pb.tree_ms) >= 20 {
         let mut cfg = victris_engine::mcts::Config { depth: pb.tree_depth, value_weight: pb.tree_value, value_gen: pb.tree_gen as usize, lead: pb.tree_lead, quiet_slam: pb.tree_slam, own_priors: pb.tree_own_priors, dash_burst: pb.tree_dash_burst, lead_mask: if pb.tree_lead_them { 1u8 << (1 - me) } else { 0 }, expand_at: pb.tree_expand_at, max_nodes: pb.tree_max_nodes, quiet: pb.tree_quiet, c: pb.tree_c, even: pb.tree_even as f32, ..Default::default() };
         if pb.tree_value != 0.0 || pb.tree_net != 0.0 || pb.tree_net_hp != 0.0 || pb.tree_net_value != 0.0 {
@@ -1832,6 +1919,9 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             }
             let root = search.root();
             let Some((mut turn, _, mut q)) = root[me].iter().max_by_key(|a| a.1).copied() else { return idle };
+            if let Some(i) = pv_wander(t, pb, s.tick, &root[me].iter().map(|a| a.1 as f32).collect::<Vec<_>>()) {
+                (turn, q) = (root[me][i].0, root[me][i].2);
+            }
             let value = search.value() as f64;
             let mut weighed: Vec<victris_engine::pvsearch::WeighedTurn> = Vec::new();
             if hold > 0.0 {
@@ -1964,6 +2054,15 @@ fn decide_inner(t: &Tracker, view: &View, pb: &Playbook, started: Instant) -> De
             Some((turn, _, q)) => Decision { turn, sims: done, score: q, note: "tree" },
             None => idle,
         };
+    }
+    // `tree_pv_plan`: out of sight and past the learned search's guesses, the best walk by the
+    // network's value instead of the hand-written policy below.
+    if !visible && pb.tree_pv_plan > 0 && pb.search && !pb.tree_pv_dir.is_empty() && (pb.tree_pv_plan_maps.is_empty() || pb.tree_pv_plan_maps.iter().any(|m| *m == e.map.name)) {
+        if let Some(net) = pv_net(&format!("{}/{}.json", pb.tree_pv_dir, e.map.name)) {
+            if let Some(d) = pv_plan_decide(t, pb, net, &s) {
+                return d;
+            }
+        }
     }
     let dist_now = chebyshev(my.pos, en.pos);
 
@@ -2593,6 +2692,154 @@ fn pv_net(path: &str) -> Option<&'static victris_engine::pvnet::PvNet> {
     *m.entry(path.to_string()).or_insert_with(|| victris_engine::pvnet::PvNet::load(std::path::Path::new(path)).map(|n| &*Box::leak(Box::new(n))))
 }
 
+/// `tree_pv_wander`: on a tick where the turn is to be drawn, which of the turns with these
+/// shares of the visits; `None` on every other tick and always when the switch is off.
+fn pv_wander(t: &Tracker, pb: &Playbook, tick: i32, shares: &[f32]) -> Option<usize> {
+    if pb.tree_pv_wander <= 0.0 {
+        return None;
+    }
+    let mut x = (t.seed as u64 ^ 0x2545_f491_4f6c_dd1d).wrapping_mul(2 * tick as u64 + 1) ^ (pb.tree_pv_wander_seed.wrapping_add(t.me as u64 + 1)).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    let mut next = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    };
+    next();
+    if tick >= 12 && next() >= pb.tree_pv_wander {
+        return None;
+    }
+    let total: f32 = shares.iter().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let mut at = next() as f32 * total;
+    for (i, w) in shares.iter().enumerate() {
+        at -= w;
+        if at < 0.0 {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// `tree_pv_plan`: the decision on a tick with the opponent out of sight and nothing known of
+/// where it went: the first step of the best walk. A walk goes to one tile by the shortest
+/// way and waits there; it is played out on the engine for `tree_pv_plan` ticks against each
+/// place the opponent may stand (standing still there: nothing is known of how it moves), and
+/// scored by the network's value of the position it has led to at the end (and, at half the
+/// weight, halfway), averaged over the places.
+fn pv_plan_decide(t: &Tracker, pb: &Playbook, net: &'static victris_engine::pvnet::PvNet, s: &State) -> Option<Decision> {
+    let e = &t.engine;
+    let me = t.me;
+    let mine = s.fighters[me];
+    if !mine.alive || mine.state != FState::Idle || mine.cd_move > 0 {
+        // no step can be taken this tick: nothing to choose
+        return Some(Decision { turn: RawTurn::IDLE, sims: 0, score: 0.0, note: "pv-plan" });
+    }
+    let horizon = pb.tree_pv_plan.clamp(6, 60) as i32;
+    let ghost = s.fighters[1 - me];
+    let (w, h) = (e.map.w, e.map.h);
+    // where the opponent may stand: the tracker's standing guess, and tiles spread over the
+    // ones it can still be on (the same ones from tick to tick while they stay possible)
+    let open = |p: P| !e.map.is_wall(p) && p != mine.pos && !can_see(&e.rules, &e.map, mine.pos, p) && t.possible.get((p[1] * w + p[0]) as usize).copied().unwrap_or(false);
+    let mut places: Vec<P> = Vec::new();
+    if open(ghost.pos) {
+        places.push(ghost.pos);
+    }
+    let want = pb.tree_pv_plan_places.clamp(1, 16) as usize;
+    let cands: Vec<P> = (0..w * h).map(|i| [i % w, i / w]).filter(|p| open(*p)).collect();
+    while places.len() < want && places.len() < cands.len().max(1) {
+        // the possible tile furthest (by walking) from the places already taken
+        let next = cands.iter().filter(|c| !places.contains(c)).max_by_key(|c| places.iter().map(|p| victris_engine::strategy::path(e, *p, **c)).min().unwrap_or(0));
+        match next {
+            Some(c) => places.push(*c),
+            None => break,
+        }
+    }
+    if places.is_empty() {
+        places.push(ghost.pos);
+    }
+    // the walks: to every tile within reach (a step every `move_cooldown` ticks)
+    let period = e.rules.move_cooldown.max(1);
+    let reach = horizon / period;
+    let value = |st: &State| -> f32 {
+        match victris_engine::pvsearch::outcome(st) {
+            Some(v) => if me == 0 { v } else { -v },
+            None => { let v = net.eval(e, st).v0; if me == 0 { v } else { -v } }
+        }
+    };
+    let toward = |from: P, dest: P| -> Option<u8> {
+        let now = victris_engine::strategy::path(e, dest, from);
+        (0..8u8).filter(|d| !e.map.step_blocked(from, *d)).map(|d| (victris_engine::strategy::path(e, dest, add(from, DIR_VEC[d as usize])), d)).filter(|x| x.0 < now).min().map(|x| x.1)
+    };
+    let mut best: Option<(f32, RawTurn, P)> = None;
+    let mut tried = 0u32;
+    let mut stay = 0.0f32;
+    // the best walk that starts with each first turn
+    let mut by_first: Vec<(RawTurn, f32)> = Vec::new();
+    for i in 0..w * h {
+        let dest = [i % w, i / w];
+        if e.map.is_wall(dest) || victris_engine::strategy::path(e, dest, mine.pos) > reach {
+            continue;
+        }
+        let first = if dest == mine.pos { RawTurn::IDLE } else { match toward(mine.pos, dest) { Some(d) => RawTurn::step(d), None => continue } };
+        let mut score = 0.0f32;
+        for place in places.iter() {
+            let mut st = *s;
+            st.fighters[1 - me] = victris_engine::state::Fighter { pos: *place, ..ghost };
+            let (mut sum, mut n) = (0.0f32, 0u32);
+            for k in 0..horizon {
+                if st.result.is_some() {
+                    break;
+                }
+                let f = st.fighters[me];
+                let mut turns = [RawTurn::IDLE; 2];
+                if f.pos != dest && f.alive && f.state == FState::Idle && f.cd_move == 0 {
+                    if let Some(d) = toward(f.pos, dest) {
+                        turns[me] = RawTurn::step(d);
+                    }
+                }
+                e.step(&mut st, &turns);
+                // the walk is worth the position it leads to: the one at the end counts twice, the one halfway once
+                if k + 1 == horizon / 2 && st.result.is_none() {
+                    sum += value(&st);
+                    n += 1;
+                }
+                if k + 1 == horizon || st.result.is_some() {
+                    sum += 2.0 * value(&st);
+                    n += 2;
+                }
+            }
+            score += sum / n.max(1) as f32;
+        }
+        score /= places.len() as f32;
+        tried += 1;
+        if dest == mine.pos {
+            stay = score;
+        }
+        match by_first.iter_mut().find(|b| b.0 == first) {
+            Some(b) => b.1 = b.1.max(score),
+            None => by_first.push((first, score)),
+        }
+        if best.map(|b| score > b.0).unwrap_or(true) {
+            best = Some((score, first, dest));
+        }
+    }
+    let (score, turn, _dest) = best?;
+    // a walk has to beat standing still by more than the noise of the figures to be taken
+    let turn = if score - stay < 0.002 { RawTurn::IDLE } else { turn };
+    PV_PLAN_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    PV_PLAN_STATS[1].fetch_add((turn != RawTurn::IDLE) as u64, std::sync::atomic::Ordering::Relaxed);
+    PV_PLAN_STATS[2].fetch_add(tried as u64, std::sync::atomic::Ordering::Relaxed);
+    // what is shown of this decision (and what fog self-play learns from it): each first turn
+    // with a share that falls off with how far its best walk is behind the best of all
+    let mut acts: [Vec<(RawTurn, u32, f64)>; 2] = [Vec::new(), Vec::new()];
+    acts[me] = by_first.iter().map(|b| (b.0, (1000.0 * ((b.1 - score) / 0.02).exp()).round() as u32, b.1 as f64)).collect();
+    LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root: *s, acts, value: if me == 0 { score as f64 } else { -score as f64 }, sims: tried, reused: 0, weighed: Vec::new() }));
+    Some(Decision { turn, sims: tried, score: score as f64, note: "pv-plan" })
+}
+
 /// The learned search's decision on a tick with the opponent out of sight (`tree_pv_fog_ticks`).
 ///
 /// A guess is the position with the opponent's fighter set down somewhere it could be. The
@@ -2683,12 +2930,17 @@ fn pv_guess_decide(t: &Tracker, pb: &Playbook, net: &'static victris_engine::pvn
         PV_GUESS_STATS[5].fetch_add((chebyshev(ghost, real) <= 1) as u64, Relaxed);
         PV_GUESS_STATS[6].fetch_add(places.len() as u64, Relaxed);
         PV_GUESS_STATS[7].fetch_add(places.iter().filter(|p| can_see(&e.rules, &e.map, mine.pos, p.0.pos)).count() as u64, Relaxed);
+        let open = t.possible.iter().filter(|p| **p).count() as u32;
+        let inside = t.possible.get((real[1] * e.map.w + real[0]) as usize).copied().unwrap_or(false);
+        PV_GUESS_LAST.with(|l| l.set(Some(GuessSeen { on_truth: on, off_by: chebyshev(places[0].0.pos, real), guesses: places.len() as u32, possible: open, truth_possible: inside })));
     }
     let begun = started.elapsed().as_millis() as u64;
     let mut pooled: Vec<(RawTurn, f32, f32)> = Vec::new();
     let mut guesses: Vec<PvGuess> = Vec::new();
     let mut first: Option<(State, [Vec<(RawTurn, u32, f64)>; 2], f64)> = None;
     let (mut done, mut spent) = (0u32, 0.0f32);
+    // the searches' values of their roots for fighter 0, weighted by their guesses
+    let mut value_sum = 0.0f32;
     for (o, w) in places.iter() {
         let weight = w / sum;
         let mut root = *s;
@@ -2721,15 +2973,22 @@ fn pv_guess_decide(t: &Tracker, pb: &Playbook, net: &'static victris_engine::pvn
                 None => pooled.push((a.0, part, a.2)),
             }
         }
+        value_sum += weight * search.value();
         if first.is_none() {
             let wide = |x: usize| r[x].iter().map(|a| (a.0, a.1, a.2 as f64)).collect::<Vec<_>>();
             first = Some((root, [wide(0), wide(1)], search.value() as f64));
         }
         guesses.push(PvGuess { state: root, weight, theirs: r[1 - me].iter().map(|a| (a.0, a.1)).collect() });
     }
-    let (turn, _, q) = pooled.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)).copied()?;
-    if let Some((root, acts, value)) = first {
-        LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root, acts, value, sims: done, reused: 0, weighed: Vec::new() }));
+    let (mut turn, _, mut q) = pooled.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)).copied()?;
+    if let Some(i) = pv_wander(t, pb, s.tick, &pooled.iter().map(|a| a.1).collect::<Vec<_>>()) {
+        (turn, q) = (pooled[i].0, pooled[i].2);
+    }
+    if let Some((root, mut acts, _)) = first {
+        // what is shown of this decision: the first guess's position, with our turns as pooled
+        // over every guess (their shares of the lines, their mean results) and the pooled value
+        acts[me] = pooled.iter().map(|a| (a.0, (a.1 * done as f32).round() as u32, a.2 as f64)).collect();
+        LAST_ROOT.with(|l| *l.borrow_mut() = Some(RootSeen { root, acts, value: value_sum as f64, sims: done, reused: 0, weighed: Vec::new() }));
     }
     PV_GUESSES.with(|g| {
         let mut g = g.borrow_mut();
