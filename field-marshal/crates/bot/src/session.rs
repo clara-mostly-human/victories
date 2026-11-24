@@ -136,6 +136,10 @@ struct Match {
     /// think was cut by the time they had waited behind another
     frames_behind: u32,
     frames_waited: u32,
+    /// decisions with a search root, and the fresh lines and reused visits summed over them
+    searched: u32,
+    fresh_sum: u64,
+    reused_sum: u64,
     /// network time (charge minus think) of the last 10 turns, and turns whose think the
     /// network cut
     recent_wire: std::collections::VecDeque<u32>,
@@ -455,6 +459,9 @@ impl Session {
                 pondered: 0,
                 frames_behind: 0,
                 frames_waited: 0,
+                searched: 0,
+                fresh_sum: 0,
+                reused_sum: 0,
                 recent_wire: std::collections::VecDeque::new(),
                 net_capped: 0,
                 rejected: 0,
@@ -575,11 +582,16 @@ impl Session {
                     }
                 }
             }
+            // The search leaves its root in LAST_ROOT: fresh lines and the visits carried from
+            // the kept tree, for the tick line (cleared first, so a decision without a search
+            // shows none).
+            crate::policy::LAST_ROOT.with(|l| *l.borrow_mut() = None);
             let d = decide(tracker, &view, &playbook);
-            (sync, d)
+            let seen = crate::policy::LAST_ROOT.with(|l| l.borrow().as_ref().map(|r| (r.sims, r.reused)));
+            (sync, d, seen)
         }));
         self.early = early;
-        let (sync, decision) = match result {
+        let (sync, decision, root_seen) = match result {
             Ok(x) => x,
             Err(_) => {
                 m.panics += 1;
@@ -646,6 +658,13 @@ impl Session {
             "budget_ms": msg.get("self").and_then(|s| s.get("budget_ms_left")),
             "truth_diff": truth_note,
         });
+        if let Some((fresh, reused)) = root_seen {
+            line["fresh"] = json!(fresh);
+            line["reused"] = json!(reused);
+            m.searched += 1;
+            m.fresh_sum += fresh as u64;
+            m.reused_sum += reused as u64;
+        }
         let net_cap = tracker.net_cap_ms.get();
         if net_cap > 0 {
             line["net_cap_ms"] = json!(net_cap);
@@ -699,7 +718,7 @@ impl Session {
                 "final_tick": msg.get("final_tick"), "rating_change": msg.get("rating_change"), "voided": msg.get("voided"),
                 "replay_url": msg.get("replay_url"),
                 "think_us": { "p50": pct(0.5), "p99": pct(0.99), "max": m.think_us.last() },
-                "sims": m.sims, "pondered": m.pondered, "frames_behind": m.frames_behind, "frames_waited": m.frames_waited, "net_capped": m.net_capped, "rejected_parts": m.rejected, "server_refusals": m.server_refusals, "panics": m.panics,
+                "sims": m.sims, "pondered": m.pondered, "frames_behind": m.frames_behind, "frames_waited": m.frames_waited, "net_capped": m.net_capped, "fresh_avg": if m.searched > 0 { json!((m.fresh_sum as f64 / m.searched as f64).round()) } else { Value::Null }, "reused_avg": if m.searched > 0 { json!((m.reused_sum as f64 / m.searched as f64).round()) } else { Value::Null }, "rejected_parts": m.rejected, "server_refusals": m.server_refusals, "panics": m.panics,
                 "min_budget_ms": if m.min_budget_ms == i64::MAX { Value::Null } else { json!(m.min_budget_ms) },
                 "charge_ms": if m.charges.is_empty() { Value::Null } else { json!({ "p50": charge(0.5), "p99": charge(0.99), "lost_turns": lost }) },
                 "remote": self.remote,
