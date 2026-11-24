@@ -533,6 +533,8 @@ fn main() {
                                 if before.tick < 60 {
                                     wave[x] += 1;
                                 }
+                                let span = ["power pads taken in ticks 0-149", "power pads taken in ticks 150-299", "power pads taken in ticks 300-449", "power pads taken in ticks 450 on"];
+                                g[x].add(0, span[(before.tick / 150).clamp(0, 3) as usize], 1.0);
                                 if first_power.is_none() {
                                     first_power = Some(x);
                                     g[x].add(0, "  the game's first power pad", 1.0);
@@ -628,7 +630,7 @@ fn main() {
             if per_game {
                 let w = res.winner.map(|w| w as usize - 1);
                 println!(
-                    "game {} {} v {} {} first pads {}-{} stood {:?}/{:?} lead40 {:?} lead100 {:?} end {} hp {}-{} alone {}-{} seen {}-{} hid11 {}-{} pdmg {}-{} dmg {}-{}",
+                    "game {} {} v {} {} first pads {}-{} stood {:?}/{:?} lead40 {:?} lead100 {:?} end {} hp {}-{} alone {}-{} seen {}-{} hid11 {}-{} pdmg {}-{} dmg {}-{} lead200 {} lead300 {} lead400 {}",
                     e.map.name,
                     r.bots[x],
                     r.bots[1 - x],
@@ -651,7 +653,10 @@ fn main() {
                     g[x].get("  damage dealt while powered")[0],
                     g[1 - x].get("  damage dealt while powered")[0],
                     g[x].get("damage dealt")[0],
-                    g[1 - x].get("damage dealt")[0]
+                    g[1 - x].get("damage dealt")[0],
+                    marks[2][x].map(|v| v.to_string()).unwrap_or("na".into()),
+                    marks[3][x].map(|v| v.to_string()).unwrap_or("na".into()),
+                    marks[4][x].map(|v| v.to_string()).unwrap_or("na".into())
                 );
             }
             t.add(0, "game length (ticks)", s.tick as f64);
