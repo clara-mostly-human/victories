@@ -26,6 +26,15 @@
 //!  - the search's value for X at the first tick of the stretch, when the pad appears and at
 //!    the last tick, by who took more power pads in the stretch: whether the search sees the
 //!    pad going and what it thinks a pad is worth.
+//!
+//! --regret N,M adds, on every tick with the other in sight: a fresh search of N lines from
+//! the real position, then M lines in which the other's first turn is fixed to the one it
+//! really sent and only X's answer varies (`Search::answers`). The best answer's result less
+//! the result of the turn the playbook chose, both against the real turn, is what the choice
+//! gave up by not knowing that turn (in the search's own value, -1 lost to 1 won). It is
+//! summed apart for real turns the search had under 5% of its lines on and for the rest. A
+//! change to the search that covers real opponents' turns better shows here as less given up
+//! on the first kind without more on the second; an own-bot match cannot show it.
 //! Nothing here is a result of a game.
 
 use marshal::policy::{decide, pv_forget, pv_ponder, Playbook, LAST_ROOT};
@@ -71,6 +80,12 @@ struct Sum {
     /// by who took more pads in the stretch: stretches, then sum and count of the value for X
     /// at the first tick, at the tick the pad appears, at the last tick
     val: [[f64; 7]; 3],
+    /// `--regret`, by kind of the other's real turn: where the search had it under 5%: ticks,
+    /// given up (sum), ticks where the best answer was another turn; then the same three
+    /// where it had it at 5% or more
+    regret: [[f64; 6]; 6],
+    /// `--regret`: ticks left out because the playbook's turn was not among the fresh search's turns
+    regret_skipped: f64,
 }
 
 impl Sum {
@@ -88,6 +103,12 @@ impl Sum {
                 self.val[k][j] += o.val[k][j];
             }
         }
+        for k in 0..6 {
+            for j in 0..6 {
+                self.regret[k][j] += o.regret[k][j];
+            }
+        }
+        self.regret_skipped += o.regret_skipped;
     }
 }
 
@@ -112,6 +133,11 @@ fn main() {
     let after: usize = opt("--after").and_then(|s| s.parse().ok()).unwrap_or(8);
     let until: i32 = opt("--until").and_then(|s| s.parse().ok()).unwrap_or(i32::MAX);
     let all = args.iter().any(|a| a == "--all");
+    // --regret N,M: see the top of the file
+    let regret: Option<(u32, u32)> = opt("--regret").and_then(|s| {
+        let mut it = s.split(',').filter_map(|v| v.parse::<u32>().ok());
+        Some((it.next()?, it.next()?))
+    });
     let limit: usize = opt("--limit").and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
     let threads: usize = opt("--threads").and_then(|s| s.parse().ok()).unwrap_or(1);
     let iters: Option<u64> = opt("--iters").and_then(|s| s.parse().ok());
@@ -228,7 +254,7 @@ fn main() {
                             );
                         }
                         for (i, (name, book)) in books.iter().enumerate() {
-                            stretch(e, r.seed, x, &states, &evs, &turns, a, b, &appears, book, &mut local[i], if tracing { Some(name.as_str()) } else { None });
+                            stretch(e, r.seed, x, &states, &evs, &turns, a, b, &appears, book, regret, &mut local[i], if tracing { Some(name.as_str()) } else { None });
                         }
                     }
                 }
@@ -287,6 +313,20 @@ fn main() {
             o[10] / o[8].max(1.0),
             o[8]
         );
+        if regret.is_some() {
+            println!("   what X's turn gave up by not knowing the other's real turn (the search's value, -1 to 1), a 100 ticks of that kind:");
+            println!("   {:<20} {:>10} {:>12} {:>16} {:>10} {:>12} {:>16}", "", "under 5%", "given up", "another turn %", "5% or more", "given up", "another turn %");
+            let mut all = [0.0f64; 6];
+            for k in 0..6 {
+                let v = &s.regret[k];
+                println!("   {:<20} {:>10.0} {:>12.2} {:>16.0} {:>10.0} {:>12.2} {:>16.0}", KINDS[k], v[0], 100.0 * v[1] / v[0].max(1.0), 100.0 * v[2] / v[0].max(1.0), v[3], 100.0 * v[4] / v[3].max(1.0), 100.0 * v[5] / v[3].max(1.0));
+                for j in 0..6 {
+                    all[j] += v[j];
+                }
+            }
+            println!("   {:<20} {:>10.0} {:>12.2} {:>16.0} {:>10.0} {:>12.2} {:>16.0}", "every kind", all[0], 100.0 * all[1] / all[0].max(1.0), 100.0 * all[2] / all[0].max(1.0), all[3], 100.0 * all[4] / all[3].max(1.0), 100.0 * all[5] / all[3].max(1.0));
+            println!("   given up in all: {:.2} over {:.0} ticks ({:.0} left out: the playbook's turn was not among the fresh search's)", all[1] + all[4], all[0] + all[3], s.regret_skipped);
+        }
         println!("   the search's value for X (-1 lost to 1 won) by who took more power pads in the stretch:");
         println!("   {:<26} {:>10} {:>14} {:>18} {:>12}", "", "stretches", "first tick", "the pad appears", "last tick");
         for k in 0..3 {
@@ -300,8 +340,9 @@ fn main() {
 /// one tick at a time from the real positions. The search is also run (its turn not used) on
 /// the two ticks before, so the tree the live bot carries into a tick is there.
 #[allow(clippy::too_many_arguments)]
-fn stretch(e: &Engine, seed: i64, x: usize, states: &[State], evs: &[Vec<Event>], turns: &[[RawTurn; 2]], a: usize, b: usize, appears: &[usize], book: &Playbook, sum: &mut Sum, trace: Option<&str>) {
+fn stretch(e: &Engine, seed: i64, x: usize, states: &[State], evs: &[Vec<Event>], turns: &[[RawTurn; 2]], a: usize, b: usize, appears: &[usize], book: &Playbook, regret: Option<(u32, u32)>, sum: &mut Sum, trace: Option<&str>) {
     let o = 1 - x;
+    let net = regret.and_then(|_| victris_engine::pvnet::PvNet::load(std::path::Path::new(&format!("{}/{}.json", book.tree_pv_dir, e.map.name))));
     let index = |want: u8| {
         e.rules.attacks.iter().position(|k| match (&k.kind, want) {
             (AttackKind::Projectile { .. }, 0) => true,
@@ -428,6 +469,22 @@ fn stretch(e: &Engine, seed: i64, x: usize, states: &[State], evs: &[Vec<Event>]
                 let slot = if share < 0.05 { 4 } else { 6 };
                 sum.opp[kind][slot] += swing as f64;
                 sum.opp[kind][slot + 1] += 1.0;
+                if let (Some((n, m)), Some(net), true) = (regret, net.as_ref(), view.enemy.is_some()) {
+                    // a fresh search from the real position, then X's answers to the real turn
+                    let mut search = victris_engine::pvsearch::Search::new(e, net, victris_engine::pvsearch::PvConfig { lead_at: book.tree_pv_lead, max_nodes: book.tree_pv_nodes as usize, ..Default::default() });
+                    search.iterate(s, n);
+                    let listed_real = search.root()[o].iter().map(|t| t.0).find(|t| phys(play(s, turns[k][x], *t).0) == want);
+                    let got = listed_real.and_then(|t| search.answers(s, o, &t, m));
+                    match got.as_ref().and_then(|g| g.iter().find(|a| a.0 == d.turn).map(|a| (a.2, victris_engine::pvsearch::Search::best_answer(g)))) {
+                        Some((ours, (best_turn, best))) if ours > f32::MIN => {
+                            let at = if share < 0.05 { 0 } else { 3 };
+                            sum.regret[kind][at] += 1.0;
+                            sum.regret[kind][at + 1] += (best - ours).max(0.0) as f64;
+                            sum.regret[kind][at + 2] += (best_turn != d.turn) as u32 as f64;
+                        }
+                        _ => sum.regret_skipped += 1.0,
+                    }
+                }
                 share_note = format!("{} {:.0}%{}", KINDS[kind], 100.0 * share, if listed { "" } else { " (not listed)" });
             }
             if let Some(name) = trace {
