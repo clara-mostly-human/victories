@@ -50,6 +50,9 @@ struct Sum {
     q_n: f64,
     /// where the search turned the network's first choice down: [the network's kind][the search's kind]
     turned: [[u32; KINDS]; KINDS],
+    /// each kind's share of the search's visits and of the network's turn shares, summed
+    by_search: [f64; KINDS],
+    by_net: [f64; KINDS],
 }
 
 /// A turn's kind for the table of turned-down first choices: stay, step or dash, times no attack
@@ -62,7 +65,7 @@ fn kind_of(class: u8) -> usize {
 
 impl Default for Sum {
     fn default() -> Sum {
-        Sum { n: 0.0, value: 0.0, decided: 0.0, hit: 0.0, policy: 0.0, floor: 0.0, pn: 0.0, top: 0.0, top_share: 0.0, net_share: 0.0, other_move: 0.0, other_attack: 0.0, net_low: 0.0, q_gap: 0.0, q_n: 0.0, turned: [[0; KINDS]; KINDS] }
+        Sum { n: 0.0, value: 0.0, decided: 0.0, hit: 0.0, policy: 0.0, floor: 0.0, pn: 0.0, top: 0.0, top_share: 0.0, net_share: 0.0, other_move: 0.0, other_attack: 0.0, net_low: 0.0, q_gap: 0.0, q_n: 0.0, turned: [[0; KINDS]; KINDS], by_search: [0.0; KINDS], by_net: [0.0; KINDS] }
     }
 }
 
@@ -77,11 +80,21 @@ impl Sum {
         for r in rows.iter().take(16) {
             out += &format!("    {:22} {:22} {:5.1}%\n", label(r.1), label(r.2), 100.0 * r.0 as f64 / all.max(1) as f64);
         }
+        out += "  each kind of turn: the search's share of its visits, the network's share\n";
+        for k in 0..KINDS {
+            if self.by_search[k] > 0.0 || self.by_net[k] > 0.0 {
+                out += &format!("    {:22} {:5.1}% {:5.1}%\n", label(k), 100.0 * self.by_search[k] / self.pn.max(1.0), 100.0 * self.by_net[k] / self.pn.max(1.0));
+            }
+        }
         out
     }
     fn add(&mut self, l: &Loss) {
         for f in l.firsts.iter().flatten() {
             self.turned[kind_of(f.0)][kind_of(f.1)] += 1;
+        }
+        for c in 0..victris_engine::pvnet::CLASSES {
+            self.by_search[kind_of(c as u8)] += l.by_search[c] as f64;
+            self.by_net[kind_of(c as u8)] += l.by_net[c] as f64;
         }
         self.n += 1.0;
         self.value += l.value as f64;
@@ -116,6 +129,8 @@ impl Sum {
         self.q_gap += o.q_gap;
         self.q_n += o.q_n;
         for i in 0..KINDS {
+            self.by_search[i] += o.by_search[i];
+            self.by_net[i] += o.by_net[i];
             for j in 0..KINDS {
                 self.turned[i][j] += o.turned[i][j];
             }

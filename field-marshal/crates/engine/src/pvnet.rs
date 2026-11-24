@@ -725,7 +725,7 @@ pub struct Scratch {
 }
 
 /// What one saved position costs under the network, for the trainer's reports.
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct Loss {
     /// how far the chance to win is from the target (cross-entropy)
     pub value: f32,
@@ -756,6 +756,16 @@ pub struct Loss {
     /// for each fighter that had a choice: the network's first choice and the search's
     /// (`CLASSES`), for the trainer's table of what the search plays in the network's place
     pub firsts: [Option<(u8, u8)>; 2],
+    /// summed over the same fighters, for each kind of turn (`CLASSES`): the search's share of
+    /// visits and the network's share
+    pub by_search: [f32; CLASSES],
+    pub by_net: [f32; CLASSES],
+}
+
+impl Default for Loss {
+    fn default() -> Loss {
+        Loss { value: 0.0, decided: false, value_hit: false, policy: 0.0, policy_floor: 0.0, policy_n: 0, top_hit: 0, top_share: 0.0, net_share: 0.0, other_move: 0, other_attack: 0, net_low: 0, q_gap: 0.0, q_n: 0, firsts: [None; 2], by_search: [0.0; CLASSES], by_net: [0.0; CLASSES] }
+    }
 }
 
 /// The value target for a saved position, as fighter 0's chance to win: the game's result,
@@ -818,6 +828,8 @@ pub fn loss_grad(net: &PvNet, e: &Engine, r: &Sample, lambda: f32, pw: f32, sc: 
             }
             let q = sm[c] / sum;
             let pi = r.pol[f][c] as f32 / total as f32;
+            out.by_search[c] += pi;
+            out.by_net[c] += q;
             if pi > 0.0 {
                 out.policy -= pi * (q + eps).ln();
                 out.policy_floor -= pi * pi.ln();
