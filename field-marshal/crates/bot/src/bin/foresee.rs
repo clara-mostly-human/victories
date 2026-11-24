@@ -27,6 +27,12 @@
 //!    the last tick, by who took more power pads in the stretch: whether the search sees the
 //!    pad going and what it thinks a pad is worth.
 //!
+//! --settle N [--every K] adds, on every K-th tick (default 30) with the other in sight: a fresh
+//! search of N lines from the real position, read at N/64, N/32, ... N/2 lines on the way. What a
+//! search of each size gives up is the full search's result for its own first turn less its
+//! result for the turn the smaller search would have sent (how much more lines still change).
+//! Give --iters 500 with it so the playbook's own decisions cost nothing.
+//!
 //! --regret N,M adds, on every tick with the other in sight: a fresh search of N lines from
 //! the real position, then M lines in which the other's first turn is fixed to the one it
 //! really sent and only X's answer varies (`Search::answers`). The best answer's result less
@@ -86,7 +92,12 @@ struct Sum {
     regret: [[f64; 6]; 6],
     /// `--regret`: ticks left out because the playbook's turn was not among the fresh search's turns
     regret_skipped: f64,
+    /// `--settle`, by size (N/64 ... N/2): positions, given up (sum), another first turn than the full search's
+    settle: [[f64; 3]; 6],
 }
+
+/// `--settle`: lines of the full search, and every how many ticks
+static SETTLE: std::sync::OnceLock<(u32, i32)> = std::sync::OnceLock::new();
 
 impl Sum {
     fn add(&mut self, o: &Sum) {
@@ -109,6 +120,11 @@ impl Sum {
             }
         }
         self.regret_skipped += o.regret_skipped;
+        for k in 0..6 {
+            for j in 0..3 {
+                self.settle[k][j] += o.settle[k][j];
+            }
+        }
     }
 }
 
@@ -133,6 +149,9 @@ fn main() {
     let after: usize = opt("--after").and_then(|s| s.parse().ok()).unwrap_or(8);
     let until: i32 = opt("--until").and_then(|s| s.parse().ok()).unwrap_or(i32::MAX);
     let all = args.iter().any(|a| a == "--all");
+    if let Some(n) = opt("--settle").and_then(|s| s.parse::<u32>().ok()) {
+        let _ = SETTLE.set((n.max(64), opt("--every").and_then(|s| s.parse().ok()).unwrap_or(30)));
+    }
     // --regret N,M: see the top of the file
     let regret: Option<(u32, u32)> = opt("--regret").and_then(|s| {
         let mut it = s.split(',').filter_map(|v| v.parse::<u32>().ok());
@@ -313,6 +332,13 @@ fn main() {
             o[10] / o[8].max(1.0),
             o[8]
         );
+        if let Some((n, _)) = SETTLE.get() {
+            println!("   what a smaller search gives up against one of {} lines (the full search's value, -1 to 1), a 100 decisions:", n);
+            for k in 0..6 {
+                let v = &s.settle[k];
+                println!("   {:>9} lines: {:>6.3} given up, another first turn {:>3.0}% ({:.0} positions)", n >> (6 - k), 100.0 * v[1] / v[0].max(1.0), 100.0 * v[2] / v[0].max(1.0), v[0]);
+            }
+        }
         if regret.is_some() {
             println!("   what X's turn gave up by not knowing the other's real turn (the search's value, -1 to 1), a 100 ticks of that kind:");
             println!("   {:<20} {:>10} {:>12} {:>16} {:>10} {:>12} {:>16}", "", "under 5%", "given up", "another turn %", "5% or more", "given up", "another turn %");
@@ -406,6 +432,31 @@ fn stretch(e: &Engine, seed: i64, x: usize, states: &[State], evs: &[Vec<Event>]
         let d = decide(&tracker, &view, book);
         let root = LAST_ROOT.with(|l| l.borrow().as_ref().filter(|r| r.root.tick == s.tick).map(|r| (if x == 0 { r.value } else { -r.value }, r.acts[x].clone(), r.acts[o].clone(), r.sims)));
         let searched = d.note == "pv" && root.is_some();
+        if let (Some((n, every)), true) = (SETTLE.get().copied(), view.enemy.is_some() && s.tick % SETTLE.get().map(|v| v.1).unwrap_or(1).max(1) == 0) {
+            let _ = every;
+            if let Some(net) = victris_engine::pvnet::PvNet::load(std::path::Path::new(&format!("{}/{}.json", book.tree_pv_dir, e.map.name))) {
+                let mut search = victris_engine::pvsearch::Search::new(e, &net, victris_engine::pvsearch::PvConfig { lead_at: book.tree_pv_lead, max_nodes: book.tree_pv_nodes as usize, ..Default::default() });
+                let mut firsts: Vec<RawTurn> = Vec::new();
+                let mut done = 0u32;
+                for k in 0..7u32 {
+                    let mark = n >> (6 - k);
+                    search.iterate(s, mark - done);
+                    done = mark;
+                    if let Some(a) = search.root()[x].iter().max_by_key(|a| a.1) {
+                        firsts.push(a.0);
+                    }
+                }
+                let r = search.root();
+                if let (Some(best), 7) = (r[x].iter().max_by_key(|a| a.1).copied(), firsts.len()) {
+                    for (k, f) in firsts.iter().take(6).enumerate() {
+                        let q = r[x].iter().find(|a| a.0 == *f).map(|a| a.2).unwrap_or(best.2);
+                        sum.settle[k][0] += 1.0;
+                        sum.settle[k][1] += (best.2 - q) as f64;
+                        sum.settle[k][2] += (*f != best.0) as u32 as f64;
+                    }
+                }
+            }
+        }
         // X's turn from the playbook and the real one, each with the other's real turn
         let (book_next, book_ev) = play(s, d.turn, turns[k][o]);
         let same = phys(book_next) == phys(*real_next);
