@@ -6,7 +6,7 @@
 //! and `step` refuses a finished match, so both fighters are alive in phases 1 to 6.
 
 use crate::events::{Event, Reason};
-use crate::geom::{add, chebyshev, octant, ray_point, ray_tiles, sub_to_tile, Ray, ShotBuf, DIR_VEC, P, SUB};
+use crate::geom::{add, chebyshev, octant, ray_point, shot_tiles, sub_to_tile, Ray, ShotBuf, DIR_VEC, P, SUB};
 use crate::map::{MapData, PadKind};
 use crate::rules::{Attack, AttackKind, Rules};
 use crate::state::*;
@@ -313,7 +313,7 @@ fn advance_projectile(map: &MapData, p: &mut Projectile, buf: &mut ShotBuf, mut 
     let ray = Ray::new(p.origin, p.target);
     let to = (p.traveled as i64 + p.speed as i64 * SUB).min(p.max_travel as i64);
     let mut last_open = p.pos;
-    ray_tiles(&ray, p.traveled as i64, to, buf);
+    shot_tiles(&ray, p.traveled as i64, to, buf);
     for rt in buf.as_slice() {
         let tile = rt.tile;
         if map.is_wall(tile) {

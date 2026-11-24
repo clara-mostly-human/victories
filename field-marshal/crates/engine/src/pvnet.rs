@@ -112,6 +112,14 @@ impl Inputs {
     fn on(&mut self, i: usize) {
         self.put(i, 1.0);
     }
+    /// `on(base + k)` for every bit `k` set in `bits`, lowest first.
+    #[inline]
+    fn on_each(&mut self, base: usize, mut bits: u64) {
+        while bits != 0 {
+            self.on(base + bits.trailing_zeros() as usize);
+            bits &= bits - 1;
+        }
+    }
     /// All inputs, zeros included (for tests).
     pub fn dense(&self) -> Vec<f32> {
         let mut v = vec![0.0; IN];
@@ -225,6 +233,30 @@ fn threat_inputs(e: &Engine, s: &State, a: usize, v: [i32; 2], b: usize, out: &m
     }
 }
 
+const _: () = assert!(R_WALL == crate::map::NEAR && R_WALL_T == 2);
+
+/// The inner 5 x 5 of a tile's 7 x 7 of walls (`MapData::walls_near`), one bit a tile, row by row.
+#[inline]
+fn inner_walls(near: u64) -> u32 {
+    let mut bits = 0u32;
+    for row in 0..5 {
+        bits |= ((near >> ((row + 1) * 7 + 1)) as u32 & 31) << (row * 5);
+    }
+    bits
+}
+
+/// The outer ring of a tile's 7 x 7 of walls, one bit a tile, row by row: the top row's seven,
+/// the two ends of each of the five rows between, the bottom row's seven.
+#[inline]
+fn ring_walls(near: u64) -> u32 {
+    let mut bits = near as u32 & 127;
+    for row in 1..6 {
+        let ends = (near >> (row * 7)) as u32;
+        bits |= (ends & 1 | (ends >> 6 & 1) << 1) << (5 + 2 * row);
+    }
+    bits | ((near >> 42) as u32 & 127) << 17
+}
+
 /// The board as fighter `x` stands in it.
 pub fn encode(e: &Engine, s: &State, x: usize, out: &mut Inputs) {
     out.n = 0;
@@ -245,21 +277,11 @@ pub fn encode(e: &Engine, s: &State, x: usize, out: &mut Inputs) {
     out.on(B_SIDE + (dx.signum() + 1) as usize);
     out.on(B_SIDE + 3 + (dy.signum() + 1) as usize);
     out.on(B_SIDE + 6 + ((dx.abs() - dy.abs()).signum() + 1) as usize);
-    let wall = |p: [i32; 2]| p[0] < 0 || p[1] < 0 || p[0] >= e.map.w || p[1] >= e.map.h || e.map.is_wall(p);
-    for wy in -R_WALL..=R_WALL {
-        for wx in -R_WALL..=R_WALL {
-            if wall([f.pos[0] + wx, f.pos[1] + wy]) {
-                out.on(B_WALL + ((wy + R_WALL) * (2 * R_WALL + 1) + wx + R_WALL) as usize);
-            }
-        }
-    }
-    for wy in -R_WALL_T..=R_WALL_T {
-        for wx in -R_WALL_T..=R_WALL_T {
-            if wall([o.pos[0] + wx, o.pos[1] + wy]) {
-                out.on(B_WALL_T + ((wy + R_WALL_T) * (2 * R_WALL_T + 1) + wx + R_WALL_T) as usize);
-            }
-        }
-    }
+    // the walls around both, from the map's table of each tile's 7 x 7 (`MapData::walls_near`):
+    // the same inputs in the same order as asking tile by tile, row by row
+    let around = e.map.walls_near(o.pos);
+    out.on_each(B_WALL, e.map.walls_near(f.pos));
+    out.on_each(B_WALL_T, inner_walls(around) as u64);
     threat_inputs(e, s, 1 - x, f.pos, B_THREAT, out);
     threat_inputs(e, s, x, o.pos, B_THREAT + TH, out);
     for i in 0..PADS {
@@ -280,17 +302,7 @@ pub fn encode(e: &Engine, s: &State, x: usize, out: &mut Inputs) {
     out.on(B_CTX + 2);
     out.n0 = out.n;
     // the ring three tiles from the opponent, row by row
-    let mut k = 0;
-    for wy in -R_WALL..=R_WALL {
-        for wx in -R_WALL..=R_WALL {
-            if wx.abs().max(wy.abs()) == R_WALL {
-                if wall([o.pos[0] + wx, o.pos[1] + wy]) {
-                    out.on(B_RING_T + k);
-                }
-                k += 1;
-            }
-        }
-    }
+    out.on_each(B_RING_T, ring_walls(around) as u64);
     out.n1 = out.n;
     for i in 0..PADS {
         if e.map.pads.get(i).is_none() || s.pads[i].available {
@@ -922,5 +934,64 @@ impl Sym {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wall inputs asked tile by tile, as `encode` made them before the map kept a table.
+    fn walls_tile_by_tile(e: &Engine, p: [i32; 2]) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+        let wall = |p: [i32; 2]| p[0] < 0 || p[1] < 0 || p[0] >= e.map.w || p[1] >= e.map.h || e.map.is_wall(p);
+        let (mut near, mut inner, mut ring) = (Vec::new(), Vec::new(), Vec::new());
+        for wy in -R_WALL..=R_WALL {
+            for wx in -R_WALL..=R_WALL {
+                if wall([p[0] + wx, p[1] + wy]) {
+                    near.push(((wy + R_WALL) * (2 * R_WALL + 1) + wx + R_WALL) as usize);
+                }
+            }
+        }
+        for wy in -R_WALL_T..=R_WALL_T {
+            for wx in -R_WALL_T..=R_WALL_T {
+                if wall([p[0] + wx, p[1] + wy]) {
+                    inner.push(((wy + R_WALL_T) * (2 * R_WALL_T + 1) + wx + R_WALL_T) as usize);
+                }
+            }
+        }
+        let mut k = 0;
+        for wy in -R_WALL..=R_WALL {
+            for wx in -R_WALL..=R_WALL {
+                if wx.abs().max(wy.abs()) == R_WALL {
+                    if wall([p[0] + wx, p[1] + wy]) {
+                        ring.push(k);
+                    }
+                    k += 1;
+                }
+            }
+        }
+        (near, inner, ring)
+    }
+
+    #[test]
+    fn wall_inputs_from_the_table_are_the_ones_asked_tile_by_tile() {
+        let listed = |bits: u64| {
+            let mut x = Inputs::default();
+            x.on_each(0, bits);
+            (0..x.n).map(|k| x.idx[k] as usize).collect::<Vec<_>>()
+        };
+        for name in crate::shipped::MAP_NAMES {
+            let e = Engine::shipped(name);
+            // every tile of the board, and a margin off it
+            for y in -4..e.map.h + 4 {
+                for x in -4..e.map.w + 4 {
+                    let (near, inner, ring) = walls_tile_by_tile(&e, [x, y]);
+                    let bits = e.map.walls_near([x, y]);
+                    assert_eq!(listed(bits), near, "{name} {x},{y}");
+                    assert_eq!(listed(inner_walls(bits) as u64), inner, "{name} {x},{y}");
+                    assert_eq!(listed(ring_walls(bits) as u64), ring, "{name} {x},{y}");
+                }
+            }
+        }
     }
 }

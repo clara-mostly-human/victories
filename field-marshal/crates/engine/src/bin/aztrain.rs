@@ -6,6 +6,11 @@
 //!   aztrain --out NET.json --data FILE [FILE ...] [--init NET.json] [--h1 64] [--h2 32]
 //!           [--epochs 8] [--lr 0.002] [--batch 512] [--lambda 0.5] [--pw 1.0] [--threads 4]
 //!           [--holdout 0.05] [--seed 1] [--map columns-21] [--mirror 1] [--widen]
+//!           [--value-data FILE ...]
+//!
+//! The files after --value-data teach the value only: their turn shares are left out. That
+//! is for games searched too lightly to teach the moves (`azgen --deep` saves its own lightly
+//! searched ticks that way already), whose results are still worth having.
 //!
 //! With --widen an --init network made before the walls three tiles from the opponent were
 //! inputs (`pvnet::IN_OLD`) is given them (`PvNet::widened`); a new network always has them.
@@ -90,12 +95,17 @@ fn main() {
         Some(i) => args[i + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect(),
         None => Vec::new(),
     };
+    let value_files: Vec<String> = match args.iter().position(|a| a == "--value-data") {
+        Some(i) => args[i + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect(),
+        None => Vec::new(),
+    };
     // replay every saved game to get its positions back
     let mut data: Vec<Sample> = Vec::new();
     let mut game_start: Vec<usize> = Vec::new();
     let mut bad = 0;
-    for f in &files {
+    for (k, f) in files.iter().chain(value_files.iter()).enumerate() {
         let b = std::fs::read(f).unwrap_or_else(|_| panic!("cannot read {f}"));
+        let first = data.len();
         for g in GameLog::read_all(&b) {
             let at = data.len();
             if g.samples(&e, &mut data) {
@@ -104,7 +114,14 @@ fn main() {
                 bad += 1;
             }
         }
+        if k >= files.len() {
+            // a --value-data file: its positions teach the value, not the moves
+            for r in &mut data[first..] {
+                r.pol = [[0; victris_engine::pvnet::CLASSES]; 2];
+            }
+        }
     }
+    let files_n = files.len() + value_files.len();
     let total = data.len();
     assert!(total > 0, "no positions to learn from");
     let mut rng = Rng::new(seed);
@@ -146,7 +163,7 @@ fn main() {
             net.w[pb + c] = (share[c] / all).ln() as f32;
         }
     }
-    println!("aztrain: {} positions ({} held out) from {} games in {} files{}, network {}x{} ({} weights), {} epochs, {} mirror images", total, held.len(), game_start.len(), files.len(), if bad > 0 { format!(" ({bad} games did not replay and were left out)") } else { String::new() }, net.h1, net.h2, len, epochs, images.len());
+    println!("aztrain: {} positions ({} held out) from {} games in {} files{}, network {}x{} ({} weights), {} epochs, {} mirror images", total, held.len(), game_start.len(), files_n, if bad > 0 { format!(" ({bad} games did not replay and were left out)") } else { String::new() }, net.h1, net.h2, len, epochs, images.len());
     let (data_ref, e_ref) = (&data, &e);
     let rec = move |i: u32| &data_ref[i as usize];
     let check = |net: &PvNet, ids: &[u32]| -> Sum {

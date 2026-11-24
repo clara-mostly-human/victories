@@ -16,6 +16,8 @@ pub const MAX_PADS: usize = 8;
 /// which covers the sight radius and every blast. Farther pairs are traced each time.
 pub const LOS_RADIUS: i32 = 8;
 const LOS_SPAN: usize = (2 * LOS_RADIUS + 1) as usize;
+/// How far out `MapData::walls_near` looks: a 7 x 7 block is 49 tiles, one bit each.
+pub const NEAR: i32 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PadKind {
@@ -52,6 +54,8 @@ pub struct MapData {
     /// 2 clear. Filled on first use, like the official engine's cache; atomics keep the
     /// map shareable between search threads (a race only repeats a trace).
     los: Vec<AtomicU8>,
+    /// per tile, the walls among the 7 x 7 tiles around it (`walls_near`)
+    near: Vec<u64>,
     pub center: P,
 }
 
@@ -116,6 +120,7 @@ impl MapData {
             pads,
             blocked: Vec::new(),
             los: Vec::new(),
+            near: Vec::new(),
             center: [(w - 1) >> 1, (h - 1) >> 1],
         };
         for s in &m.spawns {
@@ -159,6 +164,32 @@ impl MapData {
         self.blocked = blocked;
 
         self.los = (0..n * LOS_SPAN * LOS_SPAN).map(|_| AtomicU8::new(0)).collect();
+
+        self.near = (0..n as i32).map(|i| self.walls_near_slow([i % self.w, i / self.w])).collect();
+    }
+
+    fn walls_near_slow(&self, p: P) -> u64 {
+        let mut bits = 0u64;
+        for dy in -NEAR..=NEAR {
+            for dx in -NEAR..=NEAR {
+                if self.is_wall([p[0] + dx, p[1] + dy]) {
+                    bits |= 1 << ((dy + NEAR) * (2 * NEAR + 1) + dx + NEAR);
+                }
+            }
+        }
+        bits
+    }
+
+    /// The walls among the 7 x 7 tiles around `p`, one bit a tile, row by row from the top
+    /// left: bit `(dy + 3) * 7 + dx + 3` is set when the tile `[dx, dy]` from `p` is a wall or
+    /// off the board. Worked out once a tile when the map is read.
+    #[inline]
+    pub fn walls_near(&self, p: P) -> u64 {
+        if self.in_bounds(p) {
+            self.near[(p[1] * self.w + p[0]) as usize]
+        } else {
+            self.walls_near_slow(p)
+        }
     }
 
     #[inline]
@@ -252,6 +283,7 @@ impl Clone for MapData {
             pads: self.pads.clone(),
             blocked: self.blocked.clone(),
             los: self.los.iter().map(|x| AtomicU8::new(x.load(Ordering::Relaxed))).collect(),
+            near: self.near.clone(),
             center: self.center,
         }
     }

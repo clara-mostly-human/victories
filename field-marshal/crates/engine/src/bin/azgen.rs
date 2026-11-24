@@ -9,6 +9,7 @@
 //!         [--map columns-21] [--wander 0.25] [--open 12] [--wide 0.25] [--earned 0] [--mix 0]
 //!         [--lead 0] [--from GAMES.az] [--from-share 0.5] [--from-tick 0]
 //!         [--from-level 1000] [--read 0] [--read-lines N] [--read-teach 0] [--teach-answer 0]
+//!         [--deep N] [--deep-share 0.125] [--nodes 400000]
 //!
 //! With --from a share of the games (--from-share) do not start at tick 0 but from a position
 //! out of a saved game (ladder games as `azreal` saves them): a game drawn from the file is
@@ -59,6 +60,17 @@
 //! With --lead N (the network-led search only) the search may lead its shots, and expects the
 //! other fighter to, from N lines through the root on (`Search::lead`).
 //!
+//! With --deep N (the network-led search only) a share of the ticks, --deep-share (one in
+//! eight unless given), drawn at random, is searched N lines where the others get --iters, and
+//! only those ticks teach the moves: the others are saved with the game's result and the
+//! search's value but no shares. A live bot searches a hundred times the lines self-play
+//! does, so a network taught by 800-line searches knows only what such a search concludes
+//! and the live search has to find the rest for itself every tick. Searching every tick of
+//! every game that deep costs 75 times as much; the games' results need many games, the
+//! moves need deep searches, and this buys both. The tree is kept from tick to tick as
+//! ever, so the ticks after a deep one are played from what it found. --nodes is the most
+//! positions a game's tree holds (a live bot's `tree_pv_nodes`).
+//!
 //! With --net the search is `pvsearch` led by that network. Without it the search is the
 //! flagship's (`mcts`, the live playbook's settings): the first generation learns from the
 //! search we already have, the following ones from their own play.
@@ -100,6 +112,9 @@ fn main() {
     let read_lines: u32 = arg(&args, "--read-lines", iters / 2);
     let read_teach: u32 = arg(&args, "--read-teach", 0);
     let teach_answer: f64 = arg(&args, "--teach-answer", 0.0);
+    let deep: u32 = arg(&args, "--deep", 0);
+    let deep_share: f64 = arg(&args, "--deep-share", 0.125);
+    let nodes: usize = arg(&args, "--nodes", PvConfig::default().max_nodes);
     let chase: f64 = arg(&args, "--chase", 0.0);
     let chase_early: i32 = arg(&args, "--chase-early", 0);
     // --hunt P: each time a fighter comes to hold the power-up alone, with chance P it is sent
@@ -167,7 +182,7 @@ fn main() {
                         let mut was_alone = [false; 2];
                         let mut hunt_first = [0u8; 2];
                         let mut hunt_lead = [0i32; 2];
-                        let mut pv = net.as_ref().map(|n| pvsearch::Search::new(&e, n, PvConfig { even_root: wide, lead_at: lead, ..Default::default() }));
+                        let mut pv = net.as_ref().map(|n| pvsearch::Search::new(&e, n, PvConfig { even_root: wide, lead_at: lead, max_nodes: nodes, ..Default::default() }));
                         while s.result.is_none() {
                             let free = |x: usize| s.fighters[x].alive && s.fighters[x].state == FState::Idle;
                             if !free(0) && !free(1) {
@@ -181,9 +196,12 @@ fn main() {
                             let mut pol: Option<[[u8; CLASSES]; 2]> = None;
                             // with --mix: what each turn earned, to draw the turns played from
                             let mut drawn: Option<[Vec<(RawTurn, u32)>; 2]> = None;
+                            // --deep: is this one of the ticks searched deep, the only ones that teach the moves
+                            let deep_tick = deep > 0 && pv.is_some() && rng.unit() < deep_share;
+                            let lines = if deep_tick { deep } else { iters };
                             let (visits, q): ([Vec<(RawTurn, u32)>; 2], Option<f32>) = match pv.as_mut() {
                                 Some(p) => {
-                                    p.iterate(&s, iters);
+                                    p.iterate(&s, lines);
                                     let r = p.root();
                                     if earned > 0 || mix > 0 {
                                         let k = p.root_earned();
@@ -205,7 +223,8 @@ fn main() {
                                     ([r.acts[0].iter().map(|a| (a.0, a.1)).collect(), r.acts[1].iter().map(|a| (a.0, a.1)).collect()], None)
                                 }
                             };
-                            st[5] += iters as u64;
+                            st[5] += lines as u64;
+                            st[20] += deep_tick as u64;
                             searched += 1;
                             let w = if s.tick < open { 1.0 } else { wander };
                             let mut pair = match &drawn {
@@ -330,6 +349,10 @@ fn main() {
                                     }
                                 }
                             }
+                            if deep > 0 && pv.is_some() && !deep_tick {
+                                // not searched deep: the result and the value are its lesson, not the moves
+                                pol = Some([[0; CLASSES]; 2]);
+                            }
                             log.ticks.push(TickLog { turns: pair, q, pol: Some(pol.unwrap_or_else(|| [shares(&visits[0]), shares(&visits[1])])) });
                             let had = [s.fighters[0].power_until >= s.tick, s.fighters[1].power_until >= s.tick];
                             e.step(&mut s, &pair);
@@ -405,6 +428,9 @@ fn main() {
         st[0] as f64 / secs * 60.0,
         st[5] as f64 / secs / threads as f64
     );
+    if deep > 0 {
+        println!("deep {}: {} of the {} positions searched {} lines and teaching the moves, the rest {} lines", deep_share, st[20], st[1], deep, iters);
+    }
     if chase > 0.0 {
         let pc = |a: u64, b: u64| if b > 0 { 100.0 * a as f64 / b as f64 } else { 0.0 };
         for (k, label) in ["with the other unpowered", "with the other powered"].iter().enumerate() {
