@@ -7,10 +7,14 @@
 //!           [--epochs 8] [--lr 0.002] [--batch 512] [--lambda 0.5] [--pw 1.0] [--threads 4]
 //!           [--holdout 0.05] [--seed 1] [--map columns-21] [--mirror 1] [--widen]
 //!           [--value-data FILE ...] [--moves-only] [--turned]
+//!           [--deep-data FILE ...] [--deep-pw 8]
 //!
 //! The files after --value-data teach the value only: their turn shares are left out. That
 //! is for games searched too lightly to teach the moves (`azgen --deep` saves its own lightly
-//! searched ticks that way already), whose results are still worth having. With --moves-only
+//! searched ticks that way already), whose results are still worth having. The files after
+//! --deep-data are used in full and their turn shares count --deep-pw times as much: an
+//! `azgen --deep` file carries far fewer move lessons than a file where every tick teaches,
+//! and taught from those alone the move head forgets what it knew. With --moves-only
 //! only the positions that carry turn shares are used, for teaching and for the check alike:
 //! of an `azgen --deep` file those are the deeply searched ticks, so with --lambda 1 the check
 //! says how well the network's value agrees with a deep search's. --turned prints, for the
@@ -183,11 +187,18 @@ fn main() {
         Some(i) => args[i + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect(),
         None => Vec::new(),
     };
+    let deep_files: Vec<String> = match args.iter().position(|a| a == "--deep-data") {
+        Some(i) => args[i + 1..].iter().take_while(|a| !a.starts_with("--")).cloned().collect(),
+        None => Vec::new(),
+    };
+    let deep_pw: f32 = arg(&args, "--deep-pw", 8.0);
     // replay every saved game to get its positions back
     let mut data: Vec<Sample> = Vec::new();
     let mut game_start: Vec<usize> = Vec::new();
     let mut bad = 0;
-    for (k, f) in files.iter().chain(value_files.iter()).enumerate() {
+    // how many times --pw each position's turn shares count: --deep-pw for a --deep-data file
+    let mut weigh: Vec<f32> = Vec::new();
+    for (k, f) in files.iter().chain(value_files.iter()).chain(deep_files.iter()).enumerate() {
         let b = std::fs::read(f).unwrap_or_else(|_| panic!("cannot read {f}"));
         let first = data.len();
         for g in GameLog::read_all(&b) {
@@ -198,14 +209,15 @@ fn main() {
                 bad += 1;
             }
         }
-        if k >= files.len() {
+        if k >= files.len() && k < files.len() + value_files.len() {
             // a --value-data file: its positions teach the value, not the moves
             for r in &mut data[first..] {
                 r.pol = [[0; victris_engine::pvnet::CLASSES]; 2];
             }
         }
+        weigh.resize(data.len(), if k >= files.len() + value_files.len() { deep_pw } else { 1.0 });
     }
-    let files_n = files.len() + value_files.len();
+    let files_n = files.len() + value_files.len() + deep_files.len();
     let total = data.len();
     assert!(total > 0, "no positions to learn from");
     let mut rng = Rng::new(seed);
@@ -248,7 +260,7 @@ fn main() {
         }
     }
     println!("aztrain: {} positions ({} held out) from {} games in {} files{}, network {}x{} ({} weights), {} epochs, {} mirror images", total, held.len(), game_start.len(), files_n, if bad > 0 { format!(" ({bad} games did not replay and were left out)") } else { String::new() }, net.h1, net.h2, len, epochs, images.len());
-    let (data_ref, e_ref) = (&data, &e);
+    let (data_ref, e_ref, weigh_ref) = (&data, &e, &weigh);
     let rec = move |i: u32| &data_ref[i as usize];
     let check = |net: &PvNet, ids: &[u32]| -> Sum {
         let chunk = ids.len().div_ceil(threads.max(1)).max(1);
@@ -296,6 +308,7 @@ fn main() {
                     let (mut sum, mut scr) = (Sum::default(), Scratch::default());
                     for &i in part {
                         let k = images_ref[((draw ^ (i as u64).wrapping_mul(0x9E3779B97F4A7C15)) >> 33) as usize % images_ref.len()];
+                        let pw = pw * weigh_ref[i as usize];
                         let l = if k == 0 { loss_grad(net_ref, e_ref, rec(i), lambda, pw, &mut scr, Some(&mut grad)) } else { loss_grad(net_ref, e_ref, &sym_ref.image(k, rec(i)), lambda, pw, &mut scr, Some(&mut grad)) };
                         sum.add(&l);
                     }
