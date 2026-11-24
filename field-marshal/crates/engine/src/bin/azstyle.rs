@@ -120,6 +120,123 @@ const IN_SIGHT: [&str; 4] = ["  in sight at 1-2 tiles", "  in sight at 3-4 tiles
 const SHOT_AT: [&str; 4] = ["  shots fired from 1-2 tiles", "  shots fired from 3-4 tiles", "  shots fired from 5-6 tiles", "  shots fired from 7+ tiles or out of sight"];
 const HIT_AT: [&str; 4] = ["  shots landed from 1-2 tiles", "  shots landed from 3-4 tiles", "  shots landed from 5-6 tiles", "  shots landed from 7+ tiles or out of sight"];
 
+/// What the target can do about a shot fighter `x` sends with the turn `fire` in position `s` (its shot counted
+/// as ready): 0 no one step or dash avoids it, sent on the firing tick or on any tick before it lands; 1 only a
+/// step or dash sent on the firing tick itself, before the shot can be seen; 2 a step or dash sent once it is in
+/// flight; 3 it does not hit a target that stands still. Hits after a bounce off a wall are left out.
+fn dodge_class(e: &Engine, s: &victris_engine::state::State, x: usize, fire: RawTurn, shot: usize) -> u8 {
+    let lands = |at: Option<(i32, RawTurn)>| -> Option<i32> {
+        let mut st = *s;
+        st.fighters[x].cd_attack[shot] = 0;
+        let mut ev: Vec<Event> = Vec::new();
+        let mut id = None;
+        for j in 0..12 {
+            if st.result.is_some() {
+                break;
+            }
+            let mut turns = [RawTurn::IDLE; 2];
+            if j == 0 {
+                turns[x] = fire;
+            }
+            if let Some((when, t)) = at {
+                if when == j {
+                    turns[1 - x] = t;
+                }
+            }
+            e.step_events(&mut st, &turns, &mut ev);
+            for n in &ev {
+                match n {
+                    Event::ProjectileSpawn { projectile, owner, .. } if j == 0 && *owner as usize - 1 == x && id.is_none() => id = Some(*projectile),
+                    Event::ProjectileBounce { projectile, .. } if Some(*projectile) == id => return None,
+                    Event::ProjectileEnd { projectile, reason, .. } if Some(*projectile) == id => {
+                        let hit = *reason == "hit" && ev.iter().any(|h| matches!(h, Event::Hit { attacker, target, .. } if *attacker as usize - 1 == x && *target as usize - 1 == 1 - x));
+                        return if hit { Some(j) } else { None };
+                    }
+                    _ => {}
+                }
+            }
+            id?;
+        }
+        None
+    };
+    let Some(at) = lands(None) else { return 3 };
+    let (mut blind, mut seen) = (false, false);
+    for j in 0..=at {
+        for dir in 0..8u8 {
+            if lands(Some((j, RawTurn::step(dir)))).is_none() || lands(Some((j, RawTurn::dash(dir)))).is_none() {
+                if j == 0 {
+                    blind = true;
+                } else {
+                    seen = true;
+                }
+            }
+        }
+    }
+    if seen {
+        2
+    } else if blind {
+        1
+    } else {
+        0
+    }
+}
+
+/// A spell of ticks on which a shot at the other's tile could not be avoided has ended.
+fn close_spell(g: &mut Tally, ready: bool, sent: bool, last: u8) {
+    g.add(0, "spells a shot at the other's tile could not be avoided", 1.0);
+    if sent {
+        g.add(0, "  spells: shot sent", 1.0);
+    } else if ready {
+        g.add(0, "  spells: shot ready and not sent", 1.0);
+    } else {
+        g.add(0, "  spells: shot not ready throughout", 1.0);
+        if last >= 2 {
+            g.add(0, "    of those, the shot before was one a step or dash avoids in flight, or a miss on a standing target", 1.0);
+        }
+    }
+}
+
+/// --after N: what a fighter's hp lead does over the N ticks after one of its acts, by kind of act.
+const AFTER_N: [&str; 11] = [
+    "swing: times after a dash with a push the same tick",
+    "swing: times after a dash that closes in, no push",
+    "swing: times after a dash out of the other's frost, no push",
+    "swing: times after another dash",
+    "swing: times after a push without a dash",
+    "swing: times after a frost cast",
+    "swing: times after a shot no step or dash avoids",
+    "swing: times after a shot only a step or dash sent blind avoids",
+    "swing: times after a shot a step or dash avoids in flight",
+    "swing: times after a shot that misses a standing target",
+    "swing: times after any tick in sight",
+];
+const AFTER_SUM: [&str; 11] = [
+    "swing: sum after a dash with a push the same tick",
+    "swing: sum after a dash that closes in, no push",
+    "swing: sum after a dash out of the other's frost, no push",
+    "swing: sum after another dash",
+    "swing: sum after a push without a dash",
+    "swing: sum after a frost cast",
+    "swing: sum after a shot no step or dash avoids",
+    "swing: sum after a shot only a step or dash sent blind avoids",
+    "swing: sum after a shot a step or dash avoids in flight",
+    "swing: sum after a shot that misses a standing target",
+    "swing: sum after any tick in sight",
+];
+
+const FIRED_SURE: [&str; 4] = [
+    "  shots fired that no step or dash avoids",
+    "  shots fired that only a step or dash sent blind avoids",
+    "  shots fired that a step or dash avoids once in flight",
+    "  shots fired that miss a target standing still",
+];
+const LANDED_SURE: [&str; 4] = [
+    "  shots landed that no step or dash avoids",
+    "  shots landed that only a step or dash sent blind avoids",
+    "  shots landed that a step or dash avoids once in flight",
+    "  shots landed that miss a target standing still",
+];
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let who = arg(&args, "--who");
@@ -131,6 +248,11 @@ fn main() {
     // --trace N: the opening of X's first N games in which it took none of the first two power pads, tick by tick
     let trace: usize = arg(&args, "--trace").and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut traced = 0usize;
+    // --sure: for every shot and every tick in sight within 6 tiles, whether one step or dash by the target could
+    // avoid a shot (played out on the engine)
+    let sure_on = args.iter().any(|a| a == "--sure");
+    // --after N: the hp lead N ticks after each dash, push, frost cast and shot (shots by kind with --sure)
+    let after: i32 = arg(&args, "--after").and_then(|v| v.parse().ok()).unwrap_or(0);
     let mut t = Tally::default();
     // every label once, so the print order does not depend on what happened first
     for k in [
@@ -178,6 +300,14 @@ fn main() {
         let mut g: [Tally; 2] = [Tally::default(), Tally::default()];
         // a shot in flight: its id -> (who fired it, distance band, the target could not step, the target stood slowed, led)
         let mut flying: HashMap<u32, (usize, usize, bool, bool, bool, bool)> = HashMap::new();
+        // --sure: the kind of the shot each fighter sends this tick, of its shots in flight and of its last shot;
+        // an open spell of ticks on which its shot could not be avoided: (shot ready at some tick, shot sent)
+        let mut fired_class: [Option<u8>; 2] = [None; 2];
+        let mut flying_class: HashMap<u32, u8> = HashMap::new();
+        let mut last_class = [0u8; 2];
+        let mut spell: [Option<(bool, bool)>; 2] = [None; 2];
+        // --after: (tick to read at, fighter, kind of act, its hp lead before the act)
+        let mut acts: Vec<(i32, usize, usize, i32)> = Vec::new();
         let mut first_power: Option<usize> = None;
         let mut marks = [[None::<i32>; 2]; 5];
         // the opening: power pads taken before tick 60 (the first pair appears together), and where each
@@ -201,6 +331,20 @@ fn main() {
             let before = s;
             let see = can_see(&e.rules, &e.map, before.fighters[0].pos, before.fighters[1].pos);
             let d = chebyshev(before.fighters[0].pos, before.fighters[1].pos);
+            let lead = |x: usize| before.fighters[x].hp.max(0) - before.fighters[1 - x].hp.max(0);
+            acts.retain(|(at, x, kind, then)| {
+                if before.tick < *at {
+                    return true;
+                }
+                g[*x].add(0, AFTER_N[*kind], 1.0);
+                g[*x].add(0, AFTER_SUM[*kind], (lead(*x) - then) as f64);
+                false
+            });
+            if after > 0 && see && before.fighters[0].alive && before.fighters[1].alive {
+                for x in 0..2 {
+                    acts.push((before.tick + after, x, 10, lead(x)));
+                }
+            }
             // read the meetings of 15 ticks ago: what each fighter gained on the other since
             meets.retain(|(at, kind, hp)| {
                 if before.tick < *at {
@@ -282,6 +426,71 @@ fn main() {
                 }
                 if me.state == FState::Idle && tk.turns[x].attack == AttackIn::None && tk.turns[x].mv == DirIn::None && tk.turns[x].dash == DirIn::None {
                     g[x].add(0, "ticks free and sent nothing", 1.0);
+                }
+            }
+            if let (true, Some(sh)) = (sure_on, shot) {
+                // which fighters' shots the engine takes this tick
+                let mut trial = before;
+                let mut taken: Vec<Event> = Vec::new();
+                e.step_events(&mut trial, &tk.turns, &mut taken);
+                for x in 0..2 {
+                    let (me, op) = (&before.fighters[x], &before.fighters[1 - x]);
+                    let sends = taken.iter().any(|n| matches!(n, Event::Attack { fighter, attack, .. } if *fighter as usize - 1 == x && *attack as usize == sh));
+                    fired_class[x] = if sends && me.alive && op.alive { Some(dodge_class(e, &before, x, tk.turns[x], sh)) } else { None };
+                    let open = me.alive && op.alive && see && d <= 6 && me.state == FState::Idle;
+                    let class = if open { dodge_class(e, &before, x, RawTurn::IDLE.with_attack(sh as u8, op.pos), sh) } else { 3 };
+                    if open {
+                        g[x].add(0, "ticks in sight within 6 tiles, free to act", 1.0);
+                        if op.cd_dash > 0 {
+                            g[x].add(0, "  of those, the other's dash spent", 1.0);
+                            if class == 0 {
+                                g[x].add(0, "    and no step or dash avoids a shot at its tile", 1.0);
+                            }
+                        }
+                        if class <= 1 {
+                            g[x].add(0, if class == 0 { "  ticks a shot at the other's tile: no step or dash avoids it" } else { "  ticks a shot at the other's tile: only a step or dash sent blind avoids it" }, 1.0);
+                            if me.cd_attack[sh] <= 0 {
+                                g[x].add(0, if class == 0 { "    of those, own shot ready (no step or dash avoids)" } else { "    of those, own shot ready (only a blind one avoids)" }, 1.0);
+                                if sends {
+                                    g[x].add(0, if class == 0 { "    of those, shot sent (no step or dash avoids)" } else { "    of those, shot sent (only a blind one avoids)" }, 1.0);
+                                }
+                            }
+                        }
+                    }
+                    if class == 0 {
+                        if spell[x].is_none() {
+                            // how the spell arose: what the target could not do when it began
+                            let why = if op.state != FState::Idle {
+                                "    spell began: target stunned or mid-dash"
+                            } else if slowed(1 - x) {
+                                "    spell began: target slowed in the frost"
+                            } else if op.cd_move > 0 && op.cd_dash > 0 {
+                                "    spell began: target had just stepped, its dash spent"
+                            } else if op.cd_move > 0 {
+                                "    spell began: target had just stepped, its dash ready"
+                            } else if op.cd_dash > 0 {
+                                "    spell began: target free to step, its dash spent"
+                            } else {
+                                "    spell began: target free to step, its dash ready"
+                            };
+                            g[x].add(0, why, 1.0);
+                            g[x].add(0, ["    spell began at 1-2 tiles", "    spell began at 3-4 tiles", "    spell began at 5-6 tiles", "    spell began at 5-6 tiles"][band(d)], 1.0);
+                            if op.cd_dash > 0 {
+                                g[x].add(0, "    spell began with the target's dash spent", 1.0);
+                            }
+                            if me.power_until >= before.tick {
+                                g[x].add(0, "    spell began with the shooter powered", 1.0);
+                            }
+                        }
+                        let w = spell[x].get_or_insert((false, false));
+                        w.0 |= me.cd_attack[sh] <= 0;
+                        w.1 |= sends;
+                    } else if let Some((ready, sent)) = spell[x].take() {
+                        close_spell(&mut g[x], ready, sent, last_class[x]);
+                    }
+                    if let Some(c) = fired_class[x] {
+                        last_class[x] = c;
+                    }
                 }
             }
             e.step_events(&mut s, &tk.turns, &mut events);
@@ -422,8 +631,17 @@ fn main() {
                             if !see {
                                 g[x].add(0, "  shots fired with the other out of sight", 1.0);
                             }
+                            if let Some(c) = fired_class[x] {
+                                g[x].add(0, FIRED_SURE[c as usize], 1.0);
+                                if after > 0 {
+                                    acts.push((before.tick + after, x, 6 + c as usize, lead(x)));
+                                }
+                            }
                         } else if Some(*attack as usize) == frost {
                             g[x].add(0, "frost cast", 1.0);
+                            if after > 0 {
+                                acts.push((before.tick + after, x, 5, lead(x)));
+                            }
                             let rad = match e.rules.attacks[*attack as usize].kind {
                                 AttackKind::Area { radius, .. } => radius,
                                 _ => 1,
@@ -437,6 +655,9 @@ fn main() {
                             }
                         } else if Some(*attack as usize) == burst {
                             g[x].add(0, "pushes used", 1.0);
+                            if after > 0 && tk.turns[x].dash == DirIn::None {
+                                acts.push((before.tick + after, x, 4, lead(x)));
+                            }
                             if tk.turns[x].dash != DirIn::None {
                                 g[x].add(0, "  pushes with a dash the same tick", 1.0);
                             }
@@ -450,11 +671,18 @@ fn main() {
                         let b = if see { band(d) } else { 3 };
                         let alone = before.fighters[x].power_until >= before.tick && before.fighters[1 - x].power_until < before.tick;
                         flying.insert(*projectile, (x, b, stuck(1 - x), slowed(1 - x), *target != before.fighters[1 - x].pos, alone));
+                        if let Some(c) = fired_class[x] {
+                            flying_class.insert(*projectile, c);
+                        }
                     }
                     Event::ProjectileEnd { projectile, reason, .. } => {
+                        let class = flying_class.remove(projectile);
                         if let Some((x, b, st, sl, led, alone)) = flying.remove(projectile) {
                             if *reason == "hit" {
                                 g[x].add(0, "shots landed", 1.0);
+                                if let Some(c) = class {
+                                    g[x].add(0, LANDED_SURE[c as usize], 1.0);
+                                }
                                 if alone {
                                     g[x].add(0, "  powered alone: shots landed", 1.0);
                                 }
@@ -518,6 +746,11 @@ fn main() {
                         if slowed(x) {
                             g[x].add(0, "  dashes out of the other's frost", 1.0);
                         }
+                        if after > 0 {
+                            let pushed = matches!(tk.turns[x].attack, AttackIn::Named { attack, .. } if Some(attack as usize) == burst);
+                            let kind = if pushed { 0 } else if slowed(x) { 2 } else if now < was { 1 } else { 3 };
+                            acts.push((before.tick + after, x, kind, lead(x)));
+                        }
                     }
                     Event::Pickup { fighter, kind, pad, .. } => {
                         let x = *fighter as usize - 1;
@@ -570,6 +803,15 @@ fn main() {
                     }
                 }
             }
+        }
+        for x in 0..2 {
+            if let Some((ready, sent)) = spell[x].take() {
+                close_spell(&mut g[x], ready, sent, last_class[x]);
+            }
+        }
+        for (_, x, kind, then) in acts.drain(..) {
+            g[x].add(0, AFTER_N[kind], 1.0);
+            g[x].add(0, AFTER_SUM[kind], ((s.fighters[x].hp.max(0) - s.fighters[1 - x].hp.max(0)) - then) as f64);
         }
         // meetings the game ended on: read at its last position
         for (_, kind, hp) in meets.drain(..) {
@@ -705,6 +947,22 @@ fn main() {
     rate("landed of fired at a target that could not step", "  shots landed on a target that could not step when fired", "  shots fired at a target that could not step");
     rate("landed of fired at a target slowed in own frost", "  shots landed on a target slowed in own frost when fired", "  shots fired at a target slowed in own frost");
     rate("landed of those aimed off the target's tile", "  shots landed that were aimed off the target's tile", "  shots aimed off the target's tile");
+    if after > 0 {
+        println!("own hp lead gained over the {} ticks after an act (times a game and gain a time; X, then the other fighter):", after);
+        let games = t.get("games")[0].max(1.0);
+        for k in 0..AFTER_N.len() {
+            let (n, v) = (t.get(AFTER_N[k]), t.get(AFTER_SUM[k]));
+            let m = |i: usize| if n[i] > 0.0 { v[i] / n[i] } else { 0.0 };
+            println!("  {:<52} {:>7.2} {:>+7.2}   {:>7.2} {:>+7.2}", AFTER_N[k].replace("swing: times after ", ""), n[0] / games, m(0), n[1] / games, m(1));
+        }
+    }
+    if sure_on {
+        for c in 0..4 {
+            rate(&LANDED_SURE[c].replace("  shots landed", "landed of fired:"), LANDED_SURE[c], FIRED_SURE[c]);
+        }
+        rate("spells a shot could not be avoided: shot sent", "  spells: shot sent", "spells a shot at the other's tile could not be avoided");
+        rate("spells a shot could not be avoided: shot not ready", "  spells: shot not ready throughout", "spells a shot at the other's tile could not be avoided");
+    }
     rate("frost blasts that hit, of frost cast", "frost blasts that hit", "frost cast");
     rate("wall slams of pushes used", "wall slams", "pushes used");
     rate("pushes that hit, of pushes used", "  pushes that hit", "pushes used");
