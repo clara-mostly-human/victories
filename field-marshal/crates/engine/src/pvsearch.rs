@@ -72,13 +72,32 @@ impl Hasher for KeyHasher {
 
 type Index = HashMap<u64, u32, BuildHasherDefault<KeyHasher>>;
 
+/// One turn a fighter may take at a position, with the search's counts for it. Sixteen bytes:
+/// a tree of 150,000 positions holds some three million of these and they are most of what
+/// it weighs. The turn itself is kept packed (`RawTurn::pack`); spelled out it took 28 of an
+/// `Act`'s 40 bytes and is only read for the one turn a line plays. (Measured 2026-11-24 with
+/// `pvbench`: the smaller lists make the search no faster, a line waits once for a list to
+/// arrive from memory however long it is, but the tree takes far less room.)
 #[derive(Clone, Copy, Debug)]
 pub struct Act {
-    pub turn: RawTurn,
+    code: u32,
     pub prior: f32,
     pub n: u32,
     /// summed results, from this fighter's side (-1 lost to 1 won)
     pub w: f32,
+}
+
+impl Act {
+    /// None for a turn that does not pack (`RawTurn::pack`); no turn the search makes is one.
+    fn new(turn: &RawTurn, prior: f32) -> Option<Act> {
+        debug_assert!(turn.pack().is_some(), "a turn that does not pack: {turn:?}");
+        turn.pack().map(|code| Act { code, prior, n: 0, w: 0.0 })
+    }
+
+    #[inline]
+    pub fn turn(&self) -> RawTurn {
+        RawTurn::unpack(self.code)
+    }
 }
 
 struct Node {
@@ -205,8 +224,9 @@ fn lists_at(e: &Engine, net: &PvNet, s: &State, even: f32, rest: &[f32], pass: &
         let mut list: Vec<Act> = Vec::with_capacity(buf.len());
         for t in buf.iter() {
             let number = logits[class_of(t)];
+            let Some(act) = Act::new(t, number) else { continue };
             top = top.max(number);
-            list.push(Act { turn: *t, prior: number, n: 0, w: 0.0 });
+            list.push(act);
         }
         let mut total = 0.0f32;
         for a in list.iter_mut() {
@@ -479,7 +499,7 @@ impl<'a> Search<'a> {
             let mut shots: Vec<usize> = (0..self.nodes[0].acts[x].len())
                 .filter(|&i| {
                     let a = &self.nodes[0].acts[x][i];
-                    a.n > 0 && matches!(a.turn.attack, AttackIn::Named { attack, target: TargetIn::Tile(t) } if attack as usize == shot && t == at)
+                    a.n > 0 && matches!(a.turn().attack, AttackIn::Named { attack, target: TargetIn::Tile(t) } if attack as usize == shot && t == at)
                 })
                 .collect();
             if shots.is_empty() {
@@ -493,8 +513,8 @@ impl<'a> Search<'a> {
             let lines: u32 = theirs.iter().map(|a| a.n).sum();
             let mut done: Vec<(RawTurn, [i32; 2])> = Vec::new();
             for a in theirs.iter() {
-                let to = if moves(&a.turn) {
-                    let mv = RawTurn { attack: AttackIn::None, ..a.turn };
+                let to = if moves(&a.turn()) {
+                    let mv = RawTurn { attack: AttackIn::None, ..a.turn() };
                     match done.iter().find(|d| d.0 == mv) {
                         Some(d) => d.1,
                         None => {
@@ -537,16 +557,17 @@ impl<'a> Search<'a> {
             let mut added = false;
             for i in shots {
                 let a = self.nodes[0].acts[x][i];
-                let from = if moves(&a.turn) { after(x, &a.turn) } else { root.fighters[x].pos };
+                let from = if moves(&a.turn()) { after(x, &a.turn()) } else { root.fighters[x].pos };
                 for &(to, share) in &aims[1..] {
                     if to == from {
                         continue;
                     }
-                    let turn = RawTurn { attack: AttackIn::Named { attack: shot as u8, target: TargetIn::Tile(to) }, ..a.turn };
-                    if self.nodes[0].acts[x].iter().any(|b| b.turn == turn) {
+                    let turn = RawTurn { attack: AttackIn::Named { attack: shot as u8, target: TargetIn::Tile(to) }, ..a.turn() };
+                    if self.nodes[0].acts[x].iter().any(|b| b.turn() == turn) {
                         continue;
                     }
-                    self.nodes[0].acts[x].push(Act { turn, prior: a.prior * share, n: 0, w: 0.0 });
+                    let Some(act) = Act::new(&turn, a.prior * share) else { continue };
+                    self.nodes[0].acts[x].push(act);
                     added = true;
                 }
             }
@@ -582,7 +603,7 @@ impl<'a> Search<'a> {
         if root.result.is_some() || self.nodes.is_empty() {
             return false;
         }
-        let Some(mine) = self.nodes[0].acts[me].iter().position(|a| a.turn == *ours) else { return false };
+        let Some(mine) = self.nodes[0].acts[me].iter().position(|a| a.turn() == *ours) else { return false };
         let theirs: Vec<f64> = self.nodes[0].acts[1 - me].iter().map(|a| a.n as f64).collect();
         let total: f64 = theirs.iter().sum();
         if total <= 0.0 {
@@ -656,19 +677,19 @@ impl<'a> Search<'a> {
         if root.result.is_some() || self.nodes.is_empty() {
             return None;
         }
-        let mine = self.nodes[0].acts[me].iter().position(|a| a.turn == *ours)?;
+        let mine = self.nodes[0].acts[me].iter().position(|a| a.turn() == *ours)?;
         let other = 1 - me;
         let count = self.nodes[0].acts[other].len();
         if count == 0 {
             return None;
         }
         if count == 1 {
-            return Some(vec![(self.nodes[0].acts[other][0].turn, 0, 0.0, 0)]);
+            return Some(vec![(self.nodes[0].acts[other][0].turn(), 0, 0.0, 0)]);
         }
         let mut order: Vec<usize> = (0..count).collect();
         order.sort_by(|a, b| self.nodes[0].acts[other][*b].prior.total_cmp(&self.nodes[0].acts[other][*a].prior));
         let prior: Vec<f32> = self.nodes[0].acts[other].iter().map(|a| a.prior).collect();
-        let turns: Vec<RawTurn> = self.nodes[0].acts[other].iter().map(|a| a.turn).collect();
+        let turns: Vec<RawTurn> = self.nodes[0].acts[other].iter().map(|a| a.turn()).collect();
         let side = if other == 0 { 1.0 } else { -1.0 };
         // what each turn has brought against `ours` so far: (lines, summed results for the other fighter).
         // Kept here and not read back from the tree, where a pair that ends the game has no position.
@@ -784,7 +805,7 @@ impl<'a> Search<'a> {
                 cell.push(if g[j].1 > 0 { (g[j].1, -g[j].2 * g[j].1 as f32) } else { (0, 0.0) });
             }
         }
-        let mine: Vec<usize> = same.iter().map(|c| self.nodes[0].acts[x].iter().position(|a| a.turn == c.0).unwrap_or(0)).collect();
+        let mine: Vec<usize> = same.iter().map(|c| self.nodes[0].acts[x].iter().position(|a| a.turn() == c.0).unwrap_or(0)).collect();
         let side = if x == 0 { 1.0 } else { -1.0 };
         let more = (lines - (lines / 2).min(lines)) / (rows * n) as u32;
         for i in 0..rows {
@@ -877,7 +898,7 @@ impl<'a> Search<'a> {
         if root.result.is_some() || self.nodes.is_empty() {
             return None;
         }
-        let mine = self.nodes[0].acts[me].iter().position(|a| a.turn == *ours)?;
+        let mine = self.nodes[0].acts[me].iter().position(|a| a.turn() == *ours)?;
         let theirs: Vec<f64> = self.nodes[0].acts[1 - me].iter().map(|a| a.n as f64).collect();
         let total: f64 = theirs.iter().sum();
         if total <= 0.0 {
@@ -1022,7 +1043,7 @@ impl<'a> Search<'a> {
         }
         for &(n, i0, i1) in &path[from..] {
             let nd = &self.nodes[n as usize];
-            self.e.step(&mut s, &[nd.acts[0][i0 as usize].turn, nd.acts[1][i1 as usize].turn]);
+            self.e.step(&mut s, &[nd.acts[0][i0 as usize].turn(), nd.acts[1][i1 as usize].turn()]);
         }
         s
     }
@@ -1068,7 +1089,7 @@ impl<'a> Search<'a> {
                     } else {
                         fl.waiting.insert(key, Vec::new());
                         let nd = &self.nodes[node];
-                        let last = [nd.acts[0][i0].turn, nd.acts[1][i1].turn];
+                        let last = [nd.acts[0][i0].turn(), nd.acts[1][i1].turn()];
                         // from this position's kept state; when it has none yet, from the one
                         // above with both pairs (the state between comes back to be kept)
                         let job = if node == 0 || nd.state.is_some() {
@@ -1082,7 +1103,7 @@ impl<'a> Search<'a> {
                                 self.nodes[node].state = Some(state.clone());
                                 Job { line, key, base: Some(state), pairs: [last, last], steps: 1 }
                             } else {
-                                let before = [up.acts[0][j0 as usize].turn, up.acts[1][j1 as usize].turn];
+                                let before = [up.acts[0][j0 as usize].turn(), up.acts[1][j1 as usize].turn()];
                                 Job { line, key, base: up.state.clone().filter(|_| above > 0), pairs: [before, last], steps: 2 }
                             }
                         };
@@ -1179,7 +1200,7 @@ impl<'a> Search<'a> {
                     if k > 0 && nd.state.is_none() {
                         nd.state = Some(std::sync::Arc::new(s));
                     }
-                    let pair = [nd.acts[0][i0 as usize].turn, nd.acts[1][i1 as usize].turn];
+                    let pair = [nd.acts[0][i0 as usize].turn(), nd.acts[1][i1 as usize].turn()];
                     self.e.step(&mut s, &pair);
                 }
                 self.lists(node, &s, self.cfg.even);
@@ -1223,7 +1244,7 @@ impl<'a> Search<'a> {
                     if k > 0 && nd.state.is_none() {
                         nd.state = Some(std::sync::Arc::new(s));
                     }
-                    let pair = [nd.acts[0][i0 as usize].turn, nd.acts[1][i1 as usize].turn];
+                    let pair = [nd.acts[0][i0 as usize].turn(), nd.acts[1][i1 as usize].turn()];
                     self.e.step(&mut s, &pair);
                 }
                 match outcome(&s) {
@@ -1261,7 +1282,7 @@ impl<'a> Search<'a> {
     /// Each fighter's turns at the root with their visits and mean result (from its own side).
     pub fn root(&self) -> [Vec<(RawTurn, u32, f32)>; 2] {
         let list = |x: usize| match self.nodes.first() {
-            Some(nd) => nd.acts[x].iter().map(|a| (a.turn, a.n, if a.n > 0 { a.w / a.n as f32 } else { 0.0 })).collect(),
+            Some(nd) => nd.acts[x].iter().map(|a| (a.turn(), a.n, if a.n > 0 { a.w / a.n as f32 } else { 0.0 })).collect(),
             None => vec![(RawTurn::IDLE, 0, 0.0)],
         };
         [list(0), list(1)]
@@ -1287,18 +1308,18 @@ impl<'a> Search<'a> {
             let root_n = (nd.n.max(1) as f32).sqrt();
             let top = (0..acts.len()).max_by_key(|i| acts[*i].n).unwrap_or(0);
             if acts.is_empty() || acts[top].n == 0 {
-                return acts.iter().map(|a| (a.turn, 0.0)).collect();
+                return acts.iter().map(|a| (a.turn(), 0.0)).collect();
             }
             let bound = acts[top].w / acts[top].n as f32 + self.cfg.c * share(&acts[top]) * root_n / (1.0 + acts[top].n as f32);
             acts.iter()
                 .enumerate()
                 .map(|(i, a)| {
                     if i == top || a.n == 0 {
-                        return (a.turn, a.n as f32);
+                        return (a.turn(), a.n as f32);
                     }
                     let gap = bound - a.w / a.n as f32;
                     let earned = if gap > 1e-6 { (self.cfg.c * share(a) * root_n / gap - 1.0).clamp(0.0, a.n as f32) } else { a.n as f32 };
-                    (a.turn, earned)
+                    (a.turn(), earned)
                 })
                 .collect()
         };
@@ -1321,7 +1342,7 @@ impl<'a> Search<'a> {
 
     /// The most visited turn of fighter `x`.
     pub fn best(&self, x: usize) -> RawTurn {
-        self.nodes.first().and_then(|nd| nd.acts[x].iter().max_by_key(|a| a.n).map(|a| a.turn)).unwrap_or(RawTurn::IDLE)
+        self.nodes.first().and_then(|nd| nd.acts[x].iter().max_by_key(|a| a.n).map(|a| a.turn())).unwrap_or(RawTurn::IDLE)
     }
 
     /// Every position in the tree, for measuring: (ticks below the root, lines through it, the
@@ -1338,7 +1359,7 @@ impl<'a> Search<'a> {
             out.push((depth, nd.n, s));
             for &(pair, child) in &nd.kids {
                 let mut c = s;
-                self.e.step(&mut c, &[nd.acts[0][(pair >> 16) as usize].turn, nd.acts[1][(pair & 0xffff) as usize].turn]);
+                self.e.step(&mut c, &[nd.acts[0][(pair >> 16) as usize].turn(), nd.acts[1][(pair & 0xffff) as usize].turn()]);
                 stack.push((child as usize, depth + 1, c));
             }
         }
@@ -1458,7 +1479,7 @@ impl<'a> Search<'a> {
                 .map(|j| {
                     let (i0, i1) = pair(i, j);
                     let mut s = *root;
-                    self.e.step(&mut s, &[self.nodes[0].acts[0][i0].turn, self.nodes[0].acts[1][i1].turn]);
+                    self.e.step(&mut s, &[self.nodes[0].acts[0][i0].turn(), self.nodes[0].acts[1][i1].turn()]);
                     match outcome(&s) {
                         Some(v) => (if x == 0 { v } else { -v }, KNOWN),
                         None => self.cell(x, i, j),
@@ -1624,11 +1645,11 @@ impl<'a> Search<'a> {
             .map(|r| {
                 let mean = score(&tab, r, &expected);
                 let (worst, worst_to) = match answer {
-                    Some(j) if tab[r][j].1 > 0 => (tab[r][j].0, self.nodes[0].acts[1 - x][j].turn),
-                    Some(j) => (mean, self.nodes[0].acts[1 - x][j].turn),
+                    Some(j) if tab[r][j].1 > 0 => (tab[r][j].0, self.nodes[0].acts[1 - x][j].turn()),
+                    Some(j) => (mean, self.nodes[0].acts[1 - x][j].turn()),
                     None => (mean, RawTurn::IDLE),
                 };
-                WeighedTurn { turn: self.nodes[0].acts[x][ours[r]].turn, worth: score(&tab, r, &mix), expected: mean, worst, worst_to, lines: tab[r].iter().filter(|c| c.1 != KNOWN).map(|c| c.1).sum() }
+                WeighedTurn { turn: self.nodes[0].acts[x][ours[r]].turn(), worth: score(&tab, r, &mix), expected: mean, worst, worst_to, lines: tab[r].iter().filter(|c| c.1 != KNOWN).map(|c| c.1).sum() }
             })
             .collect()
     }
@@ -1641,7 +1662,7 @@ impl<'a> Search<'a> {
         let mut best: Option<(u32, RawTurn, RawTurn)> = None;
         if let Some(nd) = self.nodes.first() {
             for &(pair, child) in &nd.kids {
-                let (t0, t1) = (nd.acts[0][(pair >> 16) as usize].turn, nd.acts[1][(pair & 0xffff) as usize].turn);
+                let (t0, t1) = (nd.acts[0][(pair >> 16) as usize].turn(), nd.acts[1][(pair & 0xffff) as usize].turn());
                 let n = self.nodes[child as usize].n;
                 if best.map(|b| n > b.0).unwrap_or(true) {
                     let mut s = *old_root;
@@ -1665,8 +1686,8 @@ impl<'a> Search<'a> {
     /// the root. False (and an empty search) when the pair was never tried.
     pub fn advance(&mut self, t0: &RawTurn, t1: &RawTurn) -> bool {
         let found = self.nodes.first().and_then(|nd| {
-            let i0 = nd.acts[0].iter().position(|a| a.turn == *t0)?;
-            let i1 = nd.acts[1].iter().position(|a| a.turn == *t1)?;
+            let i0 = nd.acts[0].iter().position(|a| a.turn() == *t0)?;
+            let i1 = nd.acts[1].iter().position(|a| a.turn() == *t1)?;
             self.index.get(&((i0 as u64) << 16 | i1 as u64)).copied()
         });
         let Some(start) = found else {

@@ -290,6 +290,64 @@ pub fn ray_tiles<const N: usize>(r: &Ray, sa: i64, sb: i64, out: &mut RayBuf<N>)
     }
 }
 
+/// How many of a shot's one-tick sweeps a thread remembers (`shot_tiles`), and the most tiles
+/// in one that is remembered.
+const SWEEPS: usize = 4096;
+const SWEEP_TILES: usize = 7;
+
+/// One remembered sweep: the tiles as steps from the ray's origin.
+#[derive(Clone, Copy)]
+struct Sweep {
+    key: u64,
+    len: u8,
+    step: [[i8; 2]; SWEEP_TILES],
+    entry: [Q; SWEEP_TILES],
+}
+
+thread_local! {
+    static SWEPT: std::cell::RefCell<Vec<Sweep>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `ray_tiles` for one tick of a shot's flight, remembered. A search plays the same shots over
+/// and over: the tiles a ray sweeps between two distances depend only on its direction and
+/// the distances, counted from its origin, so they are worked out once (by `ray_tiles`
+/// itself) and kept on this thread with the origin taken out. What comes back is what
+/// `ray_tiles` gives, tile for tile, in the same order with the same entries.
+pub fn shot_tiles(r: &Ray, sa: i64, sb: i64, out: &mut ShotBuf) {
+    let fits = r.d[0].abs() < 2048 && r.d[1].abs() < 2048 && (0..1 << 20).contains(&sa) && (0..1 << 20).contains(&sb);
+    if !fits {
+        return ray_tiles(r, sa, sb, out);
+    }
+    // never 0: the first part is at least 1
+    let key = (r.d[0] + 2048) as u64 | ((r.d[1] + 2048) as u64) << 12 | (sa as u64) << 24 | (sb as u64) << 44;
+    let slot = (key.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52) as usize;
+    debug_assert!(slot < SWEEPS);
+    SWEPT.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        if kept.is_empty() {
+            kept.resize(SWEEPS, Sweep { key: 0, len: 0, step: [[0; 2]; SWEEP_TILES], entry: [Q { n: 0, d: 1 }; SWEEP_TILES] });
+        }
+        let k = &mut kept[slot];
+        if k.key == key {
+            out.len = k.len as usize;
+            for i in 0..out.len {
+                out.items[i] = RayTile { tile: [r.o[0] as i32 + k.step[i][0] as i32, r.o[1] as i32 + k.step[i][1] as i32], entry: k.entry[i] };
+            }
+            return;
+        }
+        ray_tiles(r, sa, sb, out);
+        let near = |t: &RayTile| (t.tile[0] as i64 - r.o[0]).abs() < 128 && (t.tile[1] as i64 - r.o[1]).abs() < 128;
+        if out.len <= SWEEP_TILES && out.as_slice().iter().all(near) {
+            k.key = key;
+            k.len = out.len as u8;
+            for (i, t) in out.as_slice().iter().enumerate() {
+                k.step[i] = [(t.tile[0] as i64 - r.o[0]) as i8, (t.tile[1] as i64 - r.o[1]) as i8];
+                k.entry[i] = t.entry;
+            }
+        }
+    })
+}
+
 #[inline]
 fn tile_before(p: &RayTile, q: &RayTile) -> bool {
     if qlt(p.entry, q.entry) {
@@ -302,4 +360,48 @@ fn tile_before(p: &RayTile, q: &RayTile) -> bool {
         return p.tile[1] < q.tile[1];
     }
     p.tile[0] < q.tile[0]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_remembered_sweep_is_the_one_worked_out() {
+        let same = |a: &ShotBuf, b: &ShotBuf| a.len == b.len && a.as_slice().iter().zip(b.as_slice()).all(|(p, q)| p.tile == q.tile && p.entry.n == q.entry.n && p.entry.d == q.entry.d);
+        let (mut fresh, mut kept) = (ShotBuf::new(), ShotBuf::new());
+        let mut sweeps = 0;
+        // twice over, so that every sweep is asked for again after it has been remembered,
+        // from origins all over a board and off it, at every speed up to 4 tiles a tick
+        for round in 0..2 {
+            for (ox, oy) in [(0, 0), (10, 10), (20, 3), (5, 17), (-2, 40), (33, -1)] {
+                for dx in -9i32..=9 {
+                    for dy in -9i32..=9 {
+                        if dx == 0 && dy == 0 {
+                            continue;
+                        }
+                        let r = Ray::new([ox, oy], [ox + dx, oy + dy]);
+                        for speed in [1i64, 2, 3, 4] {
+                            let reach = 9 * SUB + 137 * (dx + 2 * dy) as i64 % 500;
+                            let mut sa = 0;
+                            while sa < reach {
+                                let sb = (sa + speed * SUB).min(reach);
+                                ray_tiles(&r, sa, sb, &mut fresh);
+                                shot_tiles(&r, sa, sb, &mut kept);
+                                assert!(same(&fresh, &kept), "round {round} from {ox},{oy} by {dx},{dy} travel {sa} to {sb}");
+                                sweeps += 1;
+                                sa = sb;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(sweeps > 50_000);
+        // a ray too long to remember is still worked out
+        let r = Ray::new([0, 0], [3000, 1]);
+        ray_tiles(&r, 0, 2 * SUB, &mut fresh);
+        shot_tiles(&r, 0, 2 * SUB, &mut kept);
+        assert!(same(&fresh, &kept));
+    }
 }
