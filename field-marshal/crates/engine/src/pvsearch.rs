@@ -1288,6 +1288,17 @@ impl<'a> Search<'a> {
         [list(0), list(1)]
     }
 
+    /// Each fighter's turns at the root as the search holds them: the turn, the share the
+    /// network gave it before any line was searched, its visits and its mean result (from its
+    /// own side). For tools that compare the network's first choice with the search's.
+    pub fn root_acts(&self) -> [Vec<(RawTurn, f32, u32, f32)>; 2] {
+        let list = |x: usize| match self.nodes.first() {
+            Some(nd) => nd.acts[x].iter().map(|a| (a.turn(), a.prior, a.n, if a.n > 0 { a.w / a.n as f32 } else { 0.0 })).collect(),
+            None => Vec::new(),
+        };
+        [list(0), list(1)]
+    }
+
     /// Each fighter's turns at the root with the visits each one earned: its visits less the
     /// ones it only got because the root was made to look wider than the search looks
     /// anywhere else (`even_root` above `even`, as self-play asks). A turn other than the most

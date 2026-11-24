@@ -52,6 +52,8 @@ struct Sum {
     net_low: f64,
     q_gap: f64,
     q_n: f64,
+    /// positions where the network's value is off the search's by more than 0.3
+    q_far: f64,
     /// where the search turned the network's first choice down: [the network's kind][the search's kind]
     turned: [[u32; KINDS]; KINDS],
     /// each kind's share of the search's visits and of the network's turn shares, summed
@@ -69,7 +71,7 @@ fn kind_of(class: u8) -> usize {
 
 impl Default for Sum {
     fn default() -> Sum {
-        Sum { n: 0.0, value: 0.0, decided: 0.0, hit: 0.0, policy: 0.0, floor: 0.0, pn: 0.0, top: 0.0, top_share: 0.0, net_share: 0.0, other_move: 0.0, other_attack: 0.0, net_low: 0.0, q_gap: 0.0, q_n: 0.0, turned: [[0; KINDS]; KINDS], by_search: [0.0; KINDS], by_net: [0.0; KINDS] }
+        Sum { n: 0.0, value: 0.0, decided: 0.0, hit: 0.0, policy: 0.0, floor: 0.0, pn: 0.0, top: 0.0, top_share: 0.0, net_share: 0.0, other_move: 0.0, other_attack: 0.0, net_low: 0.0, q_gap: 0.0, q_n: 0.0, q_far: 0.0, turned: [[0; KINDS]; KINDS], by_search: [0.0; KINDS], by_net: [0.0; KINDS] }
     }
 }
 
@@ -115,6 +117,7 @@ impl Sum {
         self.net_low += l.net_low as f64;
         self.q_gap += l.q_gap as f64;
         self.q_n += l.q_n as f64;
+        self.q_far += (l.q_gap > 0.3) as u32 as f64;
     }
     fn merge(&mut self, o: &Sum) {
         self.n += o.n;
@@ -132,6 +135,7 @@ impl Sum {
         self.net_low += o.net_low;
         self.q_gap += o.q_gap;
         self.q_n += o.q_n;
+        self.q_far += o.q_far;
         for i in 0..KINDS {
             self.by_search[i] += o.by_search[i];
             self.by_net[i] += o.by_net[i];
@@ -142,10 +146,11 @@ impl Sum {
     }
     fn line(&self) -> String {
         format!(
-            "value loss {:.4}, picks the winner {:.1}%, off the search's value by {:.4}; moves loss {:.4} (the search's own spread {:.4}), same first choice as the search {:.1}% (the search's visits on its first choice {:.1}%, on the network's {:.1}%; another step or dash {:.1}%, another attack {:.1}%; the network's first choice under a twentieth of the visits {:.1}%)",
+            "value loss {:.4}, picks the winner {:.1}%, off the search's value by {:.4} (by over 0.3 in {:.1}%); moves loss {:.4} (the search's own spread {:.4}), same first choice as the search {:.1}% (the search's visits on its first choice {:.1}%, on the network's {:.1}%; another step or dash {:.1}%, another attack {:.1}%; the network's first choice under a twentieth of the visits {:.1}%)",
             self.value / self.n.max(1.0),
             100.0 * self.hit / self.decided.max(1.0),
             self.q_gap / self.q_n.max(1.0),
+            100.0 * self.q_far / self.q_n.max(1.0),
             self.policy / self.pn.max(1.0),
             self.floor / self.pn.max(1.0),
             100.0 * self.top / self.pn.max(1.0),
