@@ -299,7 +299,18 @@ pub fn run_match(a: &Playbook, b: &Playbook, pairs: u32, first_seed: i64, thread
 pub fn run_match_with(a: &Playbook, b: Option<&Playbook>, pairs: u32, first_seed: i64, threads: usize) -> Tally {
     // ARENA_MAPS=columns-21,pillars-21 keeps only those maps (default: all three)
     let only: Vec<String> = std::env::var("ARENA_MAPS").map(|v| v.split(',').map(str::to_string).collect()).unwrap_or_default();
-    let engines: Vec<Engine> = victris_engine::shipped::MAP_NAMES.iter().filter(|n| only.is_empty() || only.iter().any(|o| o == *n)).map(|n| Engine::shipped(n)).collect();
+    let mut engines: Vec<Engine> = victris_engine::shipped::MAP_NAMES.iter().filter(|n| only.is_empty() || only.iter().any(|o| o == *n)).map(|n| Engine::shipped(n)).collect();
+    // ARENA_CLOCK=K: the bots are told a tick limit and a match budget K times the ladder's.
+    // For a gate sized by lines (`tree_iters`) on a machine slower than the one the bots live
+    // on: the think cap follows the tick limit (`Tracker::think_cap_ms`), so a slow core would
+    // cut every search off at the clock before it reached its lines. The game is unchanged.
+    let clock: f64 = std::env::var("ARENA_CLOCK").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    if clock > 0.0 && clock != 1.0 {
+        for e in &mut engines {
+            e.rules.limits.tick_ms = (e.rules.limits.tick_ms as f64 * clock) as i32;
+            e.rules.limits.match_budget_ms = (e.rules.limits.match_budget_ms as f64 * clock) as i32;
+        }
+    }
     let jobs: Vec<(usize, i64, bool)> = (0..pairs)
         .flat_map(|k| (0..engines.len()).flat_map(move |m| [(m, first_seed + k as i64, false), (m, first_seed + k as i64, true)]))
         .collect();

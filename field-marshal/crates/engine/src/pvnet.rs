@@ -739,6 +739,23 @@ pub struct Loss {
     pub policy_floor: f32,
     pub policy_n: u32,
     pub top_hit: u32,
+    /// summed likewise: the share of the search's visits on the search's own first choice,
+    /// and on the network's. Close together, the two first choices differ only where the
+    /// search rates them much the same.
+    pub top_share: f32,
+    pub net_share: f32,
+    /// for how many the two first choices differ in the step or dash, and in the attack
+    pub other_move: u32,
+    pub other_attack: u32,
+    /// for how many the network's first choice got under a twentieth of the search's visits:
+    /// a choice the search turned down, not one it rated about the same
+    pub net_low: u32,
+    /// where the search left a value: how far the network's own value (-1 to 1) is from it
+    pub q_gap: f32,
+    pub q_n: u32,
+    /// for each fighter that had a choice: the network's first choice and the search's
+    /// (`CLASSES`), for the trainer's table of what the search plays in the network's place
+    pub firsts: [Option<(u8, u8)>; 2],
 }
 
 /// The value target for a saved position, as fighter 0's chance to win: the game's result,
@@ -762,6 +779,10 @@ pub fn loss_grad(net: &PvNet, e: &Engine, r: &Sample, lambda: f32, pw: f32, sc: 
     let t = value_target(r, lambda);
     let eps = 1e-7f32;
     let mut out = Loss { value: -(t * (p + eps).ln() + (1.0 - t) * (1.0 - p + eps).ln()), decided: r.z != 0, value_hit: (d > 0.0) == (r.z > 0), ..Default::default() };
+    if r.has_q {
+        out.q_gap = (2.0 * p - 1.0 - r.q).abs();
+        out.q_n = 1;
+    }
     let mut dl = [[0.0f32; CLASSES]; 2];
     for f in 0..2 {
         let logits = if f == 0 { &sc.pa.logits } else { &sc.pb.logits };
@@ -811,6 +832,14 @@ pub fn loss_grad(net: &PvNet, e: &Engine, r: &Sample, lambda: f32, pw: f32, sc: 
         }
         out.policy_n += 1;
         out.top_hit += (best_net.1 == best_pi.1) as u32;
+        out.top_share += best_pi.0 as f32 / total as f32;
+        out.net_share += r.pol[f][best_net.1] as f32 / total as f32;
+        out.other_move += (best_net.1 / ATTACKS != best_pi.1 / ATTACKS) as u32;
+        out.other_attack += (best_net.1 % ATTACKS != best_pi.1 % ATTACKS) as u32;
+        out.net_low += ((r.pol[f][best_net.1] as u32) * 20 < total) as u32;
+        if (r.pol[f][best_net.1] as u32) * 20 < total {
+            out.firsts[f] = Some((best_net.1 as u8, best_pi.1 as u8));
+        }
     }
     if let Some(grad) = grad {
         net.backward(&sc.xa, &sc.pa, p - t, &dl[0], grad);

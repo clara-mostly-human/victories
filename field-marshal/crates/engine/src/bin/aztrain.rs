@@ -6,11 +6,16 @@
 //!   aztrain --out NET.json --data FILE [FILE ...] [--init NET.json] [--h1 64] [--h2 32]
 //!           [--epochs 8] [--lr 0.002] [--batch 512] [--lambda 0.5] [--pw 1.0] [--threads 4]
 //!           [--holdout 0.05] [--seed 1] [--map columns-21] [--mirror 1] [--widen]
-//!           [--value-data FILE ...]
+//!           [--value-data FILE ...] [--moves-only] [--turned]
 //!
 //! The files after --value-data teach the value only: their turn shares are left out. That
 //! is for games searched too lightly to teach the moves (`azgen --deep` saves its own lightly
-//! searched ticks that way already), whose results are still worth having.
+//! searched ticks that way already), whose results are still worth having. With --moves-only
+//! only the positions that carry turn shares are used, for teaching and for the check alike:
+//! of an `azgen --deep` file those are the deeply searched ticks, so with --lambda 1 the check
+//! says how well the network's value agrees with a deep search's. --turned prints, for the
+//! games kept out, what kind of turn the search plays where it gives the network's first choice
+//! under a twentieth of its visits.
 //!
 //! With --widen an --init network made before the walls three tiles from the opponent were
 //! inputs (`pvnet::IN_OLD`) is given them (`PvNet::widened`); a new network always has them.
@@ -26,7 +31,7 @@ fn arg<T: std::str::FromStr>(args: &[String], name: &str, default: T) -> T {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).and_then(|v| v.parse().ok()).unwrap_or(default)
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct Sum {
     n: f64,
     value: f64,
@@ -36,10 +41,48 @@ struct Sum {
     floor: f64,
     pn: f64,
     top: f64,
+    top_share: f64,
+    net_share: f64,
+    other_move: f64,
+    other_attack: f64,
+    net_low: f64,
+    q_gap: f64,
+    q_n: f64,
+    /// where the search turned the network's first choice down: [the network's kind][the search's kind]
+    turned: [[u32; KINDS]; KINDS],
+}
+
+/// A turn's kind for the table of turned-down first choices: stay, step or dash, times no attack
+/// or one of the three.
+const KINDS: usize = 12;
+fn kind_of(class: u8) -> usize {
+    let (m, a) = (class as usize / victris_engine::pvnet::ATTACKS, class as usize % victris_engine::pvnet::ATTACKS);
+    (if m == 0 { 0 } else if m <= 8 { 1 } else { 2 }) * 4 + a
+}
+
+impl Default for Sum {
+    fn default() -> Sum {
+        Sum { n: 0.0, value: 0.0, decided: 0.0, hit: 0.0, policy: 0.0, floor: 0.0, pn: 0.0, top: 0.0, top_share: 0.0, net_share: 0.0, other_move: 0.0, other_attack: 0.0, net_low: 0.0, q_gap: 0.0, q_n: 0.0, turned: [[0; KINDS]; KINDS] }
+    }
 }
 
 impl Sum {
+    /// The table of turned-down first choices, most frequent first: `names` are the attacks'.
+    fn table(&self, names: &[String]) -> String {
+        let label = |k: usize| format!("{}{}", ["stay", "step", "dash"][k / 4], if k % 4 == 0 { String::new() } else { format!(" + {}", names.get(k % 4 - 1).map(String::as_str).unwrap_or("attack")) });
+        let mut rows: Vec<(u32, usize, usize)> = (0..KINDS * KINDS).map(|i| (self.turned[i / KINDS][i % KINDS], i / KINDS, i % KINDS)).filter(|r| r.0 > 0).collect();
+        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        let all: u32 = rows.iter().map(|r| r.0).sum();
+        let mut out = format!("  the network's first choice turned down by the search ({} choices): the network's kind, the search's, share\n", all);
+        for r in rows.iter().take(16) {
+            out += &format!("    {:22} {:22} {:5.1}%\n", label(r.1), label(r.2), 100.0 * r.0 as f64 / all.max(1) as f64);
+        }
+        out
+    }
     fn add(&mut self, l: &Loss) {
+        for f in l.firsts.iter().flatten() {
+            self.turned[kind_of(f.0)][kind_of(f.1)] += 1;
+        }
         self.n += 1.0;
         self.value += l.value as f64;
         self.decided += l.decided as u8 as f64;
@@ -48,6 +91,13 @@ impl Sum {
         self.floor += l.policy_floor as f64;
         self.pn += l.policy_n as f64;
         self.top += l.top_hit as f64;
+        self.top_share += l.top_share as f64;
+        self.net_share += l.net_share as f64;
+        self.other_move += l.other_move as f64;
+        self.other_attack += l.other_attack as f64;
+        self.net_low += l.net_low as f64;
+        self.q_gap += l.q_gap as f64;
+        self.q_n += l.q_n as f64;
     }
     fn merge(&mut self, o: &Sum) {
         self.n += o.n;
@@ -58,15 +108,33 @@ impl Sum {
         self.floor += o.floor;
         self.pn += o.pn;
         self.top += o.top;
+        self.top_share += o.top_share;
+        self.net_share += o.net_share;
+        self.other_move += o.other_move;
+        self.other_attack += o.other_attack;
+        self.net_low += o.net_low;
+        self.q_gap += o.q_gap;
+        self.q_n += o.q_n;
+        for i in 0..KINDS {
+            for j in 0..KINDS {
+                self.turned[i][j] += o.turned[i][j];
+            }
+        }
     }
     fn line(&self) -> String {
         format!(
-            "value loss {:.4}, picks the winner {:.1}%; moves loss {:.4} (the search's own spread {:.4}), same first choice as the search {:.1}%",
+            "value loss {:.4}, picks the winner {:.1}%, off the search's value by {:.4}; moves loss {:.4} (the search's own spread {:.4}), same first choice as the search {:.1}% (the search's visits on its first choice {:.1}%, on the network's {:.1}%; another step or dash {:.1}%, another attack {:.1}%; the network's first choice under a twentieth of the visits {:.1}%)",
             self.value / self.n.max(1.0),
             100.0 * self.hit / self.decided.max(1.0),
+            self.q_gap / self.q_n.max(1.0),
             self.policy / self.pn.max(1.0),
             self.floor / self.pn.max(1.0),
-            100.0 * self.top / self.pn.max(1.0)
+            100.0 * self.top / self.pn.max(1.0),
+            100.0 * self.top_share / self.pn.max(1.0),
+            100.0 * self.net_share / self.pn.max(1.0),
+            100.0 * self.other_move / self.pn.max(1.0),
+            100.0 * self.other_attack / self.pn.max(1.0),
+            100.0 * self.net_low / self.pn.max(1.0)
         )
     }
 }
@@ -76,6 +144,7 @@ fn main() {
     let out: String = arg(&args, "--out", String::from("net.json"));
     let init: String = arg(&args, "--init", String::new());
     let widen = args.iter().any(|a| a == "--widen");
+    let moves_only = args.iter().any(|a| a == "--moves-only");
     let (h1, h2): (usize, usize) = (arg(&args, "--h1", 64), arg(&args, "--h2", 32));
     let epochs: usize = arg(&args, "--epochs", 8);
     let lr0: f32 = arg(&args, "--lr", 0.002);
@@ -131,7 +200,7 @@ fn main() {
     for (k, &at) in game_start.iter().enumerate() {
         let end = game_start.get(k + 1).copied().unwrap_or(total);
         let to = if rng.unit() < holdout { &mut held } else { &mut train };
-        to.extend((at..end).map(|i| i as u32));
+        to.extend((at..end).filter(|i| !moves_only || data[*i].pol.iter().any(|p| p.iter().any(|v| *v > 0))).map(|i| i as u32));
     }
     let mut net = if init.is_empty() { PvNet::blank(&map, h1, h2, seed) } else { PvNet::load(std::path::Path::new(&init)).expect("cannot read --init") };
     // `--widen`: a network made before the newest inputs gets them here, with weights of zero,
@@ -184,7 +253,12 @@ fn main() {
         })
     };
     if !held.is_empty() {
-        println!("  before: held out: {}", check(&net, &held).line());
+        let before = check(&net, &held);
+        println!("  before: held out: {}", before.line());
+        if args.iter().any(|a| a == "--turned") {
+            let names: Vec<String> = e.rules.attacks.iter().map(|a| a.name.clone()).collect();
+            print!("{}", before.table(&names));
+        }
     }
     let (mut m, mut v) = (vec![0.0f32; len], vec![0.0f32; len]);
     let (b1, b2) = (0.9f32, 0.999f32);
