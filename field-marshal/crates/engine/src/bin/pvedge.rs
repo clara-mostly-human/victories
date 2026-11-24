@@ -2,7 +2,7 @@
 //! own first choice, counted in the deep search's own results.
 //!
 //!   pvedge --net NET.json --az GAMES.az [--map arena-21] [--at 800,3200,12800,60000]
-//!          [--max 400] [--seed 1] [--nodes 150000] [--lead 256] [--threads 4]
+//!          [--max 400] [--seed 1] [--nodes 150000] [--lead 256] [--threads 4] [--kinds 0.1]
 //!
 //! Replays the games of GAMES.az, draws --max of their searched positions and searches each
 //! one afresh, the way a live bot's search is set up, to the last number of lines in --at.
@@ -15,13 +15,16 @@
 //! decision. That last figure is what stopping there, or playing the network's first choice
 //! unsearched, costs a decision as the deep search counts it.
 //!
+//! --kinds X adds a table of the decisions where the network's first choice is lower by more
+//! than X: the kind of turn the network chose and the kind the finished search plays.
+//!
 //! A turn with few visits has a rough mean result, and a search gives few visits to a turn
 //! that started badly, so the cost of a turn the search dropped early is overstated a little.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use victris_engine::azdata::GameLog;
-use victris_engine::pvnet::PvNet;
+use victris_engine::pvnet::{class_of, PvNet, ATTACKS};
 use victris_engine::pvsearch::{self, PvConfig, Rng};
 use victris_engine::state::State;
 use victris_engine::Engine;
@@ -33,6 +36,18 @@ struct Row {
     lower: Vec<Option<f32>>,
     net_visits: f32,
     value_moved: f32,
+    /// the kind of turn the network chose first and the kind the finished search plays
+    kinds: (usize, usize),
+    /// the position: opponent in sight, a shot in flight, fighters within 2 tiles, either
+    /// fighter powered, the chooser behind on hp; and the distance between the fighters
+    sit: [bool; 5],
+    dist: i32,
+}
+
+/// stay, step or dash, times the attack (none or which): 12 kinds.
+fn kind_of(class: usize) -> usize {
+    let (m, a) = (class / ATTACKS, class % ATTACKS);
+    (if m == 0 { 0 } else if m <= 8 { 1 } else { 2 }) * 4 + a
 }
 
 fn main() {
@@ -42,6 +57,7 @@ fn main() {
     let map = opt("--map").unwrap_or_else(|| "arena-21".to_string());
     let at: Vec<u32> = opt("--at").unwrap_or_else(|| "800,3200,12800,60000".to_string()).split(',').filter_map(|s| s.trim().parse().ok()).collect();
     assert!(!at.is_empty() && at.windows(2).all(|w| w[0] < w[1]), "--at wants rising numbers of lines");
+    let kinds_over: Option<f32> = opt("--kinds").and_then(|s| s.parse().ok());
     let (max, seed, nodes, lead, threads) = (num("--max", 400) as usize, num("--seed", 1), num("--nodes", 150_000) as usize, num("--lead", 256) as u32, num("--threads", 4) as usize);
     let net = PvNet::load(std::path::Path::new(&opt("--net").expect("--net NET.json"))).expect("cannot read the network");
     let e = Engine::shipped(&map);
@@ -99,7 +115,18 @@ fn main() {
                     for code in std::iter::once(net_first).chain(firsts.iter().map(|f| f[x])) {
                         lower.push(if code == firsts.last().unwrap()[x] { None } else { result(code).map(|r| end.0 - r.0) });
                     }
-                    mine.push(Row { lower, net_visits: result(net_first).map(|r| r.1 as f32 / total.max(1) as f32).unwrap_or(0.0), value_moved: moved });
+                    let kind = |code: Option<u32>| acts[x].iter().find(|a| a.0.pack() == code).map(|a| kind_of(class_of(&a.0))).unwrap_or(0);
+                    let kinds = (kind(net_first), kind(firsts.last().unwrap()[x]));
+                    let (me, op) = (&s.fighters[x], &s.fighters[1 - x]);
+                    let dist = victris_engine::geom::chebyshev(me.pos, op.pos);
+                    let sit = [
+                        victris_engine::observe::can_see(&e.rules, &e.map, me.pos, op.pos),
+                        s.n_projectiles > 0,
+                        dist <= 2,
+                        me.power_until >= s.tick || op.power_until >= s.tick,
+                        me.hp < op.hp,
+                    ];
+                    mine.push(Row { lower, net_visits: result(net_first).map(|r| r.1 as f32 / total.max(1) as f32).unwrap_or(0.0), value_moved: moved, kinds, sit, dist });
                 }
                 rows.lock().unwrap().extend(mine);
             });
@@ -123,5 +150,41 @@ fn main() {
         let over = |x: f32| 100.0 * d.iter().filter(|v| **v > x).count() as f32 / n;
         let sum: f32 = d.iter().sum();
         println!("  {:28} {:>8.1}% {:>10.4} {:>7.1}% {:>7.1}% {:>7.1}% {:>7.1}% {:>12.4}", name, 100.0 * d.len() as f32 / n, sum / d.len().max(1) as f32, over(0.02), over(0.05), over(0.1), over(0.2), sum / n);
+    }
+    if let Some(over) = kinds_over {
+        let names: Vec<String> = e.rules.attacks.iter().map(|a| a.name.clone()).collect();
+        let label = |k: usize| format!("{}{}", ["stay", "step", "dash"][k / 4], if k % 4 == 0 { String::new() } else { format!(" + {}", names.get(k % 4 - 1).map(String::as_str).unwrap_or("attack")) });
+        let group = |name: &str, pick: &dyn Fn(&Row) -> bool| {
+            let g: Vec<&Row> = rows.iter().filter(|r| pick(r)).collect();
+            let m = g.len().max(1) as f32;
+            let share = |i: usize| 100.0 * g.iter().filter(|r| r.sit[i]).count() as f32 / m;
+            println!(
+                "  {:34} {:5} decisions: opponent in sight {:5.1}%, a shot in flight {:5.1}%, within 2 tiles {:5.1}%, a fighter powered {:5.1}%, chooser behind on hp {:5.1}%, {:.1} tiles apart",
+                name,
+                g.len(),
+                share(0),
+                share(1),
+                share(2),
+                share(3),
+                share(4),
+                g.iter().map(|r| r.dist as f32).sum::<f32>() / m
+            );
+        };
+        group("every decision", &|_| true);
+        group("first choice is the search's", &|r| r.lower[0].is_none());
+        group("first choice lower by more than X", &|r| r.lower[0].is_some_and(|v| v > over));
+        let mut by = std::collections::HashMap::<(usize, usize), (u32, f32)>::new();
+        for r in rows.iter().filter(|r| r.lower[0].is_some_and(|v| v > over)) {
+            let c = by.entry(r.kinds).or_insert((0, 0.0));
+            c.0 += 1;
+            c.1 += r.lower[0].unwrap_or(0.0);
+        }
+        let mut list: Vec<_> = by.into_iter().collect();
+        list.sort_by(|a, b| b.1 .0.cmp(&a.1 .0));
+        let all: u32 = list.iter().map(|r| r.1 .0).sum();
+        println!("  the network's first choice lower by more than {over} ({all} decisions): the network's kind, the search's, share, lower by");
+        for ((a, b), (c, sum)) in list.iter().take(16) {
+            println!("    {:22} {:22} {:5.1}% {:8.3}", label(*a), label(*b), 100.0 * *c as f32 / all.max(1) as f32, sum / *c as f32);
+        }
     }
 }
